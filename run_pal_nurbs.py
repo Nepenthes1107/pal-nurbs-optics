@@ -11,7 +11,7 @@ from biot.e2e.pal_nurbs import (
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Run the fixed three-distance 11x11 PAL-NURBS optimizer"
+        description="Run the fixed three-distance 7x7 PAL B-spline optimizer"
     )
     parser.add_argument("--output", default=MinimalConfig.output)
     parser.add_argument("--excel", default=MinimalConfig.excel, help="PAL-NURBS 使用的镜片系统 Excel")
@@ -26,7 +26,22 @@ def main() -> int:
     parser.add_argument("--fft-size-px", type=int, default=MinimalConfig.fft_size_px)
     parser.add_argument("--fov-min-deg", type=float, default=MinimalConfig.fov_min_deg)
     parser.add_argument("--fov-max-deg", type=float, default=MinimalConfig.fov_max_deg)
-    parser.add_argument("--steps", type=int, default=MinimalConfig.max_steps)
+    parser.add_argument(
+        "--accepted-steps",
+        type=int,
+        default=MinimalConfig.max_accepted_steps,
+        help="最大 accepted optimizer steps（拒绝步不消耗该预算）",
+    )
+    parser.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=MinimalConfig.early_stopping_patience,
+    )
+    parser.add_argument(
+        "--relative-improvement-threshold",
+        type=float,
+        default=MinimalConfig.relative_improvement_threshold,
+    )
     parser.add_argument(
         "--prepare-only",
         action="store_true",
@@ -48,7 +63,9 @@ def main() -> int:
         fft_size_px=args.fft_size_px,
         fov_min_deg=args.fov_min_deg,
         fov_max_deg=args.fov_max_deg,
-        max_steps=args.steps,
+        max_accepted_steps=args.accepted_steps,
+        early_stopping_patience=args.early_stopping_patience,
+        relative_improvement_threshold=args.relative_improvement_threshold,
     )
     if args.prepare_only:
         output = prepare_only(config, resume=args.resume)

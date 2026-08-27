@@ -1,6 +1,6 @@
-"""Fixed-weight tensor-product NURBS controls for regional PAL optimization.
+"""Fixed-weight tensor-product B-spline controls for PAL optimization.
 
-The multidistance PAL method uses one sealed cubic 11x11 control lattice.
+The multidistance PAL method uses one sealed cubic 7x7 control lattice.
 Only the control-point heights are trainable. Coordinates supplied to
 ``delta_raw`` follow the workbook/GridSag row convention; trace coordinates
 mirror physical y exactly at the optical-system boundary.
@@ -16,8 +16,8 @@ from .surfaces import SurfaceDomain
 
 DEGREE = 3
 DOMAIN_MM = (-40.0, 40.0)
-CONTROL_COUNT = 11
-_INTERNAL_KNOTS = (-30.0, -20.0, -10.0, 0.0, 10.0, 20.0, 30.0)
+CONTROL_COUNT = 7
+_INTERNAL_KNOTS = (-20.0, 0.0, 20.0)
 
 
 def fixed_knots(
@@ -25,7 +25,7 @@ def fixed_knots(
     dtype: torch.dtype = torch.float64,
     device: torch.device | str = "cpu",
 ) -> torch.Tensor:
-    """Return the fixed cubic 11-control knot vector on ``[-40, 40] mm``."""
+    """Return the fixed cubic 7-control knot vector on ``[-40, 40] mm``."""
     values = (
         (DOMAIN_MM[0],) * (DEGREE + 1)
         + _INTERNAL_KNOTS
@@ -142,12 +142,12 @@ class FixedWeightNURBSPerturbation(torch.nn.Module):
         self.degree = DEGREE
         self.domain = domain or SurfaceDomain(DOMAIN_MM, DOMAIN_MM)
         if self.domain.x_range_mm != DOMAIN_MM or self.domain.y_range_mm != DOMAIN_MM:
-            raise ValueError("the fixed 11x11 NURBS lattice requires [-40,40] mm in x and y")
+            raise ValueError("the fixed 7x7 B-spline lattice requires [-40,40] mm in x and y")
         self.max_sag_mm = float(max_abs_control_mm)
         initial = torch.zeros((n - 2, n - 2), dtype=dtype, device=torch.device(device))
         if inner_q is not None:
             if tuple(inner_q.shape) != tuple(initial.shape):
-                raise ValueError("inner_q shape does not match the fixed 11x11 lattice")
+                raise ValueError("inner_q shape does not match the fixed 7x7 lattice")
             initial.copy_(inner_q.to(device=initial.device, dtype=initial.dtype))
         if bool(torch.any(initial.abs() > 1.0)):
             raise ValueError("normalized controls must lie in [-1,1]")

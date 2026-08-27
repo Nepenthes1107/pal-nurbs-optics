@@ -50,11 +50,12 @@ python -m biot.gui
 
 ## PAL-NURBS 合同
 
-- 仅优化 PAL 后表面的固定 cubic NURBS `zp` 控制量；`xp/yp/weight` 固定，外层控制环固定为零。参数网格为单一 `11×11`，实际可训练的内层为 `9×9`。
-- 三个物距分别为 `D500=500 mm`、`D2000=2000 mm` 和 `Dinf=Infinity`。每个物距使用完全相同的 `11×11` FOV 角度网格，总计 `3×121=363` 个真实 case；无有限距离近似 Infinity。
+- 仅优化 PAL 后表面的固定权重 cubic B-spline `zp` 控制量；`xp/yp/weight` 固定，外圈控制环固定为零。参数网格为单一 `7×7`，实际可训练的内层为 `5×5=25` 个控制量。
+- 三个物距分别为 `D500=500 mm`、`D1000=1000 mm` 和 `Dinf=Infinity`。每个物距使用完全相同的 `11×11` FOV 角度网格，总计 `3×121=363` 个真实 case；无有限距离近似 Infinity。
 - case 布局使用基线 PAL 后表面的 chief/reference ray 落点映射到 `inputs/pal/zones.json`。固定网格点不因稀疏、FPS、WFNO 资格或覆盖率筛选而删除；落在 monitored 安全带但未标注分区的点按显式最近分区规则分类，并记录分类模式和距离。
-- 每个 case 依次执行真实可微光线追迹、连续 OPL、去 pupil tilt 的 raw 物理 FFT PSF，再计算能量归一化 PSF 的二阶矩（`mm²`）。PSF 不做 crop、resize、插值、滤波或显示增强，离线 PSF 也不参与反传。
-- loss 为所有 case 的 `objective_weight × PSF_second_moment_mm2` 之和。分区总质量和分区内三物距分配由 `inputs/pal/multidistance_weights.json` 指定，15 个“分区×物距”组合必须都有 case，展开后权重总和严格为 1，不做缺项后的重新归一化。
+- 每个 case 依次执行真实可微光线追迹、连续 OPL、去 pupil tilt 的 raw 物理 FFT PSF。far/corridor/near 使用能量归一化 PSF 二阶矩（`mm²`），astig-left/right 使用 M/A 中的像散量 A（`D`）；每个 zone×distance 组合除以其 PAL 零残差 baseline 指标。PSF 不做 crop、resize、插值、滤波或显示增强，离线 PSF 也不参与反传。
+- 固定联合权重为 far `(0, 0.050, 0.200)`、corridor `(0.025, 0.200, 0.025)`、near `(0.200, 0.050, 0)`、两个 astig 侧各 `(0.125/3, 0.125/3, 0.125/3)`，距离顺序均为 `D500/D1000/Dinf`；总和严格为 1。零权重 case 仍进入 baseline/validation sweep，但不进入优化梯度。
+- 优化上限为 `50` 个 accepted steps；拒绝步恢复 PAL 参数和完整 Adam state。默认 early stopping 为连续 `7` 个 accepted steps 未达到归一化总 loss 相对改善阈值 `1e-4`。
 - `best_feasible` 只在完整 363-case sweep 且健康、`P_far`、`ADD`、控制量和单步 sag 约束均通过时更新；不使用局部 case、`best_image` 或 `latest` 兜底。
 - 旧的候选点选择、80-case 目标、PSF support 数据库、7×7→11×11→19×19 晋级和精确 refinement audit 不属于当前方法。
 
@@ -65,7 +66,7 @@ python run_pal_nurbs.py `
   --output results/optimization/run_001 `
   --excel eye_image_glass_grad3.xlsx --device cuda `
   --weights-json inputs/pal/multidistance_weights.json `
-  --requested-np 1024 --fft-size-px 512 --steps 10
+  --requested-np 1024 --fft-size-px 512 --accepted-steps 50
 ```
 
 普通 `--resume` 只允许恢复同一运行目录中 identity、配置、输入哈希和实现闭包完全一致的 checkpoint。当前项目不再支持跨平台 training-state/parity 导入。

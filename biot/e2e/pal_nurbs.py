@@ -1,10 +1,10 @@
-"""固定三物距、多距离加权 PSF 二阶矩的 PAL-NURBS 优化链。
+"""固定三物距、分区/物距归一化目标的 PAL-B-spline 优化链。
 
 训练主链只有以下物理步骤：
 
-``11x11 PAL 后表面参数`` → ``D500/D2000/Dinf 共用 FOV 网格`` →
+``7x7 PAL 后表面参数`` → ``D500/D1000/Dinf 共用 FOV 网格`` →
 ``真实可微光线追迹`` → ``去 pupil tilt 的物理 FFT PSF`` →
-``能量归一化 PSF 二阶矩`` → ``物距/分区权重 loss`` → ``Adam 更新``。
+``分区指标(M2 或 M/A 的 A)的 baseline normalization`` → ``Adam 更新``。
 
 旧的密集候选点、FPS 选择、WFNO 资格轮次、覆盖审计、PSF crop/resize、
 80-case 分组目标和 7x7→11x11→19x19 阶梯都不属于本方法。
@@ -54,7 +54,7 @@ from .system import (
 )
 
 
-METHOD_NAME = "pal_multidistance_11x11_weighted_psf_second_moment"
+METHOD_NAME = "pal_multidistance_d500_d1000_dinf_baseline_normalized_m2_astig_a_bspline7"
 RUN_IDENTITY_SCHEMA_VERSION = 3
 CASE_LAYOUT_SCHEMA_VERSION = 1
 EVALUATION_PROGRESS_SCHEMA_VERSION = 1
@@ -83,7 +83,9 @@ class MinimalConfig:
     fov_min_deg: float = -32.0
     fov_max_deg: float = 32.0
     fov_count: int = 11
-    max_steps: int = 10
+    max_accepted_steps: int = 50
+    early_stopping_patience: int = 7
+    relative_improvement_threshold: float = 1.0e-4
     learning_rate: float = 2.0e-3
     minimum_learning_rate: float = 1.0e-6
     max_abs_control_mm: float = 0.12
@@ -116,8 +118,12 @@ class MinimalConfig:
             value = float(getattr(self, name))
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{name} must be finite and positive")
-        if int(self.max_steps) < 0:
-            raise ValueError("max_steps must be non-negative")
+        if int(self.max_accepted_steps) < 0:
+            raise ValueError("max_accepted_steps must be non-negative")
+        if int(self.early_stopping_patience) < 1:
+            raise ValueError("early_stopping_patience must be positive")
+        if not math.isfinite(float(self.relative_improvement_threshold)) or float(self.relative_improvement_threshold) <= 0.0:
+            raise ValueError("relative_improvement_threshold must be finite and positive")
         if not 0.0 < float(self.minimum_valid_fraction) <= 1.0:
             raise ValueError("minimum_valid_fraction must be in (0,1]")
         if not 0.0 <= float(self.maximum_edge_fraction) < 1.0:
@@ -528,6 +534,45 @@ class MinimalOpticalModel:
         self.fit_spec = FitSpec(control_shape=(41, 41), sample_shape=(81, 81), degree=3)
         self._cache: dict[tuple[float, float, float], tuple[FittedE2ESystem, object]] = {}
         self._templates: dict[float, tuple[FittedE2ESystem, object]] = {}
+        self._pal_sag: torch.Tensor | None = None
+        self._pal_power_config: PALPowerConfig | None = None
+        self._pal_zones: Mapping[str, torch.Tensor] | None = None
+
+    def set_prescription_context(
+        self,
+        sag: torch.Tensor,
+        power_config: PALPowerConfig,
+        zones: Mapping[str, torch.Tensor],
+    ) -> None:
+        """Attach the differentiable PAL M/A context used by astigmatism loss."""
+        self._pal_sag = sag
+        self._pal_power_config = power_config
+        self._pal_zones = zones
+
+    def astig_A_by_zone(self) -> dict[str, torch.Tensor]:
+        if self._pal_sag is None or self._pal_power_config is None or self._pal_zones is None:
+            raise RuntimeError("PAL prescription context is required for astigmatism loss")
+        coord = torch.linspace(
+            -self._pal_power_config.semi_diameter_mm,
+            self._pal_power_config.semi_diameter_mm,
+            int(self._pal_sag.shape[0]),
+            device=self._pal_sag.device,
+            dtype=self._pal_sag.dtype,
+        )
+        yy, xx = torch.meshgrid(coord, coord, indexing="ij")
+        sag = self._pal_sag + self.perturbation.delta_raw(xx, yy)
+        maps = torch_averfang_maps(sag, self._pal_power_config)
+        result: dict[str, torch.Tensor] = {}
+        for zone in ("astig_left", "astig_right"):
+            mask_name = "peripheral_" + zone
+            mask = self._pal_zones[mask_name] & maps["valid"]
+            if not bool(mask.any()):
+                raise ValueError(f"M/A mask has no valid samples for {zone}")
+            value = maps["A_D"][mask].mean()
+            if not bool(torch.isfinite(value)) or bool(value <= 0.0):
+                raise ValueError(f"M/A astigmatism A is invalid for {zone}")
+            result[zone] = value
+        return result
 
     @staticmethod
     def _key(distance_mm: float, field_x_deg: float, field_y_deg: float) -> tuple[float, float, float]:
@@ -769,7 +814,14 @@ def torch_averfang_maps(sag: torch.Tensor, config: PALPowerConfig) -> dict[str, 
         & torch.isfinite(power)
         & torch.isfinite(astig)
     )
-    return {"power_D": power, "astigmatism_D": astig, "valid": valid}
+    return {
+        "power_D": power,
+        # A is the M/A astigmatism component in diopters. Keep the legacy
+        # spelling for prescription reports, but make the loss input explicit.
+        "A_D": astig,
+        "astigmatism_D": astig,
+        "valid": valid,
+    }
 
 
 def load_pal(
@@ -818,7 +870,7 @@ def prescription_metrics(
     return {
         "P_far_D": pfar,
         "ADD_D": add,
-        "astig_mean_D": maps["astigmatism_D"][monitored].mean(),
+        "astig_mean_D": maps["A_D"][monitored].mean(),
     }
 
 
@@ -859,7 +911,7 @@ def _validate_layout_cases(cases: Sequence[Mapping[str, Any]], config: MinimalCo
     if actual_indices != expected_indices:
         raise ValueError("case layout case indices are not contiguous")
     weights = [float(case.get("objective_weight", math.nan)) for case in cases]
-    if any(not math.isfinite(value) or value <= 0.0 for value in weights):
+    if any(not math.isfinite(value) or value < 0.0 for value in weights):
         raise ValueError("case layout contains invalid objective weights")
     if abs(sum(weights) - 1.0) > 1.0e-12:
         raise ValueError("case layout objective weights are not normalized")
@@ -1079,17 +1131,70 @@ def prepare_only(config: MinimalConfig, *, resume: bool = False) -> Path:
     return output / "preoptimization"
 
 
+def _metric_key(case: Mapping[str, Any]) -> str:
+    return f"{str(case['zone'])}/{str(case['distance_label'])}"
+
+
+def _baseline_metric_table(
+    rows: Sequence[Mapping[str, Any]], *, require_complete: bool = True
+) -> dict[str, float]:
+    values_by_key: dict[str, list[float]] = {}
+    for row in rows:
+        key = _metric_key(row)
+        value = float(row["loss_metric"])
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(f"baseline metric must be finite and positive for {key}")
+        values_by_key.setdefault(key, []).append(value)
+    table = {
+        key: sum(values) / len(values)
+        for key, values in values_by_key.items()
+    }
+    expected = {
+        f"{zone}/{spec.label}"
+        for zone in PARTITION_ZONES
+        for spec in DISTANCE_SPECS
+    }
+    if require_complete and set(table) != expected:
+        raise ValueError("baseline metrics do not cover all zone/distance combinations")
+    return table
+
+
+def _normalize_evaluation_rows(
+    rows: Sequence[Mapping[str, Any]], baseline_metrics: Mapping[str, float]
+) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for row in rows:
+        key = _metric_key(row)
+        if key not in baseline_metrics:
+            raise ValueError(f"missing baseline metric for {key}")
+        denominator = float(baseline_metrics[key])
+        value = float(row["loss_metric"])
+        if not math.isfinite(denominator) or denominator <= 0.0:
+            raise ValueError(f"baseline metric is invalid for {key}")
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(f"loss metric is invalid for {key}")
+        row_copy = dict(row)
+        row_copy["baseline_metric"] = denominator
+        row_copy["normalized_metric"] = value / denominator
+        row_copy["weighted_loss"] = float(row_copy["objective_weight"]) * float(row_copy["normalized_metric"])
+        normalized.append(row_copy)
+    return normalized
+
+
 def _summarize_rows(rows: Sequence[Mapping[str, Any]]) -> tuple[float, dict[str, Any]]:
     if not rows:
         raise ValueError("cannot summarize an empty PSF evaluation")
     weights = [float(row["objective_weight"]) for row in rows]
-    if any(not math.isfinite(value) or value <= 0.0 for value in weights):
-        raise ValueError("PSF rows contain invalid objective weights")
+    if any(not math.isfinite(value) or value < 0.0 for value in weights):
+        raise ValueError("evaluation rows contain invalid objective weights")
     if abs(sum(weights) - 1.0) > 1.0e-12:
-        raise ValueError("PSF row weights are not normalized")
-    loss = sum(float(row["weighted_m2_mm2"]) for row in rows)
-    if not math.isfinite(loss) or loss < 0.0:
-        raise ValueError("PSF weighted second-moment loss is invalid")
+        raise ValueError("evaluation row weights are not normalized")
+    for row in rows:
+        for name in ("loss_metric", "normalized_metric", "weighted_loss"):
+            value = float(row[name])
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"evaluation row {name} is invalid")
+    loss = sum(float(row["weighted_loss"]) for row in rows)
     min_valid = min(float(row["valid_fraction"]) for row in rows)
     max_edge = max(float(row["edge_fraction"]) for row in rows)
     max_energy_error = max(abs(float(row["energy"]) - 1.0) for row in rows)
@@ -1102,7 +1207,9 @@ def _summarize_rows(rows: Sequence[Mapping[str, Any]]) -> tuple[float, dict[str,
             target[group] = {
                 "case_count": len(members),
                 "mean_m2_mm2": sum(float(row["m2_mm2"]) for row in members) / len(members),
-                "weighted_loss_mm2": sum(float(row["weighted_m2_mm2"]) for row in members),
+                "mean_astig_A_D": sum(float(row["astig_A_D"]) for row in members) / len(members),
+                "mean_normalized_metric": sum(float(row["normalized_metric"]) for row in members) / len(members),
+                "weighted_loss": sum(float(row["weighted_loss"]) for row in members),
                 "mean_valid_fraction": sum(float(row["valid_fraction"]) for row in members) / len(members),
             }
     health = {
@@ -1140,10 +1247,11 @@ def _evaluate(
     cases: Sequence[Mapping[str, Any]],
     *,
     with_grad: bool,
+    baseline_metrics: Mapping[str, float] | None = None,
     progress_path: Path | None = None,
     identity_sha256: str | None = None,
 ) -> tuple[float, list[dict[str, Any]], dict[str, Any]]:
-    """Evaluate a complete case sweep, accumulating weighted M2 gradients."""
+    """Evaluate all cases; only positive-weight normalized metrics backpropagate."""
     if not cases:
         raise ValueError("cannot evaluate an empty case set")
     if with_grad and progress_path is not None:
@@ -1167,9 +1275,14 @@ def _evaluate(
         start_index = int(payload.get("next_case_index", -1))
         if start_index != len(rows) or start_index > len(cases):
             raise ValueError("evaluation progress index is inconsistent")
+    astig_by_zone: dict[str, torch.Tensor] = {}
+    if any(str(case["zone"]) in ("astig_left", "astig_right") for case in cases):
+        with torch.set_grad_enabled(with_grad):
+            astig_by_zone = model.astig_A_by_zone()
+    astig_weighted_terms: list[torch.Tensor] = []
     for index, case in enumerate(cases[start_index:], start=start_index + 1):
         weight = float(case["objective_weight"])
-        if not math.isfinite(weight) or weight <= 0.0:
+        if not math.isfinite(weight) or weight < 0.0:
             raise ValueError(f"case {case['case_id']} has invalid objective weight")
         with torch.set_grad_enabled(with_grad):
             result = model.field(case)
@@ -1179,22 +1292,51 @@ def _evaluate(
             moment = psf_second_moment_mm2(
                 result.psf, pixel_pitch_mm=result.pixel_pitch_mm
             )
-            weighted = moment * torch.as_tensor(
-                weight, device=moment.device, dtype=moment.dtype
+            zone = str(case["zone"])
+            if zone in ("astig_left", "astig_right"):
+                metric = astig_by_zone[zone]
+                metric_name = "astig_A_D"
+            else:
+                metric = moment
+                metric_name = "m2_mm2"
+            if baseline_metrics is None:
+                baseline_metric = torch.ones((), device=metric.device, dtype=metric.dtype)
+            else:
+                key = _metric_key(case)
+                if key not in baseline_metrics:
+                    raise ValueError(f"missing baseline metric for {key}")
+                denominator = float(baseline_metrics[key])
+                if not math.isfinite(denominator) or denominator <= 0.0:
+                    raise ValueError(f"baseline metric is invalid for {key}")
+                baseline_metric = torch.as_tensor(denominator, device=metric.device, dtype=metric.dtype)
+            normalized_metric = metric / baseline_metric
+            weighted = normalized_metric * torch.as_tensor(
+                weight, device=metric.device, dtype=metric.dtype
             )
-            if with_grad:
+            if with_grad and weight > 0.0:
                 if not weighted.requires_grad:
                     raise RuntimeError(f"case {case['case_id']} is detached from PAL parameters")
-                weighted.backward()
+                if metric_name == "astig_A_D":
+                    astig_weighted_terms.append(weighted)
+                else:
+                    weighted.backward()
         valid_fraction = float(result.valid_fraction.detach().cpu())
         edge_fraction = float(result.edge_fraction.detach().cpu())
         moment_value = float(moment.detach().cpu())
+        metric_value = float(metric.detach().cpu())
+        normalized_value = float(normalized_metric.detach().cpu())
         energy_value = float(energy.detach().cpu())
         rows.append(
             {
                 **dict(case),
                 "m2_mm2": moment_value,
-                "weighted_m2_mm2": float(weighted.detach().cpu()),
+                "astig_A_D": metric_value if metric_name == "astig_A_D" else 0.0,
+                "loss_metric": metric_value,
+                "loss_metric_name": metric_name,
+                "baseline_metric": float(baseline_metric.detach().cpu()),
+                "normalized_metric": normalized_value,
+                "weighted_loss": float(weighted.detach().cpu()),
+                "weighted_m2_mm2": float(moment_value * weight),
                 "energy": energy_value,
                 "valid_fraction": valid_fraction,
                 "valid_ray_count": int(result.valid_mask.sum().detach().cpu())
@@ -1219,6 +1361,8 @@ def _evaluate(
             )
         if index % 25 == 0 or index == len(cases):
             print(f"[pal-multidistance] evaluated {index}/{len(cases)} cases (grad={with_grad})", flush=True)
+    if with_grad and astig_weighted_terms:
+        torch.stack(astig_weighted_terms).sum().backward()
     loss, health = _summarize_rows(rows)
     return loss, rows, health
 
@@ -1274,7 +1418,7 @@ def _save_checkpoint(
     identity_sha256: str,
     case_layout_sha256: str,
     step: int,
-    loss_mm2: float,
+    normalized_loss: float,
     health: Mapping[str, Any],
     power: Mapping[str, float],
     feasible: bool,
@@ -1287,7 +1431,7 @@ def _save_checkpoint(
             "case_layout_sha256": case_layout_sha256,
             "control_count": CONTROL_COUNT,
             "step": int(step),
-            "loss_mm2": float(loss_mm2),
+            "normalized_loss": float(normalized_loss),
             "health": dict(health),
             "power": dict(power),
             "feasible": bool(feasible),
@@ -1303,10 +1447,12 @@ def _make_training_resume_payload(
     module: FixedWeightNURBSPerturbation,
     optimizer: torch.optim.Optimizer,
     learning_rate: float,
-    completed_steps: int,
-    max_steps: int,
+    completed_attempts: int,
+    max_accepted_steps: int,
+    accepted_steps: int,
+    no_improvement_accepted_steps: int,
     history: Sequence[Mapping[str, Any]],
-    best_loss_mm2: float,
+    best_normalized_loss: float,
     best_step: int,
     best_state: Mapping[str, Any],
     best_health: Mapping[str, Any],
@@ -1318,13 +1464,15 @@ def _make_training_resume_payload(
         "identity_sha256": identity_sha256,
         "case_layout_sha256": case_layout_sha256,
         "control_count": CONTROL_COUNT,
-        "max_steps": int(max_steps),
-        "completed_steps": int(completed_steps),
+        "max_accepted_steps": int(max_accepted_steps),
+        "completed_attempts": int(completed_attempts),
+        "accepted_steps": int(accepted_steps),
+        "no_improvement_accepted_steps": int(no_improvement_accepted_steps),
         "model_state": copy.deepcopy(module.state_dict()),
         "optimizer_state": copy.deepcopy(optimizer.state_dict()),
         "learning_rate": float(learning_rate),
         "history": [dict(row) for row in history],
-        "best_loss_mm2": float(best_loss_mm2),
+        "best_normalized_loss": float(best_normalized_loss),
         "best_step": int(best_step),
         "best_state": copy.deepcopy(dict(best_state)),
         "best_health": dict(best_health),
@@ -1338,7 +1486,7 @@ def _validate_training_resume(
     *,
     identity_sha256: str,
     case_layout_sha256: str,
-    max_steps: int,
+    max_accepted_steps: int,
 ) -> None:
     if int(payload.get("schema_version", -1)) != TRAINING_RESUME_SCHEMA_VERSION:
         raise ValueError("training resume schema mismatch")
@@ -1350,13 +1498,17 @@ def _validate_training_resume(
         raise ValueError("training resume case layout mismatch")
     if int(payload.get("control_count", -1)) != CONTROL_COUNT:
         raise ValueError("training resume control count mismatch")
-    if int(payload.get("max_steps", -1)) != int(max_steps):
-        raise ValueError("training resume max_steps mismatch")
-    completed = int(payload.get("completed_steps", -1))
+    if int(payload.get("max_accepted_steps", -1)) != int(max_accepted_steps):
+        raise ValueError("training resume max_accepted_steps mismatch")
+    completed = int(payload.get("completed_attempts", -1))
+    accepted = int(payload.get("accepted_steps", -1))
+    no_improvement = int(payload.get("no_improvement_accepted_steps", -1))
     history = payload.get("history")
-    if not isinstance(history, list) or completed != len(history) or completed < 0 or completed > max_steps:
-        raise ValueError("training resume step/history mismatch")
-    if [int(row.get("step", -1)) for row in history] != list(range(1, completed + 1)):
+    if not isinstance(history, list) or completed != len(history) or completed < 0:
+        raise ValueError("training resume attempt/history mismatch")
+    if accepted < 0 or accepted > max_accepted_steps or no_improvement < 0:
+        raise ValueError("training resume accepted-step state is invalid")
+    if [int(row.get("attempt", -1)) for row in history] != list(range(1, completed + 1)):
         raise ValueError("training resume history is not contiguous")
     for name in ("model_state", "optimizer_state", "best_state", "best_health", "best_power", "rng_state"):
         if not isinstance(payload.get(name), dict):
@@ -1415,9 +1567,12 @@ def _load_baseline_state(
         if not torch.is_tensor(value):
             raise ValueError("baseline state contains a non-tensor parameter")
         if not torch.equal(value.to(device=expected_value.device, dtype=expected_value.dtype), expected_value):
-            raise ValueError("baseline state is not the zero-residual 11x11 PAL")
+            raise ValueError("baseline state is not the zero-residual 7x7 PAL")
     if int(payload.get("case_count", -1)) <= 0:
         raise ValueError("baseline state case count is invalid")
+    metrics = payload.get("baseline_metrics")
+    if not isinstance(metrics, dict):
+        raise ValueError("baseline state lacks baseline metrics")
     return payload
 
 
@@ -1464,6 +1619,7 @@ def _run_bound(
         dtype=torch.float64,
     )
     model = MinimalOpticalModel(config, module)
+    model.set_prescription_context(base_sag, power_config, zones)
     try:
         write_state("case_layout")
         cases = _prepare_or_load_case_layout(
@@ -1481,7 +1637,8 @@ def _run_bound(
                 module=module,
                 device=device,
             )
-            baseline_loss = float(baseline["loss_mm2"])
+            baseline_loss = float(baseline["normalized_loss"])
+            baseline_metrics = {str(key): float(value) for key, value in baseline["baseline_metrics"].items()}
             baseline_rows = [dict(row) for row in baseline["rows"]]
             baseline_health = dict(baseline["health"])
             baseline_power = {name: float(value) for name, value in baseline["power"].items()}
@@ -1489,13 +1646,16 @@ def _run_bound(
                 raise ValueError("baseline case order changed")
         else:
             write_state("baseline_psf_sweep")
-            baseline_loss, baseline_rows, baseline_health = _evaluate(
+            _, raw_baseline_rows, _ = _evaluate(
                 model,
                 cases,
                 with_grad=False,
                 progress_path=output / "baseline_progress.pt",
                 identity_sha256=identity_sha256,
             )
+            baseline_metrics = _baseline_metric_table(raw_baseline_rows)
+            baseline_rows = _normalize_evaluation_rows(raw_baseline_rows, baseline_metrics)
+            baseline_loss, baseline_health = _summarize_rows(baseline_rows)
             baseline_power, _, baseline_sag = _power_and_sag(
                 base_sag, module, power_config, zones
             )
@@ -1521,7 +1681,8 @@ def _run_bound(
                     "case_ids": case_ids,
                     "case_count": len(cases),
                     "model_state": copy.deepcopy(module.state_dict()),
-                    "loss_mm2": baseline_loss,
+                    "normalized_loss": baseline_loss,
+                    "baseline_metrics": baseline_metrics,
                     "health": baseline_health,
                     "power": baseline_power,
                     "rows": baseline_rows,
@@ -1529,24 +1690,41 @@ def _run_bound(
                 },
             )
             (output / "baseline_progress.pt").unlink(missing_ok=True)
+        expected_metric_keys = {
+            f"{zone}/{spec.label}"
+            for zone in PARTITION_ZONES
+            for spec in DISTANCE_SPECS
+        }
+        if set(baseline_metrics) != expected_metric_keys:
+            raise ValueError("baseline metrics do not cover all zone/distance combinations")
+        if any(
+            not math.isfinite(float(value)) or float(value) <= 0.0
+            for value in baseline_metrics.values()
+        ):
+            raise ValueError("baseline metrics must be finite and positive")
+        baseline_rows = _normalize_evaluation_rows(baseline_rows, baseline_metrics)
+        baseline_loss, baseline_health = _summarize_rows(baseline_rows)
         _torch_save_atomic(
             output / "baseline_metrics.pt",
             {
                 "method": METHOD_NAME,
                 "identity_sha256": identity_sha256,
                 "case_layout_sha256": case_layout_sha256,
-                "loss_mm2": baseline_loss,
+                "normalized_loss": baseline_loss,
+                "baseline_metrics": baseline_metrics,
                 "health": baseline_health,
                 "power": baseline_power,
                 "rows": baseline_rows,
             },
         )
-        write_state("baseline_complete", baseline_loss_mm2=baseline_loss)
+        write_state("baseline_complete", normalized_loss=baseline_loss)
 
         resume_path = output / "resume.pt"
         optimizer = torch.optim.Adam([module.inner_q], lr=config.learning_rate)
         history: list[dict[str, Any]] = []
-        completed_steps = 0
+        completed_attempts = 0
+        accepted_steps = 0
+        no_improvement_accepted_steps = 0
         learning_rate = float(config.learning_rate)
         best_loss = float(baseline_loss)
         best_step = 0
@@ -1564,14 +1742,16 @@ def _run_bound(
                 payload,
                 identity_sha256=identity_sha256,
                 case_layout_sha256=case_layout_sha256,
-                max_steps=config.max_steps,
+                max_accepted_steps=config.max_accepted_steps,
             )
             module.load_state_dict(payload["model_state"])
             _restore_optimizer_state(optimizer, payload["optimizer_state"], module)
             learning_rate = float(payload["learning_rate"])
-            completed_steps = int(payload["completed_steps"])
+            completed_attempts = int(payload["completed_attempts"])
+            accepted_steps = int(payload["accepted_steps"])
+            no_improvement_accepted_steps = int(payload["no_improvement_accepted_steps"])
             history = [dict(row) for row in payload["history"]]
-            best_loss = float(payload["best_loss_mm2"])
+            best_loss = float(payload["best_normalized_loss"])
             best_step = int(payload["best_step"])
             best_state = copy.deepcopy(payload["best_state"])
             best_health = dict(payload["best_health"])
@@ -1586,7 +1766,7 @@ def _run_bound(
                 identity_sha256=identity_sha256,
                 case_layout_sha256=case_layout_sha256,
                 step=0,
-                loss_mm2=baseline_loss,
+                normalized_loss=baseline_loss,
                 health=baseline_health,
                 power=baseline_power,
                 feasible=True,
@@ -1597,7 +1777,7 @@ def _run_bound(
                 identity_sha256=identity_sha256,
                 case_layout_sha256=case_layout_sha256,
                 step=0,
-                loss_mm2=baseline_loss,
+                normalized_loss=baseline_loss,
                 health=baseline_health,
                 power=baseline_power,
                 feasible=True,
@@ -1610,10 +1790,12 @@ def _run_bound(
                     module=module,
                     optimizer=optimizer,
                     learning_rate=learning_rate,
-                    completed_steps=0,
-                    max_steps=config.max_steps,
+                    completed_attempts=0,
+                    max_accepted_steps=config.max_accepted_steps,
+                    accepted_steps=0,
+                    no_improvement_accepted_steps=0,
                     history=history,
-                    best_loss_mm2=best_loss,
+                    best_normalized_loss=best_loss,
                     best_step=best_step,
                     best_state=best_state,
                     best_health=best_health,
@@ -1621,10 +1803,19 @@ def _run_bound(
                 ),
             )
 
-        for step in range(completed_steps + 1, int(config.max_steps) + 1):
-            write_state("training_sweep", step=step, max_steps=config.max_steps)
+        attempt = completed_attempts
+        while accepted_steps < int(config.max_accepted_steps):
+            attempt += 1
+            write_state(
+                "training_sweep",
+                attempt=attempt,
+                accepted_steps=accepted_steps,
+                max_accepted_steps=config.max_accepted_steps,
+            )
             module.zero_grad(set_to_none=True)
-            loss, rows, health = _evaluate(model, cases, with_grad=True)
+            loss, rows, health = _evaluate(
+                model, cases, with_grad=True, baseline_metrics=baseline_metrics
+            )
             power, old_delta, current_sag = _power_and_sag(
                 base_sag, module, power_config, zones
             )
@@ -1635,9 +1826,10 @@ def _run_bound(
                 config,
                 step_sag_mm=0.0,
             )
+            relative_improvement = (best_loss - float(loss)) / abs(best_loss)
             if feasible and loss < best_loss:
                 best_loss = float(loss)
-                best_step = int(step)
+                best_step = int(accepted_steps)
                 best_state = copy.deepcopy(module.state_dict())
                 best_health = dict(health)
                 best_power = dict(power)
@@ -1646,8 +1838,8 @@ def _run_bound(
                     module,
                     identity_sha256=identity_sha256,
                     case_layout_sha256=case_layout_sha256,
-                    step=step,
-                    loss_mm2=best_loss,
+                    step=accepted_steps,
+                    normalized_loss=best_loss,
                     health=best_health,
                     power=best_power,
                     feasible=True,
@@ -1699,13 +1891,19 @@ def _run_bound(
             if not update_applied:
                 with torch.no_grad():
                     module.inner_q.copy_(old_parameter)
-                optimizer.load_state_dict(old_optimizer_state)
                 _restore_optimizer_state(optimizer, old_optimizer_state, module)
                 learning_rate *= 0.5
+            else:
+                accepted_steps += 1
+                if feasible and relative_improvement > float(config.relative_improvement_threshold):
+                    no_improvement_accepted_steps = 0
+                else:
+                    no_improvement_accepted_steps += 1
             history.append(
                 {
-                    "step": step,
-                    "evaluated_loss_mm2": float(loss),
+                    "attempt": attempt,
+                    "accepted_steps": accepted_steps,
+                    "evaluated_normalized_loss": float(loss),
                     "evaluated_feasible": bool(feasible),
                     "evaluated_infeasible_reasons": ",".join(reasons),
                     "evaluated_minimum_valid_fraction": float(health["minimum_valid_fraction"]),
@@ -1715,11 +1913,13 @@ def _run_bound(
                     "update_reason": update_reason,
                     "update_step_sag_mm": float(step_sag) if math.isfinite(step_sag) else math.nan,
                     "learning_rate": float(learning_rate),
-                    "best_feasible_loss_mm2": float(best_loss),
+                    "best_normalized_loss": float(best_loss),
                     "best_feasible_step": int(best_step),
+                    "no_improvement_accepted_steps": no_improvement_accepted_steps,
+                    "relative_improvement_threshold": float(config.relative_improvement_threshold),
                 }
             )
-            completed_steps = step
+            completed_attempts = attempt
             _write_history(output / "history.csv", history)
             _torch_save_atomic(
                 resume_path,
@@ -1729,16 +1929,26 @@ def _run_bound(
                     module=module,
                     optimizer=optimizer,
                     learning_rate=learning_rate,
-                    completed_steps=completed_steps,
-                    max_steps=config.max_steps,
+                    completed_attempts=completed_attempts,
+                    max_accepted_steps=config.max_accepted_steps,
+                    accepted_steps=accepted_steps,
+                    no_improvement_accepted_steps=no_improvement_accepted_steps,
                     history=history,
-                    best_loss_mm2=best_loss,
+                    best_normalized_loss=best_loss,
                     best_step=best_step,
                     best_state=best_state,
                     best_health=best_health,
                     best_power=best_power,
                 ),
             )
+            if no_improvement_accepted_steps >= int(config.early_stopping_patience):
+                write_state(
+                    "early_stopping",
+                    accepted_steps=accepted_steps,
+                    patience=config.early_stopping_patience,
+                    relative_improvement_threshold=config.relative_improvement_threshold,
+                )
+                break
             if learning_rate < float(config.minimum_learning_rate) and not update_applied:
                 break
 
@@ -1750,14 +1960,16 @@ def _run_bound(
                 identity_sha256=identity_sha256,
                 case_layout_sha256=case_layout_sha256,
                 step=best_step,
-                loss_mm2=best_loss,
+                normalized_loss=best_loss,
                 health=best_health,
                 power=best_power,
                 feasible=True,
             )
         module.load_state_dict(best_state)
         write_state("final_evaluation", best_feasible_step=best_step)
-        final_loss, final_rows, final_health = _evaluate(model, cases, with_grad=False)
+        final_loss, final_rows, final_health = _evaluate(
+            model, cases, with_grad=False, baseline_metrics=baseline_metrics
+        )
         final_power, final_delta, final_sag = _power_and_sag(
             base_sag, module, power_config, zones
         )
@@ -1767,7 +1979,7 @@ def _run_bound(
             identity_sha256=identity_sha256,
             case_layout_sha256=case_layout_sha256,
             step=best_step,
-            loss_mm2=final_loss,
+            normalized_loss=final_loss,
             health=final_health,
             power=final_power,
             feasible=True,
@@ -1791,12 +2003,17 @@ def _run_bound(
                 "min_deg": config.fov_min_deg,
                 "max_deg": config.fov_max_deg,
             },
-            "objective": "sum(case.objective_weight * physical_raw_fft_psf_second_moment_mm2)",
-            "initial_loss_mm2": baseline_loss,
-            "final_loss_mm2": final_loss,
+            "objective": "sum(zone_distance_weight * metric / baseline_metric), metric=M2 for far/corridor/near and M/A A for astig_left/right",
+            "baseline_metrics": baseline_metrics,
+            "initial_normalized_loss": baseline_loss,
+            "final_normalized_loss": final_loss,
             "improvement_percent": 100.0 * (1.0 - final_loss / baseline_loss),
             "best_feasible_step": best_step,
-            "completed_steps": completed_steps,
+            "completed_attempts": completed_attempts,
+            "accepted_steps": accepted_steps,
+            "max_accepted_steps": config.max_accepted_steps,
+            "early_stopping_patience": config.early_stopping_patience,
+            "relative_improvement_threshold": config.relative_improvement_threshold,
             "control_count": CONTROL_COUNT,
             "max_abs_sag_delta_mm": final_sag,
             "P_far_D": final_power["P_far_D"],
@@ -1815,7 +2032,7 @@ def _run_bound(
             phase="complete",
             elapsed_seconds=runtime_seconds,
             best_feasible_step=best_step,
-            final_loss_mm2=final_loss,
+            final_normalized_loss=final_loss,
         )
         return output
     finally:

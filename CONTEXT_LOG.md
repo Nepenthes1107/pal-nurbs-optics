@@ -19,11 +19,12 @@
 
 ## 当前 PAL 多物距方法合同
 
-- 参数化后表面为固定 cubic NURBS `11×11` 控制网格，外层控制环为零；不再存在 7×7→11×11→19×19 阶梯或 refinement audit。
-- 物距块严格为 `D500=500 mm`、`D2000=2000 mm`、`Dinf=Infinity`，每块复用同一个 `11×11` FOV 网格，总 case 数为 363。
-- case 使用真实可微光线追迹和去 pupil tilt 的 raw 物理 FFT PSF；loss 是能量归一化 PSF 二阶矩 `mm²` 的分区/物距加权和。禁止 PSF crop、resize、插值、滤波和离线 PSF 反传。
+- 参数化后表面为固定权重 cubic B-spline `7×7` 控制网格，外圈控制环为零，仅内部 `5×5=25` 个控制量训练；不再存在 7×7→11×11→19×19 阶梯或 refinement audit。
+- 物距块严格为 `D500=500 mm`、`D1000=1000 mm`、`Dinf=Infinity`，每块复用同一个 `11×11` FOV 网格，总 case 数为 363。
+- case 使用真实可微光线追迹和去 pupil tilt 的 raw 物理 FFT PSF；far/corridor/near 的 loss 为 baseline-normalized PSF 二阶矩，astig-left/right 的 loss 为 baseline-normalized M/A 像散量 A。禁止 PSF crop、resize、插值、滤波和离线 PSF 反传。
 - 分区分类以 `zones.json` 的存储 mask 为主；monitored 内未标注单元使用记录在 case metadata 中的最近分区规则，任何固定点都不能静默丢弃。
-- 权重定义在 `inputs/pal/multidistance_weights.json`，分区总质量及每个分区的物距分配均机器可读；15 个“分区×物距”组合必须都有 case，展开后的 `objective_weight` 总和必须为 1，禁止缺项后重新归一化。
+- 权重定义在 `inputs/pal/multidistance_weights.json`，联合权重总和严格为 1；far-D500 和 near-Dinf 为严格零权重，case 保留用于 baseline/validation 但不反传。
+- 优化预算为最多 50 个 accepted steps，默认 patience=7、相对改善阈值=1e-4；拒绝步同时恢复 PAL 参数与 Adam optimizer state。
 - `best_feasible` 只能来自完整 363-case sweep，并同时满足 PSF health、`P_far`、`ADD`、控制量和单步 sag 约束。
 
 ## 历史 r12

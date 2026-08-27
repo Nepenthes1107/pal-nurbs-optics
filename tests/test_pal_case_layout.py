@@ -128,7 +128,7 @@ def test_build_multidistance_layout_has_three_complete_shared_grids() -> None:
     def trace_reference(distance: float, field_x: float, field_y: float) -> tuple[float, float]:
         # The synthetic map deliberately makes the three distance mappings
         # identical; the builder still calls the callback once per case.
-        assert distance in (500.0, 2000.0) or math.isinf(distance)
+        assert distance in (500.0, 1000.0) or math.isinf(distance)
         return field_x / 5.0, -field_y / 5.0
 
     cases = build_multidistance_layout(
@@ -164,3 +164,19 @@ def test_repository_weight_configuration_is_machine_readable() -> None:
     assert payload["schema_version"] == 1
     assert set(payload["zone_total_weight"]) == set(PARTITION_ZONES)
     assert set(payload["distance_fraction_by_zone"]["far"]) == set(DISTANCE_LABELS)
+
+
+def test_repository_weight_configuration_matches_fixed_objective_masses() -> None:
+    payload = load_weight_spec(Path("inputs/pal/multidistance_weights.json"))
+    totals = payload["zone_total_weight"]
+    fractions = payload["distance_fraction_by_zone"]
+    expected = {
+        "far": {"D500": 0.0, "D1000": 0.05, "Dinf": 0.2},
+        "corridor": {"D500": 0.025, "D1000": 0.2, "Dinf": 0.025},
+        "near": {"D500": 0.2, "D1000": 0.05, "Dinf": 0.0},
+    }
+    for zone, cells in expected.items():
+        for distance, mass in cells.items():
+            assert fractions[zone][distance] * totals[zone] == pytest.approx(mass, abs=1.0e-12)
+    assert fractions["far"]["D500"] == 0.0
+    assert fractions["near"]["Dinf"] == 0.0

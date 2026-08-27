@@ -11,6 +11,7 @@ from biot.e2e.pal_nurbs import (
     FieldResult,
     MinimalConfig,
     MinimalOpticalModel,
+    _baseline_metric_table,
     _evaluate,
     psf_second_moment_mm2,
 )
@@ -28,8 +29,8 @@ def _toy_cases() -> list[dict[str, object]]:
             "objective_weight": 0.5,
         },
         {
-            "case_id": "D2000_r00_c00",
-            "distance_label": "D2000",
+            "case_id": "D1000_r00_c00",
+            "distance_label": "D1000",
             "zone": "corridor",
             "field_x_deg": 0.0,
             "field_y_deg": 0.0,
@@ -82,17 +83,19 @@ class _DetachedModel:
 
 
 def test_fixed_distance_contract_is_exact() -> None:
-    assert [spec.label for spec in DISTANCE_SPECS] == ["D500", "D2000", "Dinf"]
-    assert [spec.object_distance_mm for spec in DISTANCE_SPECS[:2]] == [500.0, 2000.0]
+    assert [spec.label for spec in DISTANCE_SPECS] == ["D500", "D1000", "Dinf"]
+    assert [spec.object_distance_mm for spec in DISTANCE_SPECS[:2]] == [500.0, 1000.0]
     assert math.isinf(DISTANCE_SPECS[2].object_distance_mm)
 
 
-def test_config_requires_fixed_11_by_11_grid() -> None:
+def test_config_requires_fixed_11_by_11_fov_grid() -> None:
     with pytest.raises(ValueError, match="fov_count=11"):
         MinimalConfig(fov_count=9)
     config = MinimalConfig(device="cpu", requested_np=32, fft_size_px=64)
     assert config.fov_count == 11
     assert config.weights_json.endswith("multidistance_weights.json")
+    assert config.max_accepted_steps == 50
+    assert config.early_stopping_patience == 7
 
 
 def test_psf_second_moment_is_energy_normalized_and_differentiable() -> None:
@@ -118,7 +121,7 @@ def test_weighted_m2_evaluation_accumulates_gradient_and_rows() -> None:
     assert len(rows) == 3
     assert math.isclose(sum(row["objective_weight"] for row in rows), 1.0)
     assert health["case_count"] == 3
-    assert set(health["by_distance"]) == {"D500", "D2000", "Dinf"}
+    assert set(health["by_distance"]) == {"D500", "D1000", "Dinf"}
     assert model.parameter.grad is not None
     assert torch.isfinite(model.parameter.grad)
     assert abs(float(model.parameter.grad)) > 0.0
@@ -130,7 +133,54 @@ def test_weighted_m2_evaluation_fails_when_case_is_detached() -> None:
         _evaluate(_DetachedModel(), _toy_cases(), with_grad=True)
 
 
-def test_real_model_raw_psf_and_gradient_reach_11x11_pal() -> None:
+def test_zone_distance_baseline_normalization_makes_baseline_loss_one() -> None:
+    model = _ToyModel()
+    _, raw_rows, _ = _evaluate(model, _toy_cases(), with_grad=False)
+    baseline_metrics = _baseline_metric_table(raw_rows, require_complete=False)
+    model.parameter.grad = None
+    loss, rows, _ = _evaluate(
+        model, _toy_cases(), with_grad=True, baseline_metrics=baseline_metrics
+    )
+    assert loss == pytest.approx(1.0, abs=1.0e-12)
+    assert all(row["normalized_metric"] == pytest.approx(1.0, abs=1.0e-12) for row in rows)
+
+
+class _AstigToyModel(_ToyModel):
+    def astig_A_by_zone(self) -> dict[str, torch.Tensor]:
+        value = self.parameter.square() + 1.0
+        return {"astig_left": value, "astig_right": value + 1.0}
+
+
+def test_astigmatism_zone_uses_m_over_a_astigmatism_a() -> None:
+    model = _AstigToyModel()
+    cases = [
+        {
+            "case_id": "D500_astig_left",
+            "distance_label": "D500",
+            "zone": "astig_left",
+            "field_x_deg": 0.0,
+            "field_y_deg": 0.0,
+            "objective_weight": 0.5,
+        },
+        {
+            "case_id": "D1000_astig_right",
+            "distance_label": "D1000",
+            "zone": "astig_right",
+            "field_x_deg": 0.0,
+            "field_y_deg": 0.0,
+            "objective_weight": 0.5,
+        },
+    ]
+    loss, rows, _ = _evaluate(model, cases, with_grad=True)
+    expected = 0.5 * float(model.parameter.square() + 1.0) + 0.5 * float(model.parameter.square() + 2.0)
+    assert loss == pytest.approx(expected, rel=1.0e-12)
+    assert all(row["loss_metric_name"] == "astig_A_D" for row in rows)
+    assert all(row["astig_A_D"] > 1.0 for row in rows)
+    assert model.parameter.grad is not None
+    assert torch.isfinite(model.parameter.grad)
+
+
+def test_real_model_raw_psf_and_gradient_reach_7x7_pal() -> None:
     config = MinimalConfig(
         device="cpu",
         requested_np=32,

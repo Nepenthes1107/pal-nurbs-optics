@@ -2,7 +2,7 @@
 
 本模块只负责非可微的实验布局：
 
-* 三个固定物距 ``500 mm``、``2000 mm`` 和无穷远；
+* 三个固定物距 ``500 mm``、``1000 mm`` 和无穷远；
 * 三个物距共用同一个 11×11 视场角网格；
 * 用基线 PAL 后表面的 chief/reference ray 落点确定分区；
 * 将显式权重矩阵展开为每个 case 的归一化 loss 权重。
@@ -59,7 +59,7 @@ class DistanceSpec:
 
 DISTANCE_SPECS = (
     DistanceSpec("D500", 500.0, "near"),
-    DistanceSpec("D2000", 2000.0, "corridor"),
+    DistanceSpec("D1000", 1000.0, "corridor"),
     DistanceSpec("Dinf", math.inf, "far"),
 )
 DISTANCE_LABELS = tuple(spec.label for spec in DISTANCE_SPECS)
@@ -295,8 +295,8 @@ def _validate_weight_spec(payload: Mapping[str, Any]) -> dict[str, Any]:
             if label not in row:
                 raise ValueError(f"distance fractions for {zone} lack {label}")
             value = float(row[label])
-            if not math.isfinite(value) or value <= 0.0:
-                raise ValueError(f"distance fraction {zone}/{label} must be finite and positive")
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"distance fraction {zone}/{label} must be finite and non-negative")
             fraction[zone][label] = value
         row_total = sum(fraction[zone].values())
         if abs(row_total - 1.0) > 1.0e-12:
@@ -378,7 +378,7 @@ def build_multidistance_layout(
     """Build all ``3 × 11 × 11`` cases without selection or dropping."""
     specs = tuple(distance_specs)
     if tuple(spec.label for spec in specs) != DISTANCE_LABELS:
-        raise ValueError("distance specs must be exactly D500, D2000, Dinf")
+        raise ValueError("distance specs must be exactly D500, D1000, Dinf")
     field_grid = generate_fov_grid(
         field_min_deg=field_min_deg, field_max_deg=field_max_deg, count=field_count
     )
