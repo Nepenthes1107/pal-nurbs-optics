@@ -36,6 +36,7 @@
 - Windows/WDDM 下 PyTorch CUDA allocator inactive blocks 曾造成 host commit 压力。
 - 当前实现逐 case 释放图并调用 `torch.cuda.empty_cache()`；GRIN3 使用 activation checkpoint，物理方程和梯度路径不变。
 - startup gradient 的中心/边缘 case 会作为 `_retain_training_cache()` 的显式 `extra_cases` 在缓存冻结前物化；不增加额外全局完整性扫描，baseline 后仍仅保留正式训练 case。
+- 底层前向追迹失败只抛出异常，不再向项目根目录自动写入 `optimization/wrong_result`；PAL 候选失败由对应 run 的资格筛选进度文件记录。
 - 长任务必须持续写 checkpoint、history、run state 和退出信息；异常后从最近可验证 checkpoint 恢复，不降低正式采样或门槛。
 
 ## 验证入口

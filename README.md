@@ -54,6 +54,7 @@ python -m biot.gui
 - 控制网格为 `7x7 -> 11x11 -> 19x19`，通过精确 knot refinement 晋级。
 - 80 个真实 case：Far 18、Intermediate 12、Near 18、Peripheral-left/right 各 16。
 - 使用真实可微追迹、GRIN3 固定步长 RK4、连续 OPL、去 pupil tilt FFT PSF；离线 PSF 不参与反传。
+- 追迹失败保持失败关闭，由当前 run 的资格筛选进度记录错误；底层追迹不在项目根目录自动导出 `wrong_result` Excel。
 - `J=(0.85*J_functional+0.15*J_peripheral)`，Original PAL 分母固定。
 - 仅使用 trace/PSF health、`P_far`、`ADD` 和单步 sag trust region 约束。
 - 不自动运行历史 192-case posthoc、PSF 数据库、渲染或 SSIM 链。

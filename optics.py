@@ -4193,8 +4193,6 @@ class Lensdata():
                     print('Surface aperture length:', self.surfaces[i].semi_dia)
                     print('Forward tracing ray intersection position:', p)
                     print('Forward tracing ray intersection normal:', d)
-                    savepath = './optimization/wrong_result'
-                    self.save_lensdata(savepath)
                     raise Exception('forward trace: invalid ray， stop at surface {}'.format(str(i + 1)))
                 if OPD_flag:
                     PD = (p[..., 2] + distance - ray.o[..., 2]) / ray.d[..., 2]
@@ -4434,8 +4432,6 @@ class Lensdata():
     #                     print('终止面孔径长度', self.surfaces[i].semi_dia)
     #                     print(p)
     #                     print(d)
-    #                     savepath = './optimization/wrong_result'
-    #                     self.save_lensdata(savepath)
     #                     raise Exception('forward trace: invalid ray， stop at surface {}'.format(str(i + 1)))
     #                 if OPD_flag:
     #                     PD = (p[..., 2] + distance - ray.o[..., 2]) / ray.d[..., 2]
