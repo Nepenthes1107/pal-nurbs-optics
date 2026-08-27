@@ -437,13 +437,17 @@ def _training_case_keys(
 
 
 def _retain_training_cache(
-    model: MinimalOpticalModel, cases: Sequence[Mapping[str, Any]],
+    model: MinimalOpticalModel,
+    cases: Sequence[Mapping[str, Any]],
+    *,
+    extra_cases: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, int]:
-    keep = _training_case_keys(model, cases)
+    required_cases = [*cases, *extra_cases]
+    keep = _training_case_keys(model, required_cases)
     materialized = 0
     system_and_rays = getattr(model, "_system_and_rays", None)
     if callable(system_and_rays):
-        for case in cases:
+        for case in required_cases:
             key = model._key(
                 float(case["distance_mm"]),
                 float(case["field_x_deg"]),
@@ -1166,7 +1170,11 @@ def _prepare_case_layout(
             flush=True,
         )
     save_phase_progress("complete")
-    cache_audit = _retain_training_cache(model, training_cases)
+    cache_audit = _retain_training_cache(
+        model,
+        training_cases,
+        extra_cases=_startup_cases(),
+    )
     _write_json_atomic(
         output / "preoptimization" / "forward_qualification_audit.json",
         {
@@ -1603,6 +1611,23 @@ def _accumulate_startup_case_gradients(
     return grad.detach().clone()
 
 
+def _startup_cases() -> list[dict[str, Any]]:
+    return [
+        {
+            "case_id": "startup_center",
+            "distance_mm": 2000.0,
+            "field_x_deg": 0.0,
+            "field_y_deg": 0.0,
+        },
+        {
+            "case_id": "startup_edge",
+            "distance_mm": 2000.0,
+            "field_x_deg": 40.0,
+            "field_y_deg": 40.0,
+        },
+    ]
+
+
 def _write_history(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
     if not rows:
         return
@@ -1848,10 +1873,7 @@ def _run_bound(
             "ADD_D": float(baseline_power_tensors["ADD_D"].detach().cpu()),
         }
         # 保留原有最小启动检查：中心/边缘真实 PSF 与非零有限梯度。
-        startup_cases = [
-            {"case_id": "startup_center", "distance_mm": 2000.0, "field_x_deg": 0.0, "field_y_deg": 0.0},
-            {"case_id": "startup_edge", "distance_mm": 2000.0, "field_x_deg": 40.0, "field_y_deg": 40.0},
-        ]
+        startup_cases = _startup_cases()
         _accumulate_startup_case_gradients(model, module, config, startup_cases)
         module.zero_grad(set_to_none=True)
 

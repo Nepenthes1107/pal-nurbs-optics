@@ -455,6 +455,64 @@ def test_training_cache_materializes_all_cases_then_releases_aiming_templates(
     assert model._cache_frozen
 
 
+def test_retain_training_cache_materializes_extra_cases_before_freeze() -> None:
+    class System:
+        def __init__(self) -> None:
+            self.released = False
+
+        def release_biot_lens(self) -> None:
+            self.released = True
+
+    class Model:
+        device = torch.device("cpu")
+        _key = staticmethod(MinimalOpticalModel._key)
+
+        def __init__(self) -> None:
+            self._cache = {}
+            self._templates = {500.0: (System(), object())}
+            self._cache_frozen = False
+
+        def _system_and_rays(self, distance, x, y):
+            key = self._key(distance, x, y)
+            self._cache[key] = (System(), object())
+            return self._cache[key]
+
+    model = Model()
+    training_case = {
+        "distance_mm": 500.0,
+        "field_x_deg": 1.0,
+        "field_y_deg": 2.0,
+    }
+    startup_case = {
+        "distance_mm": 2000.0,
+        "field_x_deg": 40.0,
+        "field_y_deg": 40.0,
+    }
+    stale_key = model._key(2000.0, 3.0, 4.0)
+    stale_system = System()
+    model._cache[stale_key] = (stale_system, object())
+
+    audit = _retain_training_cache(
+        model,
+        [training_case],
+        extra_cases=[startup_case],
+    )
+
+    assert set(model._cache) == {
+        model._key(500.0, 1.0, 2.0),
+        model._key(2000.0, 40.0, 40.0),
+    }
+    assert stale_system.released
+    assert model._cache_frozen
+    assert audit == {
+        "before": 3,
+        "retained": 2,
+        "removed": 1,
+        "materialized": 2,
+        "released_templates": 1,
+    }
+
+
 def test_refined_module_rebinds_frozen_training_cache_surfaces() -> None:
     class Surface:
         def __init__(self, perturbation):
@@ -521,7 +579,11 @@ def test_case_layout_filters_oversampled_pool_before_final_fps(
         "write_preoptimization_artifacts",
         lambda **kwargs: written.update(kwargs),
     )
-    monkeypatch.setattr(pal_nurbs, "_retain_training_cache", lambda model, rows: {"retained": 1})
+    monkeypatch.setattr(
+        pal_nurbs,
+        "_retain_training_cache",
+        lambda model, rows, **kwargs: {"retained": 1},
+    )
 
     class Model:
         def validate_training_case_wfno(self, case):

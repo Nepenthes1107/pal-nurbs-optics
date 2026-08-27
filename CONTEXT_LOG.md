@@ -1,6 +1,6 @@
 # 当前工程状态
 
-更新时间：2026-08-26。
+更新时间：2026-08-27。
 
 ## 当前主线
 
@@ -35,6 +35,7 @@
 
 - Windows/WDDM 下 PyTorch CUDA allocator inactive blocks 曾造成 host commit 压力。
 - 当前实现逐 case 释放图并调用 `torch.cuda.empty_cache()`；GRIN3 使用 activation checkpoint，物理方程和梯度路径不变。
+- startup gradient 的中心/边缘 case 会作为 `_retain_training_cache()` 的显式 `extra_cases` 在缓存冻结前物化；不增加额外全局完整性扫描，baseline 后仍仅保留正式训练 case。
 - 长任务必须持续写 checkpoint、history、run state 和退出信息；异常后从最近可验证 checkpoint 恢复，不降低正式采样或门槛。
 
 ## 验证入口
@@ -44,4 +45,4 @@ python -m pytest tests -q --basetemp .tmp_pytest
 python run_pal_nurbs.py --output .tmp_prepare --excel eye_image_glass_grad3.xlsx --device cpu --prepare-only
 ```
 
-2026-08-26 基线验收：`.venv` 中完整测试为 `150 passed`，无跳过；GUI smoke 使用 `pytest-qt==4.4.0`。PyTorch 2.0.1 在 Windows 中文路径下的 checkpoint 原子写入改用 Python 二进制文件句柄，仍采用原 torch 序列化、`fsync` 和原子替换。
+2026-08-27 验收：PAL-NURBS 定向测试 `20 passed`，完整测试 `151 passed`，无跳过。GUI smoke 使用 `pytest-qt==4.4.0`。PyTorch 2.0.1 在 Windows 中文路径下的 checkpoint 原子写入改用 Python 二进制文件句柄，仍采用原 torch 序列化、`fsync` 和原子替换。
