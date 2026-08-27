@@ -1,19 +1,18 @@
 from __future__ import annotations
 
-import pytest
 import torch
 
 from biot.e2e.regional_nurbs import (
+    CONTROL_COUNT,
     FixedWeightNURBSPerturbation,
-    audit_exact_refinement,
     bspline_basis_derivative,
 )
 
 
 def test_fixed_weight_nurbs_partition_boundary_and_convex_hull() -> None:
-    surface = FixedWeightNURBSPerturbation(7)
+    surface = FixedWeightNURBSPerturbation()
     with torch.no_grad():
-        surface.inner_q.copy_(torch.linspace(-0.8, 0.8, 25).reshape(5, 5))
+        surface.inner_q.copy_(torch.linspace(-0.8, 0.8, 81).reshape(9, 9))
     x = torch.linspace(-40.0, 40.0, 101, dtype=torch.float64)
     y = torch.linspace(-40.0, 40.0, 101, dtype=torch.float64)
     yy, xx = torch.meshgrid(y, x, indexing="ij")
@@ -31,10 +30,10 @@ def test_fixed_weight_nurbs_partition_boundary_and_convex_hull() -> None:
 
 
 def test_nurbs_coordinate_and_control_gradients_are_finite() -> None:
-    surface = FixedWeightNURBSPerturbation(7)
+    surface = FixedWeightNURBSPerturbation()
     generator = torch.Generator().manual_seed(7)
     with torch.no_grad():
-        surface.inner_q.copy_(0.5 * (2.0 * torch.rand((5, 5), generator=generator) - 1.0))
+        surface.inner_q.copy_(0.5 * (2.0 * torch.rand((9, 9), generator=generator) - 1.0))
     x = torch.tensor([-39.5, -20.0, -3.2, 19.9, 39.5], dtype=torch.float64, requires_grad=True)
     y = torch.tensor([-31.0, -10.0, 2.5, 20.0, 33.0], dtype=torch.float64, requires_grad=True)
     sag, dx, dy, *_ = surface.all_derivatives_raw(x, y)
@@ -46,16 +45,10 @@ def test_nurbs_coordinate_and_control_gradients_are_finite() -> None:
     assert torch.isfinite(surface.inner_q.grad).all()
 
 
-@pytest.mark.parametrize("target", [11, 19])
-def test_homogeneous_boehm_refinement_is_exact(target: int) -> None:
-    surface = FixedWeightNURBSPerturbation(7)
-    generator = torch.Generator().manual_seed(19)
-    with torch.no_grad():
-        surface.inner_q.copy_(0.3 * (2.0 * torch.rand((5, 5), generator=generator) - 1.0))
-    fine = surface.refined(11)
-    if target == 19:
-        fine = fine.refined(19)
-    audit = audit_exact_refinement(surface, fine, samples=129)
-    assert audit.max_abs_sag_mm <= 1e-12
-    assert audit.max_abs_first_derivative <= 1e-12
-    assert audit.max_abs_second_derivative_per_mm <= 1e-11
+def test_nurbs_parameterization_is_fixed_to_11_by_11() -> None:
+    surface = FixedWeightNURBSPerturbation()
+    assert CONTROL_COUNT == 11
+    assert surface.control_shape == (11, 11)
+    assert surface.trainable_dof == 9 * 9
+    assert tuple(surface.x_knots.shape) == (15,)
+    assert tuple(surface.y_knots.shape) == (15,)

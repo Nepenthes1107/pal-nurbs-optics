@@ -7,11 +7,12 @@
 from .config import E2EConfig, as_torch_device_dtype, set_random_seed
 from .psf_fft import TorchFFTPSFResult, torch_fft_psf_from_phase
 from .rays import RayBundle, make_pupil_rays, pupil_disk_grid
-from .regional_nurbs import FixedWeightNURBSPerturbation
+from .regional_nurbs import CONTROL_COUNT, FixedWeightNURBSPerturbation
 from .tracing import PALSurface, PlaneSurface, SphericalSurface, TraceResult, trace_to_image_plane
 
 __all__ = [
     "E2EConfig",
+    "CONTROL_COUNT",
     "FixedWeightNURBSPerturbation",
     "PALSurface",
     "PlaneSurface",

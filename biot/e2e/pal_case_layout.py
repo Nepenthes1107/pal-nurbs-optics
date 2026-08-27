@@ -1,40 +1,68 @@
-"""Phase 16 dense-field training-case design and pre-optimization audit plots."""
+"""固定多物距 11×11 FOV 网格及 PAL 分区权重。
+
+本模块只负责非可微的实验布局：
+
+* 三个固定物距 ``500 mm``、``2000 mm`` 和无穷远；
+* 三个物距共用同一个 11×11 视场角网格；
+* 用基线 PAL 后表面的 chief/reference ray 落点确定分区；
+* 将显式权重矩阵展开为每个 case 的归一化 loss 权重。
+
+这里不做候选池、FPS、资格筛选、覆盖率审计或 PSF 渲染。任何固定网格
+case 的主光线追迹失败、落在 monitored aperture 外或权重配置不完整都会
+直接失败，不能通过丢弃 case 继续运行。
+"""
 from __future__ import annotations
 
-import hashlib
-import contextlib
-import io
+from dataclasses import dataclass
 import json
 import math
-import subprocess
-import sys
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 
 
-TRAINING_GROUP_COUNTS = {
-    "far": 18, "intermediate": 12, "near": 18,
-    "peripheral_left": 16, "peripheral_right": 16,
-}
-TOTAL_TRAINING_CASES = sum(TRAINING_GROUP_COUNTS.values())
-CORRIDOR_LAYER_COUNT = 4
-CORRIDOR_POINTS_PER_LAYER = TRAINING_GROUP_COUNTS["intermediate"] // CORRIDOR_LAYER_COUNT
-PERIPHERAL_BAND_COUNTS = {"upper": 5, "middle": 5, "lower": 6}
-PERIPHERAL_REAR_MIRROR_TOLERANCE_MM = 1.0e-4
-REFERENCE_RETRACE_TOLERANCE_MM = 1.0e-8
-FUNCTIONAL_GROUPS = ("far", "intermediate", "near")
-PERIPHERAL_GROUPS = ("peripheral_left", "peripheral_right")
-PARTITION_ORDER = (
-    "far", "corridor", "near",
-    "peripheral_astig_left", "peripheral_astig_right",
+PARTITION_ZONES = (
+    "far",
+    "corridor",
+    "near",
+    "astig_left",
+    "astig_right",
 )
-ZONE_TO_GROUP = {
-    "far": "far", "corridor": "intermediate", "near": "near",
-    "astig_left": "peripheral_left", "astig_right": "peripheral_right",
+MASK_NAME_BY_ZONE = {
+    "far": "far",
+    "corridor": "corridor",
+    "near": "near",
+    "astig_left": "peripheral_astig_left",
+    "astig_right": "peripheral_astig_right",
 }
-GROUP_TO_ZONE = {value: key for key, value in ZONE_TO_GROUP.items()}
+PARTITION_MASK_ORDER = tuple(MASK_NAME_BY_ZONE[zone] for zone in PARTITION_ZONES)
+
+
+@dataclass(frozen=True)
+class DistanceSpec:
+    """One fixed object-distance condition.
+
+    ``object_distance_mm=math.inf`` is passed to the Excel/BIOT loader as the
+    literal ``Infinity`` condition.  The label is used in case IDs and weight
+    configuration, so no finite approximation is substituted for infinity.
+    """
+
+    label: str
+    object_distance_mm: float
+    focus_zone: str
+
+    @property
+    def serialized_distance(self) -> float | str:
+        return "Infinity" if math.isinf(self.object_distance_mm) else float(self.object_distance_mm)
+
+
+DISTANCE_SPECS = (
+    DistanceSpec("D500", 500.0, "near"),
+    DistanceSpec("D2000", 2000.0, "corridor"),
+    DistanceSpec("Dinf", math.inf, "far"),
+)
+DISTANCE_LABELS = tuple(spec.label for spec in DISTANCE_SPECS)
 
 
 def _read_json(path: str | Path) -> dict[str, Any]:
@@ -44,1243 +72,361 @@ def _read_json(path: str | Path) -> dict[str, Any]:
     return payload
 
 
-def _sha256_file(path: str | Path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _canonical_json_sha256(payload: Any) -> str:
-    encoded = json.dumps(
-        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
-    temporary.replace(path)
-
-
 def _zone_arrays(payload: Mapping[str, Any]) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
-    x = np.asarray(payload["x_mm"], dtype=np.float64)
-    y = np.asarray(payload["physical_y_mm"], dtype=np.float64)
-    masks = {name: np.asarray(mask, dtype=bool) for name, mask in dict(payload["masks"]).items()}
-    shape = (y.size, x.size)
-    if x.ndim != 1 or y.ndim != 1 or x.size < 2 or y.size < 2:
+    try:
+        x = np.asarray(payload["x_mm"], dtype=np.float64)
+        physical_y = np.asarray(payload["physical_y_mm"], dtype=np.float64)
+        raw_masks = payload["masks"]
+    except KeyError as exc:
+        raise ValueError(f"zones payload is missing {exc.args[0]!r}") from exc
+    if not isinstance(raw_masks, Mapping):
+        raise ValueError("zones masks must be an object")
+    if x.ndim != 1 or physical_y.ndim != 1 or x.size < 2 or physical_y.size < 2:
         raise ValueError("zone coordinates must be non-trivial 1-D arrays")
-    if any(mask.shape != shape for mask in masks.values()):
-        raise ValueError("zone masks do not match x_mm/physical_y_mm")
-    return x, y, masks
+    if not np.isfinite(x).all() or not np.isfinite(physical_y).all():
+        raise ValueError("zone coordinates must be finite")
+    masks = {
+        str(name): np.asarray(mask, dtype=bool)
+        for name, mask in raw_masks.items()
+    }
+    expected_shape = (physical_y.size, x.size)
+    if any(mask.shape != expected_shape for mask in masks.values()):
+        raise ValueError("zone masks do not match physical_y_mm/x_mm shape")
+    required = set(PARTITION_MASK_ORDER) | {"monitored"}
+    missing = sorted(required - set(masks))
+    if missing:
+        raise ValueError("zones payload is missing masks: " + ", ".join(missing))
+    return x, physical_y, masks
+
+
+@dataclass(frozen=True)
+class PartitionClassification:
+    zone: str
+    mode: str
+    nearest_partition_distance_mm: float
+    grid_x_mm: float
+    grid_y_mm: float
+
+
+class PartitionMap:
+    """Validated PAL partition masks with an explicit gap-extension rule.
+
+    The stored masks are authoritative when a point falls in exactly one
+    partition cell.  The current masks intentionally leave some monitored
+    safety-band cells unlabelled.  For a fixed FOV grid those cells are mapped
+    to the closest stored partition cell in physical local-surface ``(x,y)``;
+    this rule is deterministic and recorded in each case's ``partition_mode``.
+    A point outside ``monitored`` is an input/layout error and raises.
+    """
+
+    def __init__(
+        self,
+        x_mm: np.ndarray,
+        physical_y_mm: np.ndarray,
+        masks: Mapping[str, np.ndarray],
+        *,
+        nearest_tie_tolerance_mm: float = 1.0e-10,
+    ) -> None:
+        self.x_mm = np.asarray(x_mm, dtype=np.float64)
+        self.physical_y_mm = np.asarray(physical_y_mm, dtype=np.float64)
+        self.masks = {str(name): np.asarray(mask, dtype=bool) for name, mask in masks.items()}
+        self.pitch_x_mm = float(np.median(np.abs(np.diff(self.x_mm))))
+        self.pitch_y_mm = float(np.median(np.abs(np.diff(self.physical_y_mm))))
+        if not math.isfinite(self.pitch_x_mm) or self.pitch_x_mm <= 0.0:
+            raise ValueError("zone x coordinate pitch must be finite and positive")
+        if not math.isfinite(self.pitch_y_mm) or self.pitch_y_mm <= 0.0:
+            raise ValueError("zone y coordinate pitch must be finite and positive")
+        self.nearest_tie_tolerance_mm = float(nearest_tie_tolerance_mm)
+        if not math.isfinite(self.nearest_tie_tolerance_mm) or self.nearest_tie_tolerance_mm < 0.0:
+            raise ValueError("nearest partition tie tolerance must be finite and non-negative")
+        self._partition_points: dict[str, np.ndarray] = {}
+        for zone in PARTITION_ZONES:
+            mask_name = MASK_NAME_BY_ZONE[zone]
+            rows, columns = np.nonzero(self.masks[mask_name])
+            if rows.size == 0:
+                raise ValueError(f"partition mask {mask_name!r} is empty")
+            self._partition_points[zone] = np.column_stack(
+                (self.x_mm[columns], self.physical_y_mm[rows])
+            )
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> "PartitionMap":
+        x, physical_y, masks = _zone_arrays(payload)
+        return cls(x, physical_y, masks)
+
+    @classmethod
+    def from_json(cls, path: str | Path) -> "PartitionMap":
+        return cls.from_payload(_read_json(path))
+
+    def _nearest_cell(self, x_mm: float, physical_y_mm: float) -> tuple[int, int, float, float]:
+        if not math.isfinite(float(x_mm)) or not math.isfinite(float(physical_y_mm)):
+            raise ValueError("partition point must be finite")
+        ix = int(np.argmin(np.abs(self.x_mm - float(x_mm))))
+        iy = int(np.argmin(np.abs(self.physical_y_mm - float(physical_y_mm))))
+        grid_x = float(self.x_mm[ix])
+        grid_y = float(self.physical_y_mm[iy])
+        dx = abs(grid_x - float(x_mm))
+        dy = abs(grid_y - float(physical_y_mm))
+        if dx > 0.5 * self.pitch_x_mm + 1.0e-9 or dy > 0.5 * self.pitch_y_mm + 1.0e-9:
+            raise ValueError(
+                "partition point is outside the stored zone grid: "
+                f"({float(x_mm):.9g}, {float(physical_y_mm):.9g}) mm"
+            )
+        return ix, iy, grid_x, grid_y
+
+    def classify(self, *, x_mm: float, physical_y_mm: float) -> PartitionClassification:
+        ix, iy, grid_x, grid_y = self._nearest_cell(x_mm, physical_y_mm)
+        if not bool(self.masks["monitored"][iy, ix]):
+            raise ValueError(
+                "fixed FOV point falls outside monitored PAL aperture: "
+                f"({float(x_mm):.9g}, {float(physical_y_mm):.9g}) mm"
+            )
+        active = [
+            zone
+            for zone in PARTITION_ZONES
+            if bool(self.masks[MASK_NAME_BY_ZONE[zone]][iy, ix])
+        ]
+        if len(active) > 1:
+            raise ValueError(
+                "PAL partition masks overlap at grid cell "
+                f"({grid_x:.9g}, {grid_y:.9g}) mm: {active}"
+            )
+        if len(active) == 1:
+            return PartitionClassification(
+                zone=active[0],
+                mode="stored_mask",
+                nearest_partition_distance_mm=0.0,
+                grid_x_mm=grid_x,
+                grid_y_mm=grid_y,
+            )
+
+        point = np.asarray((float(x_mm), float(physical_y_mm)), dtype=np.float64)
+        distances = {
+            zone: float(np.linalg.norm(points - point, axis=1).min())
+            for zone, points in self._partition_points.items()
+        }
+        minimum = min(distances.values())
+        tied = [
+            zone
+            for zone in PARTITION_ZONES
+            if abs(distances[zone] - minimum) <= self.nearest_tie_tolerance_mm
+        ]
+        # The order is part of the fixed method identity.  Ties occur only on
+        # a geometric boundary; choosing the sealed order is deterministic and
+        # is recorded as a tie mode rather than hidden as a dropped sample.
+        chosen = tied[0]
+        mode = "nearest_partition_cell_tie" if len(tied) > 1 else "nearest_partition_cell"
+        return PartitionClassification(
+            zone=chosen,
+            mode=mode,
+            nearest_partition_distance_mm=minimum,
+            grid_x_mm=grid_x,
+            grid_y_mm=grid_y,
+        )
 
 
 def classify_partition_point(
     zones_payload: Mapping[str, Any], *, x_mm: float, physical_y_mm: float
-) -> str | None:
-    """Classify a traced rear-surface point using the stored mask cells."""
-    x, y, masks = _zone_arrays(zones_payload)
-    ix, iy = int(np.argmin(abs(x - x_mm))), int(np.argmin(abs(y - physical_y_mm)))
-    xp, yp = float(np.median(abs(np.diff(x)))), float(np.median(abs(np.diff(y))))
-    if abs(float(x[ix]) - x_mm) > 0.5 * xp + 1e-9 or abs(float(y[iy]) - physical_y_mm) > 0.5 * yp + 1e-9:
-        return None
-    active = [name for name in PARTITION_ORDER if name in masks and bool(masks[name][iy, ix])]
-    if len(active) != 1:
-        return None
-    return {"peripheral_astig_left": "astig_left", "peripheral_astig_right": "astig_right"}.get(active[0], active[0])
+) -> str:
+    """Classify one point with the same explicit rule used by training layout."""
+    return PartitionMap.from_payload(zones_payload).classify(
+        x_mm=x_mm, physical_y_mm=physical_y_mm
+    ).zone
 
 
-def _mask_name(zone: str) -> str:
-    return {"astig_left": "peripheral_astig_left", "astig_right": "peripheral_astig_right"}.get(zone, zone)
-
-
-def _inside_clearance_mm(payload: Mapping[str, Any], mask_name: str, x_mm: float, y_mm: float) -> float:
-    """Conservative point-to-nearest-outside-cell clearance of a raster mask."""
-    x, y, masks = _zone_arrays(payload)
-    mask = masks[mask_name]
-    ix, iy = int(np.argmin(abs(x - x_mm))), int(np.argmin(abs(y - y_mm)))
-    if not bool(mask[iy, ix]):
-        return -math.inf
-    oy, ox = np.nonzero(~mask)
-    if ox.size == 0:
-        return math.inf
-    distance = np.hypot(x[ox] - x_mm, y[oy] - y_mm).min()
-    half_diagonal = 0.5 * math.hypot(float(np.median(abs(np.diff(x)))), float(np.median(abs(np.diff(y)))))
-    return max(0.0, float(distance) - half_diagonal)
-
-
-def generate_dense_candidate_fields(
-    *, field_min_deg: float, field_max_deg: float, field_step_deg: float
+def generate_fov_grid(
+    *, field_min_deg: float, field_max_deg: float, count: int = 11
 ) -> list[dict[str, Any]]:
-    if field_step_deg <= 0 or field_max_deg <= field_min_deg:
-        raise ValueError("invalid dense candidate field grid")
-    intervals = int(round((field_max_deg - field_min_deg) / field_step_deg))
-    values = field_min_deg + field_step_deg * np.arange(intervals + 1, dtype=np.float64)
-    if abs(float(values[-1]) - field_max_deg) > 1e-9:
-        raise ValueError("candidate range must be exactly divisible by step")
-    return [
-        {"candidate_id": f"cand_{index + 1:04d}", "field_x_deg": float(fx), "field_y_deg": float(fy)}
-        for index, (fy, fx) in enumerate((fy, fx) for fy in values for fx in values)
-    ]
-
-
-def trace_candidate_fields(
-    candidates: Sequence[Mapping[str, Any]], *,
-    trace_reference: Callable[[float, float], tuple[float, float]],
-    zones_payload: Mapping[str, Any],
-    zone_boundary_safety_mm: float | Mapping[str, float],
-    aperture_edge_safety_mm: float,
-    progress_path: str | Path | None = None,
-    trace_identity: Mapping[str, Any] | None = None,
-    progress_interval: int = 100,
-) -> list[dict[str, Any]]:
-    """Trace every field through Original PAL with fail evidence and exact resume state."""
-    if progress_interval <= 0:
-        raise ValueError("progress_interval must be positive")
-    aperture_safety = float(aperture_edge_safety_mm)
-    if not math.isfinite(aperture_safety) or aperture_safety < 0.0:
-        raise ValueError("aperture-edge safety margin must be finite and non-negative")
-    partition_zones = {"far", "corridor", "near", "astig_left", "astig_right"}
-    if isinstance(zone_boundary_safety_mm, Mapping):
-        supplied_zone_safety = {
-            str(name): float(value) for name, value in zone_boundary_safety_mm.items()
-        }
-        missing = sorted(
-            zone for zone in partition_zones
-            if zone not in supplied_zone_safety and "default" not in supplied_zone_safety
-        )
-        if missing:
-            raise ValueError(
-                "missing zone-boundary safety margins for: " + ", ".join(missing)
+    """Return one deterministic square 11×11 field-angle grid in degree."""
+    count = int(count)
+    if count != 11:
+        raise ValueError("the multidistance method requires an 11x11 FOV grid")
+    field_min = float(field_min_deg)
+    field_max = float(field_max_deg)
+    if not math.isfinite(field_min) or not math.isfinite(field_max) or field_max <= field_min:
+        raise ValueError("FOV bounds must be finite with max > min")
+    values = np.linspace(field_min, field_max, count, dtype=np.float64)
+    result: list[dict[str, Any]] = []
+    for row, field_y in enumerate(values):
+        for column, field_x in enumerate(values):
+            fx = 0.0 if abs(float(field_x)) < 1.0e-14 else float(field_x)
+            fy = 0.0 if abs(float(field_y)) < 1.0e-14 else float(field_y)
+            result.append(
+                {
+                    "grid_row": row,
+                    "grid_column": column,
+                    "field_x_deg": fx,
+                    "field_y_deg": fy,
+                }
             )
-        resolved_zone_safety = {
-            zone: (
-                supplied_zone_safety[zone]
-                if zone in supplied_zone_safety
-                else supplied_zone_safety["default"]
-            )
-            for zone in partition_zones
-        }
-        identity_zone_safety: float | dict[str, float] = supplied_zone_safety
-    else:
-        shared_zone_safety = float(zone_boundary_safety_mm)
-        resolved_zone_safety = {
-            zone: shared_zone_safety for zone in partition_zones
-        }
-        identity_zone_safety = shared_zone_safety
-    if any(
-        not math.isfinite(value) or value < 0.0
-        for value in resolved_zone_safety.values()
-    ):
-        raise ValueError("zone-boundary safety margins must be finite and non-negative")
-    progress = None if progress_path is None else Path(progress_path)
-    identity_payload = {
-        "candidates": [dict(candidate) for candidate in candidates],
-        "zones_sha256": _canonical_json_sha256(zones_payload),
-        "zone_boundary_safety_mm": identity_zone_safety,
-        "aperture_edge_safety_mm": aperture_safety,
-        "trace_identity": None if trace_identity is None else dict(trace_identity),
-    }
-    identity_sha256 = _canonical_json_sha256(identity_payload)
-    traced: list[dict[str, Any]] = []
-    if progress is not None and progress.exists():
-        saved = _read_json(progress)
-        if saved.get("schema_version") != 1 or saved.get("identity_sha256") != identity_sha256:
-            raise ValueError(f"candidate progress identity mismatch: {progress}")
-        saved_rows = saved.get("rows")
-        if not isinstance(saved_rows, list):
-            raise ValueError(f"candidate progress rows are malformed: {progress}")
-        traced = [dict(row) for row in saved_rows]
-        if int(saved.get("next_candidate_index", -1)) != len(traced):
-            raise ValueError(f"candidate progress next index is inconsistent: {progress}")
-        expected_prefix = [str(row["candidate_id"]) for row in candidates[: len(traced)]]
-        actual_prefix = [str(row.get("candidate_id")) for row in traced]
-        if actual_prefix != expected_prefix:
-            raise ValueError(f"candidate progress prefix does not match candidate grid: {progress}")
-        if len(traced) > len(candidates):
-            raise ValueError(f"candidate progress exceeds candidate grid: {progress}")
-        print(
-            f"candidate trace resume: {len(traced)}/{len(candidates)} from {progress}",
-            flush=True,
-        )
-
-    def save_progress(status: str) -> None:
-        if progress is None:
-            return
-        _write_json_atomic(
-            progress,
-            {
-                "schema_version": 1,
-                "status": status,
-                "identity_sha256": identity_sha256,
-                "identity": identity_payload,
-                "candidate_count": len(candidates),
-                "next_candidate_index": len(traced),
-                "trace_success_count": sum(row.get("trace_status") == "ok" for row in traced),
-                "trace_failure_count": sum(row.get("trace_status") != "ok" for row in traced),
-                "rows": traced,
-            },
-        )
-
-    for candidate_index, candidate in enumerate(
-        candidates[len(traced) :], start=len(traced) + 1
-    ):
-        row = dict(candidate)
-        diagnostic_stream = io.StringIO()
-        try:
-            with contextlib.redirect_stdout(diagnostic_stream), contextlib.redirect_stderr(diagnostic_stream):
-                x_mm, y_mm = trace_reference(
-                    float(row["field_x_deg"]), float(row["field_y_deg"])
-                )
-            zone = classify_partition_point(zones_payload, x_mm=x_mm, physical_y_mm=y_mm)
-            row.update({
-                "trace_status": "ok", "reference_lens_x_mm": float(x_mm),
-                "reference_lens_physical_y_mm": float(y_mm), "reference_partition_zone": zone,
-            })
-            if zone is None:
-                row.update({"zone_boundary_clearance_mm": None, "aperture_edge_clearance_mm": None, "eligible": False})
-            else:
-                zone_clearance = _inside_clearance_mm(zones_payload, _mask_name(zone), x_mm, y_mm)
-                aperture_clearance = _inside_clearance_mm(zones_payload, "monitored", x_mm, y_mm)
-                zone_safety = resolved_zone_safety[zone]
-                row.update({
-                    "zone_boundary_clearance_mm": zone_clearance,
-                    "aperture_edge_clearance_mm": aperture_clearance,
-                    "zone_boundary_safety_mm": zone_safety,
-                    "eligible": zone_clearance >= zone_safety and aperture_clearance >= aperture_safety,
-                })
-        except Exception as exc:
-            diagnostic = diagnostic_stream.getvalue()
-            row.update({
-                "trace_status": "failed", "trace_error_type": type(exc).__name__,
-                "trace_error": str(exc), "reference_partition_zone": None, "eligible": False,
-                "trace_diagnostic_character_count": len(diagnostic),
-                "trace_diagnostic_sha256": hashlib.sha256(diagnostic.encode("utf-8")).hexdigest(),
-                "trace_diagnostic_tail": diagnostic[-4000:],
-            })
-        traced.append(row)
-        if candidate_index % progress_interval == 0 or candidate_index == len(candidates):
-            save_progress("complete" if candidate_index == len(candidates) else "running")
-        if candidate_index % 500 == 0 or candidate_index == len(candidates):
-            failure_count = sum(item.get("trace_status") != "ok" for item in traced)
-            print(
-                f"candidate trace progress: {candidate_index}/{len(candidates)}, "
-                f"failures={failure_count}",
-                flush=True,
-            )
-    save_progress("complete")
-    return traced
+    return result
 
 
-def _fps_indices(
-    points: np.ndarray,
-    count: int,
-    seed_target: Sequence[float] | None = None,
-    initial_indices: Sequence[int] | None = None,
-) -> list[int]:
-    if points.ndim != 2 or points.shape[1] != 2 or points.shape[0] < count or count <= 0:
-        raise ValueError(f"FPS needs at least {count} finite 2-D points, got {points.shape}")
-    if not np.isfinite(points).all():
-        raise ValueError("FPS points must be finite")
-    if initial_indices is None:
-        target = points.mean(0) if seed_target is None else np.asarray(seed_target, dtype=np.float64)
-        selected = [int(np.argmin(np.square(points - target).sum(1)))]
-    else:
-        selected = [int(index) for index in initial_indices]
-        if (
-            not selected
-            or len(selected) > count
-            or len(set(selected)) != len(selected)
-            or min(selected) < 0
-            or max(selected) >= points.shape[0]
-        ):
-            raise ValueError("invalid initial FPS indices")
-    minimum = np.full((points.shape[0],), np.inf, dtype=np.float64)
-    for index in selected:
-        minimum = np.minimum(minimum, np.square(points - points[index]).sum(1))
-    while len(selected) < count:
-        minimum[np.asarray(selected)] = -1.0
-        index = int(np.argmax(minimum))
-        selected.append(index)
-        minimum = np.minimum(minimum, np.square(points - points[index]).sum(1))
-    return selected
+def _validate_weight_spec(payload: Mapping[str, Any]) -> dict[str, Any]:
+    required_top = {"schema_version", "zone_total_weight", "distance_fraction_by_zone"}
+    missing = sorted(required_top - set(payload))
+    if missing:
+        raise ValueError("weight configuration is missing: " + ", ".join(missing))
+    if int(payload["schema_version"]) != 1:
+        raise ValueError("unsupported multidistance weight schema")
+    raw_zone_total = payload["zone_total_weight"]
+    raw_fraction = payload["distance_fraction_by_zone"]
+    if not isinstance(raw_zone_total, Mapping) or not isinstance(raw_fraction, Mapping):
+        raise ValueError("weight configuration fields must be objects")
+    zone_total: dict[str, float] = {}
+    for zone in PARTITION_ZONES:
+        if zone not in raw_zone_total:
+            raise ValueError(f"weight configuration lacks zone total for {zone}")
+        value = float(raw_zone_total[zone])
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(f"zone total weight for {zone} must be finite and positive")
+        zone_total[zone] = value
+    total_zone_weight = sum(zone_total.values())
+    if abs(total_zone_weight - 1.0) > 1.0e-12:
+        raise ValueError(f"zone total weights must sum to 1, got {total_zone_weight}")
 
-
-def _fps_rows(rows: Sequence[Mapping[str, Any]], count: int, seed_target: Sequence[float] | None = None) -> list[dict[str, Any]]:
-    points = np.asarray([[row["reference_lens_x_mm"], row["reference_lens_physical_y_mm"]] for row in rows], dtype=np.float64)
-    return [dict(rows[index]) for index in _fps_indices(points, count, seed_target)]
-
-
-def _nearest_neighbour_p95_mm(rows: Sequence[Mapping[str, Any]]) -> float:
-    if len(rows) < 2:
-        raise ValueError("nearest-neighbour scale needs at least two points")
-    points = np.asarray(
-        [
-            [row["reference_lens_x_mm"], row["reference_lens_physical_y_mm"]]
-            for row in rows
-        ],
-        dtype=np.float64,
-    )
-    distances = np.sqrt(
-        np.square(points[:, None, :] - points[None, :, :]).sum(axis=2)
-    )
-    np.fill_diagonal(distances, np.inf)
-    nearest = distances.min(axis=1)
-    if not np.isfinite(nearest).all():
-        raise ValueError("eligible candidate coordinates contain duplicate-only geometry")
-    return float(np.percentile(nearest, 95.0))
-
-
-def _select_corridor(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    y = np.asarray([row["reference_lens_physical_y_mm"] for row in rows], dtype=np.float64)
-    expected = TRAINING_GROUP_COUNTS["intermediate"]
-    if expected % CORRIDOR_LAYER_COUNT != 0:
-        raise ValueError("intermediate case count must divide exactly into corridor layers")
-    if len(rows) < expected:
-        raise ValueError(f"insufficient eligible corridor candidates: {len(rows)} < {expected}")
-    edges = np.linspace(
-        float(y.min()) - 1e-9,
-        float(y.max()) + 1e-9,
-        CORRIDOR_LAYER_COUNT + 1,
-    )
-    selected: list[dict[str, Any]] = []
-    for layer in range(CORRIDOR_LAYER_COUNT):
-        members = [row for row in rows if edges[layer] <= float(row["reference_lens_physical_y_mm"]) < edges[layer + 1]]
-        picked = _fps_rows(
-            members,
-            CORRIDOR_POINTS_PER_LAYER,
-            (0.0, 0.5 * (edges[layer] + edges[layer + 1])),
-        )
-        eligible_x = np.asarray(
-            [float(row["reference_lens_x_mm"]) for row in members], dtype=np.float64
-        )
-        picked_x = np.asarray(
-            [float(row["reference_lens_x_mm"]) for row in picked], dtype=np.float64
-        )
-        span = float(eligible_x.max() - eligible_x.min())
-        if span <= 0.0:
-            raise ValueError(f"corridor layer {layer + 1} has zero eligible x span")
-        candidate_scale = _nearest_neighbour_p95_mm(members)
-        edge_tolerance = min(
-            0.25 * span, max(candidate_scale, 0.10 * span)
-        )
-        centre_target = float(np.clip(0.0, eligible_x.min(), eligible_x.max()))
-        centre_tolerance = min(
-            0.20 * span, max(0.5 * candidate_scale, 0.08 * span)
-        )
-        ordered_x = np.sort(picked_x)
-        checks = {
-            "three_distinct_x": bool(np.all(np.diff(ordered_x) > 1.0e-9)),
-            "left": float(ordered_x[0] - eligible_x.min()) <= edge_tolerance,
-            "centre": abs(float(ordered_x[1] - centre_target)) <= centre_tolerance,
-            "right": float(eligible_x.max() - ordered_x[2]) <= edge_tolerance,
-        }
-        if not all(checks.values()):
-            raise ValueError(
-                f"corridor layer {layer + 1} misses eligible left/centre/right anchors: "
-                f"eligible=[{eligible_x.min():.6g},{eligible_x.max():.6g}], "
-                f"selected={picked_x.tolist()}, checks={checks}"
-            )
-        ordered = sorted(picked, key=lambda row: float(row["reference_lens_x_mm"]))
-        roles = ("left_boundary", "centre", "right_boundary")
-        if len(ordered) != len(roles):
-            raise ValueError("corridor layer contract requires exactly three anchor roles")
-        for row, role in zip(ordered, roles):
-            row["corridor_horizontal_role"] = role
-        for row in picked:
-            row["corridor_vertical_layer"] = layer + 1
-            row["corridor_eligible_x_bounds_mm"] = [
-                float(eligible_x.min()), float(eligible_x.max())
-            ]
-            row["corridor_anchor_tolerance_mm"] = {
-                "candidate_nearest_neighbour_p95": candidate_scale,
-                "edge": edge_tolerance,
-                "centre": centre_tolerance,
-            }
-        selected.extend(picked)
-    return selected
-
-
-def _peripheral_pairs(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    lookup = {(round(float(r["field_x_deg"]), 9), round(float(r["field_y_deg"]), 9)): dict(r) for r in rows}
-    pairs: list[dict[str, Any]] = []
-    for row in rows:
-        if row["reference_partition_zone"] != "astig_left":
-            continue
-        partner = lookup.get((-round(float(row["field_x_deg"]), 9), round(float(row["field_y_deg"]), 9)))
-        if partner is None or partner["reference_partition_zone"] != "astig_right":
-            continue
-        mirror_error_x = abs(
-            float(row["reference_lens_x_mm"]) + float(partner["reference_lens_x_mm"])
-        )
-        mirror_error_y = abs(
-            float(row["reference_lens_physical_y_mm"])
-            - float(partner["reference_lens_physical_y_mm"])
-        )
-        if max(mirror_error_x, mirror_error_y) > PERIPHERAL_REAR_MIRROR_TOLERANCE_MM:
-            raise ValueError(
-                "field-mirrored peripheral candidates are not mirrored on the Original PAL rear "
-                f"surface: {row['candidate_id']} / {partner['candidate_id']}, "
-                f"dx={mirror_error_x:.6g} mm, dy={mirror_error_y:.6g} mm"
-            )
-        pairs.append({
-            "left": dict(row), "right": partner,
-            "pair_x_mm": 0.5 * (abs(float(row["reference_lens_x_mm"])) + abs(float(partner["reference_lens_x_mm"]))),
-            "pair_y_mm": 0.5 * (float(row["reference_lens_physical_y_mm"]) + float(partner["reference_lens_physical_y_mm"])),
-            "reference_rear_mirror_error_mm": {
-                "x_antisymmetry": mirror_error_x, "y_symmetry": mirror_error_y
-            },
-        })
-    return pairs
-
-
-def _select_peripheral(
-    rows: Sequence[Mapping[str, Any]], corridor_y_min_mm: float,
-    corridor_y_max_mm: float, *,
-    band_counts: Mapping[str, int] = PERIPHERAL_BAND_COUNTS,
-) -> list[dict[str, Any]]:
-    pairs = _peripheral_pairs(rows)
-    specs = (
-        ("upper", int(band_counts["upper"]), lambda y: y > corridor_y_max_mm),
-        ("middle", int(band_counts["middle"]), lambda y: corridor_y_min_mm <= y <= corridor_y_max_mm),
-        ("lower", int(band_counts["lower"]), lambda y: y < corridor_y_min_mm),
-    )
-    selected: list[dict[str, Any]] = []
-    for band, count, predicate in specs:
-        members = [pair for pair in pairs if predicate(float(pair["pair_y_mm"]))]
-        points = np.asarray([[pair["pair_x_mm"], pair["pair_y_mm"]] for pair in members], dtype=np.float64)
-        if band == "upper":
-            # Three-point maximin coverage already spans inner-x and both y
-            # limits on the audited domain; add the outer-x physical anchor as
-            # the smallest evidence-driven correction to its sole failed bound.
-            initial = _fps_indices(points, count - 1)
-            outer_x = int(np.argmax(points[:, 0]))
-            initial = list(dict.fromkeys((*initial, outer_x)))
-            indices = _fps_indices(points, count, initial_indices=initial)
-        else:
-            indices = _fps_indices(points, count)
-        for index in indices:
-            selected.append({**members[index], "peripheral_band": band})
-    return selected
-
-
-def select_training_cases(
-    traced_candidates: Sequence[Mapping[str, Any]], *,
-    far_object_distance_mm: float, intermediate_object_distance_mm: float,
-    near_object_distance_mm: float, corridor_y_min_mm: float, corridor_y_max_mm: float,
-    group_counts: Mapping[str, int] = TRAINING_GROUP_COUNTS,
-    peripheral_band_counts: Mapping[str, int] = PERIPHERAL_BAND_COUNTS,
-) -> list[dict[str, Any]]:
-    """Select physical cases by lens-plane FPS after real tracing."""
-    resolved_counts = {name: int(group_counts[name]) for name in TRAINING_GROUP_COUNTS}
-    resolved_band_counts = {
-        name: int(peripheral_band_counts[name]) for name in PERIPHERAL_BAND_COUNTS
-    }
-    if any(value <= 0 for value in resolved_counts.values()):
-        raise ValueError("all training group counts must be positive")
-    if resolved_counts["intermediate"] != TRAINING_GROUP_COUNTS["intermediate"]:
-        raise ValueError("intermediate selection remains fixed at 4 layers x 3 points")
-    if resolved_counts["peripheral_left"] != resolved_counts["peripheral_right"]:
-        raise ValueError("peripheral groups must contain equal mirror-pair counts")
-    if sum(resolved_band_counts.values()) != resolved_counts["peripheral_left"]:
-        raise ValueError("peripheral band counts do not match the group count")
-    eligible = [dict(row) for row in traced_candidates if bool(row.get("eligible"))]
-    zone_rows = lambda zone: [row for row in eligible if row.get("reference_partition_zone") == zone]
-    groups: dict[str, list[dict[str, Any]]] = {
-        "far": _fps_rows(zone_rows("far"), resolved_counts["far"]),
-        "intermediate": _select_corridor(zone_rows("corridor")),
-        "near": _fps_rows(zone_rows("near"), resolved_counts["near"]),
-        "peripheral_left": [], "peripheral_right": [],
-    }
-    peripheral = zone_rows("astig_left") + zone_rows("astig_right")
-    pairs = _select_peripheral(
-        peripheral, corridor_y_min_mm, corridor_y_max_mm,
-        band_counts=resolved_band_counts,
-    )
-    band_distance = {"upper": far_object_distance_mm, "middle": intermediate_object_distance_mm, "lower": near_object_distance_mm}
-    for pair_index, pair in enumerate(pairs, 1):
-        for side, group in (("left", "peripheral_left"), ("right", "peripheral_right")):
-            groups[group].append({
-                **pair[side], "peripheral_pair_id": f"peripheral_pair_{pair_index:02d}",
-                "peripheral_band": pair["peripheral_band"], "distance_mm": float(band_distance[pair["peripheral_band"]]),
-            })
-    group_distance = {"far": far_object_distance_mm, "intermediate": intermediate_object_distance_mm, "near": near_object_distance_mm}
-    cases: list[dict[str, Any]] = []
-    for group, expected in resolved_counts.items():
-        if len(groups[group]) != expected:
-            raise ValueError(f"wrong selected count for {group}: {len(groups[group])}, expected {expected}")
-        for index, row in enumerate(groups[group], 1):
-            distance = float(row.get("distance_mm", group_distance.get(group, math.nan)))
-            cases.append({
-                **row, "sample_id": f"{group}_{index:02d}",
-                "case_id": f"{group}_{index:02d}_D{int(round(distance))}",
-                "training_group": group, "zone": GROUP_TO_ZONE[group], "distance_mm": distance,
-            })
-    expected_total = sum(resolved_counts.values())
-    if len(cases) != expected_total or len({case["case_id"] for case in cases}) != expected_total:
-        raise AssertionError(
-            f"training case contract requires exactly {expected_total} unique cases"
-        )
-    return cases
-
-
-def partition_audit(payload: Mapping[str, Any], cases: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    _, _, masks = _zone_arrays(payload)
-    topology = dict(dict(payload.get("rules", {})).get("topology", {}))
-    stats = dict(payload.get("statistics", {}))
-    zone_group = {
-        "far": "far", "corridor": "intermediate", "near": "near",
-        "peripheral_astig_left": "peripheral_left", "peripheral_astig_right": "peripheral_right",
-    }
-    zones: dict[str, Any] = {}
-    for zone in PARTITION_ORDER:
-        final = int(np.count_nonzero(masks[zone]))
-        source = int(dict(topology.get(zone, {})).get("source_pixel_count", final))
-        zones[zone] = {
-            "source_pixel_count": source, "final_pixel_count": final,
-            "topology_removed_pixel_count": source - final,
-            "topology_retained_fraction": final / source if source else None,
-            "statistics": stats.get(zone),
-            "training_case_count": sum(case.get("training_group") == zone_group[zone] for case in cases),
-        }
-    return {"interpretation": "topology retention and physical zone extent are reported separately", "zones": zones}
-
-
-def _xy_bounds(rows: Sequence[Mapping[str, Any]]) -> dict[str, list[float]] | None:
-    if not rows:
-        return None
-    x = np.asarray([row["reference_lens_x_mm"] for row in rows], dtype=np.float64)
-    y = np.asarray([row["reference_lens_physical_y_mm"] for row in rows], dtype=np.float64)
+    fraction: dict[str, dict[str, float]] = {}
+    for zone in PARTITION_ZONES:
+        row = raw_fraction.get(zone)
+        if not isinstance(row, Mapping):
+            raise ValueError(f"distance fractions for {zone} must be an object")
+        fraction[zone] = {}
+        for label in DISTANCE_LABELS:
+            if label not in row:
+                raise ValueError(f"distance fractions for {zone} lack {label}")
+            value = float(row[label])
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"distance fraction {zone}/{label} must be finite and positive")
+            fraction[zone][label] = value
+        row_total = sum(fraction[zone].values())
+        if abs(row_total - 1.0) > 1.0e-12:
+            raise ValueError(f"distance fractions for {zone} must sum to 1, got {row_total}")
     return {
-        "x_mm": [float(x.min()), float(x.max())],
-        "physical_y_mm": [float(y.min()), float(y.max())],
+        "schema_version": 1,
+        "zone_total_weight": zone_total,
+        "distance_fraction_by_zone": fraction,
+        "description": payload.get("description"),
     }
 
 
-def _occupied_mask_cells(
-    payload: Mapping[str, Any], mask_name: str, rows: Sequence[Mapping[str, Any]]
-) -> int:
-    x, y, masks = _zone_arrays(payload)
-    occupied: set[tuple[int, int]] = set()
-    for row in rows:
-        ix = int(np.argmin(abs(x - float(row["reference_lens_x_mm"]))))
-        iy = int(np.argmin(abs(y - float(row["reference_lens_physical_y_mm"]))))
-        if bool(masks[mask_name][iy, ix]):
-            occupied.add((iy, ix))
-    return len(occupied)
+def load_weight_spec(path: str | Path) -> dict[str, Any]:
+    return _validate_weight_spec(_read_json(path))
 
 
-def _convex_hull_area_mm2(rows: Sequence[Mapping[str, Any]]) -> float | None:
-    """Return the selected-point envelope area; this is not a zone-area estimate."""
-    if len(rows) < 3:
-        return None
-    points = sorted({
-        (
-            float(row["reference_lens_x_mm"]),
-            float(row["reference_lens_physical_y_mm"]),
+def attach_objective_weights(
+    cases: Sequence[Mapping[str, Any]], weight_spec: Mapping[str, Any]
+) -> list[dict[str, Any]]:
+    """Assign density-independent zone/distance masses to all fixed-grid cases."""
+    validated = _validate_weight_spec(weight_spec)
+    if not cases:
+        raise ValueError("cannot assign weights to an empty case set")
+    counts: dict[tuple[str, str], int] = {}
+    for case in cases:
+        key = (str(case["zone"]), str(case["distance_label"]))
+        if key[0] not in PARTITION_ZONES or key[1] not in DISTANCE_LABELS:
+            raise ValueError(f"unknown zone/distance in case {case.get('case_id')}: {key}")
+        counts[key] = counts.get(key, 0) + 1
+    expected_keys = {
+        (zone, label)
+        for zone in PARTITION_ZONES
+        for label in DISTANCE_LABELS
+    }
+    missing = sorted(expected_keys - set(counts))
+    if missing:
+        raise ValueError(
+            "fixed layout lacks a positive-count zone/distance combination: "
+            + ", ".join(f"{zone}/{label}" for zone, label in missing)
         )
-        for row in rows
-    })
-    if len(points) < 3:
-        return 0.0
-
-    def cross(o: tuple[float, float], a: tuple[float, float], b: tuple[float, float]) -> float:
-        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
-
-    lower: list[tuple[float, float]] = []
-    for point in points:
-        while len(lower) >= 2 and cross(lower[-2], lower[-1], point) <= 0.0:
-            lower.pop()
-        lower.append(point)
-    upper: list[tuple[float, float]] = []
-    for point in reversed(points):
-        while len(upper) >= 2 and cross(upper[-2], upper[-1], point) <= 0.0:
-            upper.pop()
-        upper.append(point)
-    hull = lower[:-1] + upper[:-1]
-    if len(hull) < 3:
-        return 0.0
-    twice_area = sum(
-        hull[index][0] * hull[(index + 1) % len(hull)][1]
-        - hull[(index + 1) % len(hull)][0] * hull[index][1]
-        for index in range(len(hull))
-    )
-    return 0.5 * abs(float(twice_area))
-
-
-def _selected_span_fraction(
-    eligible: Sequence[Mapping[str, Any]], selected: Sequence[Mapping[str, Any]]
-) -> dict[str, float | None]:
-    eligible_bounds = _xy_bounds(eligible)
-    selected_bounds = _xy_bounds(selected)
-    if eligible_bounds is None or selected_bounds is None:
-        return {"x": None, "physical_y": None}
-    result: dict[str, float | None] = {}
-    for output_name, source_name in (("x", "x_mm"), ("physical_y", "physical_y_mm")):
-        eligible_span = eligible_bounds[source_name][1] - eligible_bounds[source_name][0]
-        selected_span = selected_bounds[source_name][1] - selected_bounds[source_name][0]
-        result[output_name] = (
-            1.0 if eligible_span <= 1.0e-12 else float(selected_span / eligible_span)
+    weighted: list[dict[str, Any]] = []
+    for case in cases:
+        zone = str(case["zone"])
+        label = str(case["distance_label"])
+        count = counts[(zone, label)]
+        mass = float(validated["zone_total_weight"][zone]) * float(
+            validated["distance_fraction_by_zone"][zone][label]
+        )
+        raw_weight = mass / float(count)
+        weighted.append(
+            {
+                **dict(case),
+                "zone_distance_mass": mass,
+                "objective_weight": raw_weight,
+            }
+        )
+    result = weighted
+    total = sum(float(case["objective_weight"]) for case in result)
+    if abs(total - 1.0) > 1.0e-12:
+        raise ValueError(
+            "expanded objective weights are not normalized without renormalization: "
+            f"{total}"
         )
     return result
 
 
-def _coverage_gate(
-    eligible: Sequence[Mapping[str, Any]],
-    selected: Sequence[Mapping[str, Any]],
+def build_multidistance_layout(
     *,
-    occupied_eligible_cells: int,
-    cell_area_mm2: float,
-) -> dict[str, Any]:
-    if len(eligible) < 2 or not selected:
-        return {
-            "passed": False,
-            "reason": "coverage gate requires at least two eligible candidates and one selected case",
-        }
-    ep = np.asarray(
-        [
-            [row["reference_lens_x_mm"], row["reference_lens_physical_y_mm"]]
-            for row in eligible
-        ],
-        dtype=np.float64,
+    field_min_deg: float,
+    field_max_deg: float,
+    partition_map: PartitionMap,
+    weight_spec: Mapping[str, Any],
+    trace_reference: Callable[[float, float, float], tuple[float, float]],
+    field_count: int = 11,
+    distance_specs: Sequence[DistanceSpec] = DISTANCE_SPECS,
+    prefix_cases: Sequence[Mapping[str, Any]] = (),
+    progress_callback: Callable[[Sequence[Mapping[str, Any]]], None] | None = None,
+) -> list[dict[str, Any]]:
+    """Build all ``3 × 11 × 11`` cases without selection or dropping."""
+    specs = tuple(distance_specs)
+    if tuple(spec.label for spec in specs) != DISTANCE_LABELS:
+        raise ValueError("distance specs must be exactly D500, D2000, Dinf")
+    field_grid = generate_fov_grid(
+        field_min_deg=field_min_deg, field_max_deg=field_max_deg, count=field_count
     )
-    sp = np.asarray(
-        [
-            [row["reference_lens_x_mm"], row["reference_lens_physical_y_mm"]]
-            for row in selected
-        ],
-        dtype=np.float64,
-    )
-    nearest = np.sqrt(
-        np.square(ep[:, None, :] - sp[None, :, :]).sum(axis=2)
-    ).min(axis=1)
-    candidate_scale = _nearest_neighbour_p95_mm(eligible)
-    characteristic_spacing = math.sqrt(
-        occupied_eligible_cells * cell_area_mm2 / len(selected)
-    )
-    axis_audit: dict[str, Any] = {}
-    bounds_passed = True
-    for axis, name in ((0, "x"), (1, "physical_y")):
-        eligible_min, eligible_max = float(ep[:, axis].min()), float(ep[:, axis].max())
-        selected_min, selected_max = float(sp[:, axis].min()), float(sp[:, axis].max())
-        span = eligible_max - eligible_min
-        tolerance = max(2.0 * candidate_scale, 0.05 * span)
-        minimum_gap = max(0.0, selected_min - eligible_min)
-        maximum_gap = max(0.0, eligible_max - selected_max)
-        passed = minimum_gap <= tolerance and maximum_gap <= tolerance
-        bounds_passed = bounds_passed and passed
-        axis_audit[name] = {
-            "eligible_bounds_mm": [eligible_min, eligible_max],
-            "selected_bounds_mm": [selected_min, selected_max],
-            "inward_gap_mm": {"minimum_side": minimum_gap, "maximum_side": maximum_gap},
-            "threshold_mm": tolerance,
-            "passed": passed,
-        }
-    p95 = float(np.percentile(nearest, 95.0))
-    maximum = float(nearest.max())
-    p95_threshold = characteristic_spacing + candidate_scale
-    maximum_threshold = 1.25 * characteristic_spacing + candidate_scale
-    nearest_passed = p95 <= p95_threshold and maximum <= maximum_threshold
-    return {
-        "eligible_definition": "zone intersection true-traceable intersection safety margin",
-        "candidate_nearest_neighbour_p95_mm": candidate_scale,
-        "occupied_eligible_area_proxy_mm2": occupied_eligible_cells * cell_area_mm2,
-        "selected_count": len(selected),
-        "characteristic_spacing_mm": characteristic_spacing,
-        "bounds": axis_audit,
-        "nearest_distance_mm": {
-            "p95": p95,
-            "maximum": maximum,
-            "p95_threshold": p95_threshold,
-            "maximum_threshold": maximum_threshold,
-            "passed": nearest_passed,
-        },
-        "passed": bounds_passed and nearest_passed,
-    }
-
-
-def coverage_audit(
-    payload: Mapping[str, Any], candidates: Sequence[Mapping[str, Any]],
-    cases: Sequence[Mapping[str, Any]],
-) -> dict[str, Any]:
-    """Quantify full masks, true-traceable candidates, safe candidates and FPS coverage."""
-    x, y, masks = _zone_arrays(payload)
-    pitch_x = float(np.median(abs(np.diff(x))))
-    pitch_y = float(np.median(abs(np.diff(y))))
-    cell_area = pitch_x * pitch_y
-    zone_specs = {
-        "far": ("far", "far"),
-        "corridor": ("corridor", "intermediate"),
-        "near": ("near", "near"),
-        "peripheral_astig_left": ("astig_left", "peripheral_left"),
-        "peripheral_astig_right": ("astig_right", "peripheral_right"),
-    }
-    corridor_range = dict(dict(payload.get("statistics", {})).get("corridor", {})).get(
-        "physical_y_range_mm"
-    )
-    if not isinstance(corridor_range, list) or len(corridor_range) != 2:
-        raise ValueError("zones statistics must declare corridor physical_y_range_mm")
-    corridor_min, corridor_max = sorted(float(value) for value in corridor_range)
-
-    safe_peripheral = [
-        row for row in candidates
-        if row.get("trace_status") == "ok"
-        and bool(row.get("eligible"))
-        and row.get("reference_partition_zone") in {"astig_left", "astig_right"}
-    ]
-    peripheral_pairs = _peripheral_pairs(safe_peripheral)
-    pairable_by_zone = {
-        "astig_left": [pair["left"] for pair in peripheral_pairs],
-        "astig_right": [pair["right"] for pair in peripheral_pairs],
-    }
-
-    zones: dict[str, Any] = {}
-    for mask_name, (zone_name, group_name) in zone_specs.items():
-        traceable = [
-            row for row in candidates
-            if row.get("trace_status") == "ok" and row.get("reference_partition_zone") == zone_name
-        ]
-        eligible = [row for row in traceable if bool(row.get("eligible"))]
-        coverage_eligible = pairable_by_zone.get(zone_name, eligible)
-        selected = [row for row in cases if row.get("training_group") == group_name]
-        max_nearest = p95_nearest = median_nearest = None
-        if coverage_eligible and selected:
-            ep = np.asarray(
-                [[row["reference_lens_x_mm"], row["reference_lens_physical_y_mm"]] for row in coverage_eligible],
-                dtype=np.float64,
+    expected_count = len(specs) * len(field_grid)
+    prefix = [dict(row) for row in prefix_cases]
+    if len(prefix) > expected_count:
+        raise ValueError("layout progress exceeds the fixed multidistance case count")
+    cases: list[dict[str, Any]] = []
+    for distance_index, spec in enumerate(specs):
+        for field_index, field in enumerate(field_grid):
+            case_index = distance_index * len(field_grid) + field_index
+            if case_index < len(prefix):
+                cases.append(dict(prefix[case_index]))
+                continue
+            fx = float(field["field_x_deg"])
+            fy = float(field["field_y_deg"])
+            case_id = f"{spec.label}_r{int(field['grid_row']):02d}_c{int(field['grid_column']):02d}"
+            x_mm, physical_y_mm = trace_reference(spec.object_distance_mm, fx, fy)
+            classification = partition_map.classify(
+                x_mm=float(x_mm), physical_y_mm=float(physical_y_mm)
             )
-            sp = np.asarray(
-                [[row["reference_lens_x_mm"], row["reference_lens_physical_y_mm"]] for row in selected],
-                dtype=np.float64,
-            )
-            nearest = np.sqrt(np.square(ep[:, None, :] - sp[None, :, :]).sum(axis=2)).min(axis=1)
-            max_nearest = float(nearest.max())
-            p95_nearest = float(np.percentile(nearest, 95.0))
-            median_nearest = float(np.median(nearest))
-        iy, ix = np.nonzero(masks[mask_name])
-        full_bounds = None if ix.size == 0 else {
-            "x_mm": [float(x[ix].min()), float(x[ix].max())],
-            "physical_y_mm": [float(y[iy].min()), float(y[iy].max())],
-        }
-        full_cells = int(ix.size)
-        occupied_traceable = _occupied_mask_cells(payload, mask_name, traceable)
-        occupied_eligible = _occupied_mask_cells(payload, mask_name, eligible)
-        occupied_coverage_eligible = _occupied_mask_cells(
-            payload, mask_name, coverage_eligible
-        )
-        margins = sorted({
-            float(row["zone_boundary_safety_mm"])
-            for row in eligible if row.get("zone_boundary_safety_mm") is not None
-        })
-        zones[mask_name] = {
-            "full_mask_cell_count": full_cells,
-            "full_mask_area_mm2": full_cells * cell_area,
-            "full_mask_bounds": full_bounds,
-            "traceable_candidate_count": len(traceable),
-            "traceable_occupied_mask_cell_count": occupied_traceable,
-            "traceable_occupied_mask_cell_fraction": occupied_traceable / full_cells if full_cells else None,
-            "traceable_bounds": _xy_bounds(traceable),
-            "eligible_candidate_count": len(eligible),
-            "eligible_occupied_mask_cell_count": occupied_eligible,
-            "eligible_occupied_mask_cell_fraction": occupied_eligible / full_cells if full_cells else None,
-            "eligible_bounds": _xy_bounds(eligible),
-            "coverage_eligible_definition": (
-                "safe and exact field/rear-mirror pairable candidates"
-                if zone_name in pairable_by_zone
-                else "safe candidates"
-            ),
-            "coverage_eligible_candidate_count": len(coverage_eligible),
-            "coverage_eligible_occupied_mask_cell_count": occupied_coverage_eligible,
-            "coverage_eligible_bounds": _xy_bounds(coverage_eligible),
-            "selected_case_count": len(selected),
-            "selected_bounds": _xy_bounds(selected),
-            "selected_span_fraction_of_eligible": _selected_span_fraction(coverage_eligible, selected),
-            "eligible_convex_hull_envelope_area_mm2": _convex_hull_area_mm2(coverage_eligible),
-            "selected_convex_hull_envelope_area_mm2": _convex_hull_area_mm2(selected),
-            "eligible_to_selected_nearest_distance_mm": {
-                "median": median_nearest,
-                "p95": p95_nearest,
-                "maximum_coverage_radius": max_nearest,
-            },
-            "zone_boundary_safety_mm": margins,
-            "coverage_gate": _coverage_gate(
-                coverage_eligible,
-                selected,
-                occupied_eligible_cells=occupied_coverage_eligible,
-                cell_area_mm2=cell_area,
-            ),
-        }
-        if zone_name in pairable_by_zone:
-            predicates = {
-                "upper": lambda value: value > corridor_max,
-                "middle": lambda value: corridor_min <= value <= corridor_max,
-                "lower": lambda value: value < corridor_min,
-            }
-            band_gates: dict[str, Any] = {}
-            for band, predicate in predicates.items():
-                band_eligible = [
-                    row for row in coverage_eligible
-                    if predicate(float(row["reference_lens_physical_y_mm"]))
-                ]
-                band_selected = [
-                    row for row in selected if row.get("peripheral_band") == band
-                ]
-                band_occupied = _occupied_mask_cells(
-                    payload, mask_name, band_eligible
-                )
-                band_gates[band] = {
-                    "eligible_candidate_count": len(band_eligible),
-                    "selected_case_count": len(band_selected),
-                    "eligible_bounds": _xy_bounds(band_eligible),
-                    "selected_bounds": _xy_bounds(band_selected),
-                    "coverage_gate": _coverage_gate(
-                        band_eligible,
-                        band_selected,
-                        occupied_eligible_cells=band_occupied,
-                        cell_area_mm2=cell_area,
-                    ),
+            cases.append(
+                {
+                    "case_index": case_index,
+                    "case_id": case_id,
+                    "distance_label": spec.label,
+                    "object_distance_mm": spec.serialized_distance,
+                    "focus_zone": spec.focus_zone,
+                    "grid_row": int(field["grid_row"]),
+                    "grid_column": int(field["grid_column"]),
+                    "field_x_deg": fx,
+                    "field_y_deg": fy,
+                    "partition_x_mm": float(x_mm),
+                    "partition_physical_y_mm": float(physical_y_mm),
+                    "zone": classification.zone,
+                    "partition_mode": classification.mode,
+                    "nearest_partition_distance_mm": classification.nearest_partition_distance_mm,
+                    "partition_grid_x_mm": classification.grid_x_mm,
+                    "partition_grid_physical_y_mm": classification.grid_y_mm,
                 }
-            zones[mask_name]["peripheral_band_coverage"] = band_gates
-    failed_coverage = [
-        zone_name
-        for zone_name, zone in zones.items()
-        if not bool(zone["coverage_gate"]["passed"])
-    ]
-    failed_coverage.extend(
-        f"{zone_name}:{band_name}"
-        for zone_name, zone in zones.items()
-        for band_name, band in zone.get("peripheral_band_coverage", {}).items()
-        if not bool(band["coverage_gate"]["passed"])
-    )
-    return {
-        "schema_version": 3,
-        "interpretation": (
-            "Coverage is contracted on zone intersection true-traceable candidates intersection safety margin; "
-            "the complete raster mask can contain physically unreachable cells. Occupied-cell fractions count "
-            "only raster cells hit by the finite candidate grid and are not continuous-area claims. Convex-hull "
-            "values are selected/candidate envelopes only and are likewise not physical zone-area claims."
-        ),
-        "mask_grid_pitch_mm": {"x": pitch_x, "physical_y": pitch_y},
-        "candidate_count": len(candidates),
-        "trace_success_count": sum(row.get("trace_status") == "ok" for row in candidates),
-        "trace_failure_count": sum(row.get("trace_status") != "ok" for row in candidates),
-        "unclassified_trace_success_count": sum(
-            row.get("trace_status") == "ok" and row.get("reference_partition_zone") is None
-            for row in candidates
-        ),
-        "overall_passed": not failed_coverage,
-        "failed_coverage_gates": failed_coverage,
-        "zones": zones,
-    }
-
-
-def _validate_selected_case_geometry(
-    payload: Mapping[str, Any],
-    cases: Sequence[Mapping[str, Any]],
-    candidates: Sequence[Mapping[str, Any]],
-    sampling_contract: Mapping[str, Any],
-) -> dict[str, Any]:
-    zone_margins = sampling_contract.get("zone_boundary_safety_mm")
-    if not isinstance(zone_margins, Mapping) or not {"default", "corridor"}.issubset(zone_margins):
-        raise ValueError("sampling contract must declare default and corridor zone margins")
-    if "aperture_edge_safety_mm" not in sampling_contract:
-        raise ValueError("sampling contract must declare aperture-edge safety margin")
-    object_distances = sampling_contract.get("object_distance_mm")
-    if not isinstance(object_distances, Mapping) or not {
-        "far", "intermediate", "near"
-    }.issubset(object_distances):
-        raise ValueError("sampling contract must declare far/intermediate/near distances")
-    band_distances = sampling_contract.get("peripheral_band_distance_mm")
-    if not isinstance(band_distances, Mapping) or not {
-        "upper", "middle", "lower"
-    }.issubset(band_distances):
-        raise ValueError("sampling contract must declare upper/middle/lower distances")
-    resolved_distances = {
-        name: float(object_distances[name])
-        for name in ("far", "intermediate", "near")
-    }
-    resolved_band_distances = {
-        name: float(band_distances[name])
-        for name in ("upper", "middle", "lower")
-    }
-    if any(
-        not math.isfinite(value) or value <= 0.0
-        for value in (*resolved_distances.values(), *resolved_band_distances.values())
-    ):
-        raise ValueError("all training object distances must be finite and positive")
-    required_band_mapping = {
-        "upper": resolved_distances["far"],
-        "middle": resolved_distances["intermediate"],
-        "lower": resolved_distances["near"],
-    }
-    if resolved_band_distances != required_band_mapping:
-        raise ValueError(
-            "peripheral distances must map upper=far, middle=intermediate, lower=near"
-        )
-    aperture_margin = float(sampling_contract["aperture_edge_safety_mm"])
-    resolved_zone_margins = {
-        "default": float(zone_margins["default"]),
-        "corridor": float(zone_margins["corridor"]),
-    }
-    if any(
-        not math.isfinite(value) or value < 0.0
-        for value in (*resolved_zone_margins.values(), aperture_margin)
-    ):
-        raise ValueError("zone and aperture safety margins must be finite and non-negative")
-    corridor_range = dict(dict(payload.get("statistics", {})).get("corridor", {})).get("physical_y_range_mm")
-    if not isinstance(corridor_range, list) or len(corridor_range) != 2:
-        raise ValueError("zones statistics must declare corridor physical_y_range_mm")
-    corridor_min, corridor_max = sorted(float(value) for value in corridor_range)
-    minimum_zone_clearance = math.inf
-    minimum_aperture_clearance = math.inf
-    maximum_assigned_distance_retrace_error = 0.0
-    for case in cases:
-        group = str(case["training_group"])
-        expected_zone = GROUP_TO_ZONE[group]
-        zone_margin = resolved_zone_margins[
-            "corridor" if expected_zone == "corridor" else "default"
-        ]
-        for prefix, recorded_name, x_key, y_key in (
-            ("reference", "reference_partition_zone", "reference_lens_x_mm", "reference_lens_physical_y_mm"),
-            ("case", "case_position_partition_zone", "case_lens_x_mm", "case_lens_physical_y_mm"),
-        ):
-            x_mm, y_mm = float(case[x_key]), float(case[y_key])
-            classified = classify_partition_point(payload, x_mm=x_mm, physical_y_mm=y_mm)
-            if case.get(recorded_name) != classified or classified != expected_zone:
-                raise ValueError(f"{case['case_id']} {prefix} rear point is {classified!r}, expected {expected_zone!r}")
-            zone_clearance = _inside_clearance_mm(payload, _mask_name(expected_zone), x_mm, y_mm)
-            aperture_clearance = _inside_clearance_mm(payload, "monitored", x_mm, y_mm)
-            if zone_clearance < zone_margin or aperture_clearance < aperture_margin:
-                raise ValueError(
-                    f"{case['case_id']} {prefix} rear point violates safety margins: "
-                    f"zone={zone_clearance:.6g}/{zone_margin:.6g} mm, "
-                    f"aperture={aperture_clearance:.6g}/{aperture_margin:.6g} mm"
-                )
-            minimum_zone_clearance = min(minimum_zone_clearance, zone_clearance)
-            minimum_aperture_clearance = min(minimum_aperture_clearance, aperture_clearance)
-        assigned_distance_retrace_error = max(
-            abs(float(case["reference_lens_x_mm"]) - float(case["case_lens_x_mm"])),
-            abs(
-                float(case["reference_lens_physical_y_mm"])
-                - float(case["case_lens_physical_y_mm"])
-            ),
-        )
-        if assigned_distance_retrace_error > REFERENCE_RETRACE_TOLERANCE_MM:
-            raise ValueError(
-                f"{case['case_id']} assigned-distance rear point differs from the "
-                "common FPS reference point, so reference-domain coverage cannot be "
-                f"transferred: error={assigned_distance_retrace_error:.6g} mm"
             )
-        maximum_assigned_distance_retrace_error = max(
-            maximum_assigned_distance_retrace_error,
-            assigned_distance_retrace_error,
-        )
-        if group in PERIPHERAL_GROUPS:
-            task_y = float(case["case_lens_physical_y_mm"])
-            expected_band = "upper" if task_y > corridor_max else "lower" if task_y < corridor_min else "middle"
-            if case.get("peripheral_band") != expected_band:
-                raise ValueError(
-                    f"{case['case_id']} task-distance rear point belongs to peripheral band "
-                    f"{expected_band}, not {case.get('peripheral_band')}"
-                )
-            expected_distance = resolved_band_distances[expected_band]
-        else:
-            expected_distance = resolved_distances[group]
-        if float(case["distance_mm"]) != expected_distance:
-            raise ValueError(
-                f"{case['case_id']} distance is {case['distance_mm']}, "
-                f"expected {expected_distance} mm"
-            )
-
-    intermediate = [
-        case for case in cases if case.get("training_group") == "intermediate"
-    ]
-    eligible_corridor = [
-        row for row in candidates
-        if row.get("trace_status") == "ok"
-        and bool(row.get("eligible"))
-        and row.get("reference_partition_zone") == "corridor"
-    ]
-    if len(eligible_corridor) < TRAINING_GROUP_COUNTS["intermediate"]:
-        raise ValueError("insufficient real eligible corridor candidates for audit")
-    eligible_y = np.asarray(
-        [float(row["reference_lens_physical_y_mm"]) for row in eligible_corridor],
-        dtype=np.float64,
-    )
-    layer_edges = np.linspace(
-        float(eligible_y.min()) - 1.0e-9,
-        float(eligible_y.max()) + 1.0e-9,
-        CORRIDOR_LAYER_COUNT + 1,
-    )
-    for layer in range(1, CORRIDOR_LAYER_COUNT + 1):
-        members = [
-            case for case in intermediate
-            if int(case.get("corridor_vertical_layer", -1)) == layer
-        ]
-        roles = {case.get("corridor_horizontal_role") for case in members}
-        if len(members) != CORRIDOR_POINTS_PER_LAYER or roles != {
-            "left_boundary", "centre", "right_boundary"
-        }:
-            raise ValueError(
-                f"corridor layer {layer} does not contain the three required anchors"
-            )
-        lower, upper = layer_edges[layer - 1], layer_edges[layer]
-        if any(
-            not lower <= float(case["reference_lens_physical_y_mm"]) < upper
-            for case in members
-        ):
-            raise ValueError(f"corridor layer {layer} label does not match physical y")
-        eligible_members = [
-            row for row in eligible_corridor
-            if lower <= float(row["reference_lens_physical_y_mm"]) < upper
-        ]
-        eligible_x = np.asarray(
-            [float(row["reference_lens_x_mm"]) for row in eligible_members],
-            dtype=np.float64,
-        )
-        if eligible_x.size < CORRIDOR_POINTS_PER_LAYER:
-            raise ValueError(f"corridor layer {layer} has too few eligible candidates")
-        x_min, x_max = float(eligible_x.min()), float(eligible_x.max())
-        span = x_max - x_min
-        candidate_scale = _nearest_neighbour_p95_mm(eligible_members)
-        edge_tolerance = min(0.25 * span, max(candidate_scale, 0.10 * span))
-        centre_tolerance = min(0.20 * span, max(0.5 * candidate_scale, 0.08 * span))
-        expected_bounds = (x_min, x_max)
-        expected_tolerances = (edge_tolerance, centre_tolerance)
-        for case in members:
-            recorded_bounds = tuple(
-                float(value) for value in case.get("corridor_eligible_x_bounds_mm", ())
-            )
-            recorded_tolerances = dict(case.get("corridor_anchor_tolerance_mm", {}))
-            recorded_pair = (
-                float(recorded_tolerances.get("edge", math.nan)),
-                float(recorded_tolerances.get("centre", math.nan)),
-            )
-            if recorded_bounds != expected_bounds or recorded_pair != expected_tolerances:
-                raise ValueError(
-                    f"corridor layer {layer} anchor metadata does not match eligible candidates"
-                )
-        ordered = sorted(members, key=lambda case: float(case["reference_lens_x_mm"]))
-        if [case.get("corridor_horizontal_role") for case in ordered] != [
-            "left_boundary", "centre", "right_boundary"
-        ]:
-            raise ValueError(f"corridor layer {layer} anchor roles do not match x order")
-        selected_x = [float(case["reference_lens_x_mm"]) for case in ordered]
-        centre_target = min(max(0.0, x_min), x_max)
-        if (
-            selected_x[0] - x_min > edge_tolerance
-            or abs(selected_x[1] - centre_target) > centre_tolerance
-            or x_max - selected_x[2] > edge_tolerance
-        ):
-            raise ValueError(f"corridor layer {layer} misses a physical x anchor")
-    for group in PERIPHERAL_GROUPS:
-        for band, expected_count in PERIPHERAL_BAND_COUNTS.items():
-            actual_count = sum(
-                case.get("training_group") == group
-                and case.get("peripheral_band") == band
-                for case in cases
-            )
-            if actual_count != expected_count:
-                raise ValueError(
-                    f"{group} {band} count is {actual_count}, expected {expected_count}"
-                )
-    pairs: dict[str, list[Mapping[str, Any]]] = {}
-    for case in cases:
-        if case.get("training_group") in PERIPHERAL_GROUPS:
-            pair_id = str(case.get("peripheral_pair_id", ""))
-            if not pair_id:
-                raise ValueError(f"peripheral case {case['case_id']} has no pair id")
-            pairs.setdefault(pair_id, []).append(case)
-    maximum_reference_mirror_error = 0.0
-    maximum_task_mirror_error = 0.0
-    for pair_id, members in pairs.items():
-        by_group = {str(case["training_group"]): case for case in members}
-        if len(members) != 2 or set(by_group) != set(PERIPHERAL_GROUPS):
-            raise ValueError(f"{pair_id} must contain exactly one left/right case")
-        left, right = by_group["peripheral_left"], by_group["peripheral_right"]
-        if (
-            abs(float(left["field_x_deg"]) + float(right["field_x_deg"])) > 1.0e-9
-            or abs(float(left["field_y_deg"]) - float(right["field_y_deg"])) > 1.0e-9
-            or float(left["distance_mm"]) != float(right["distance_mm"])
-            or left.get("peripheral_band") != right.get("peripheral_band")
-        ):
-            raise ValueError(f"{pair_id} is not an exact field/distance mirror pair")
-        reference_error = max(
-            abs(float(left["reference_lens_x_mm"]) + float(right["reference_lens_x_mm"])),
-            abs(float(left["reference_lens_physical_y_mm"]) - float(right["reference_lens_physical_y_mm"])),
-        )
-        task_error = max(
-            abs(float(left["case_lens_x_mm"]) + float(right["case_lens_x_mm"])),
-            abs(float(left["case_lens_physical_y_mm"]) - float(right["case_lens_physical_y_mm"])),
-        )
-        if max(reference_error, task_error) > PERIPHERAL_REAR_MIRROR_TOLERANCE_MM:
-            raise ValueError(
-                f"{pair_id} is not mirrored on the PAL rear surface: "
-                f"reference={reference_error:.6g} mm, task={task_error:.6g} mm"
-            )
-        maximum_reference_mirror_error = max(maximum_reference_mirror_error, reference_error)
-        maximum_task_mirror_error = max(maximum_task_mirror_error, task_error)
-    return {
-        "passed": True,
-        "minimum_zone_clearance_mm": minimum_zone_clearance,
-        "minimum_aperture_clearance_mm": minimum_aperture_clearance,
-        "maximum_assigned_distance_retrace_error_mm": (
-            maximum_assigned_distance_retrace_error
-        ),
-        "assigned_distance_retrace_tolerance_mm": REFERENCE_RETRACE_TOLERANCE_MM,
-        "peripheral_pair_count": len(pairs),
-        "maximum_reference_rear_mirror_error_mm": maximum_reference_mirror_error,
-        "maximum_task_rear_mirror_error_mm": maximum_task_mirror_error,
-        "mirror_tolerance_mm": PERIPHERAL_REAR_MIRROR_TOLERANCE_MM,
-    }
-
-
-def _validate_selected_candidate_membership(
-    candidates: Sequence[Mapping[str, Any]],
-    cases: Sequence[Mapping[str, Any]],
-) -> dict[str, Any]:
-    candidate_ids = [str(row.get("candidate_id", "")) for row in candidates]
-    if not all(candidate_ids) or len(set(candidate_ids)) != len(candidate_ids):
-        raise ValueError("candidate grid must contain unique non-empty candidate ids")
-    case_ids = [str(case.get("case_id", "")) for case in cases]
-    selected_candidate_ids = [str(case.get("candidate_id", "")) for case in cases]
-    if not all(case_ids) or len(set(case_ids)) != len(case_ids):
-        raise ValueError("training cases must contain unique non-empty case ids")
-    if not all(selected_candidate_ids) or len(set(selected_candidate_ids)) != len(selected_candidate_ids):
-        raise ValueError("training cases must select unique candidate ids")
-    lookup = {str(row["candidate_id"]): row for row in candidates}
-    maximum_reference_retrace_error = 0.0
-    for case in cases:
-        candidate_id = str(case["candidate_id"])
-        candidate = lookup.get(candidate_id)
-        if candidate is None:
-            raise ValueError(f"training case selects unknown candidate {candidate_id}")
-        if candidate.get("trace_status") != "ok" or not bool(candidate.get("eligible")):
-            raise ValueError(f"training case selects non-eligible candidate {candidate_id}")
-        if (
-            float(case["field_x_deg"]) != float(candidate["field_x_deg"])
-            or float(case["field_y_deg"]) != float(candidate["field_y_deg"])
-            or case.get("reference_partition_zone") != candidate.get("reference_partition_zone")
-        ):
-            raise ValueError(f"training case field/zone does not match candidate {candidate_id}")
-        retrace_error = max(
-            abs(float(case["reference_lens_x_mm"]) - float(candidate["reference_lens_x_mm"])),
-            abs(
-                float(case["reference_lens_physical_y_mm"])
-                - float(candidate["reference_lens_physical_y_mm"])
-            ),
-        )
-        if retrace_error > REFERENCE_RETRACE_TOLERANCE_MM:
-            raise ValueError(
-                f"training case reference retrace does not match candidate {candidate_id}: "
-                f"error={retrace_error:.6g} mm"
-            )
-        maximum_reference_retrace_error = max(
-            maximum_reference_retrace_error, retrace_error
-        )
-    return {
-        "passed": True,
-        "selected_candidate_count": len(selected_candidate_ids),
-        "unique_case_id_count": len(set(case_ids)),
-        "unique_candidate_id_count": len(set(selected_candidate_ids)),
-        "maximum_reference_retrace_error_mm": maximum_reference_retrace_error,
-        "reference_retrace_tolerance_mm": REFERENCE_RETRACE_TOLERANCE_MM,
-    }
-
-
-def _run_case_layout_plotter(
-    *, output: Path, zones_json: str | Path, candidate_json: Path, manifest_json: Path
-) -> None:
-    """Render plots in a clean no-Torch process to avoid duplicate Windows OpenMP runtimes."""
-    script = Path(__file__).with_name("pal_case_layout_plotter.py")
-    command = [
-        sys.executable,
-        str(script),
-        "--zones", str(Path(zones_json).resolve()),
-        "--candidates", str(candidate_json.resolve()),
-        "--manifest", str(manifest_json.resolve()),
-        "--output", str(output.resolve()),
-    ]
-    completed = subprocess.run(command, capture_output=True, text=True, check=False)
-    if completed.returncode != 0:
+            if progress_callback is not None:
+                progress_callback(tuple(cases))
+    if len(cases) != expected_count:
         raise RuntimeError(
-            "case-layout plotter failed with exit code "
-            f"{completed.returncode}: stdout={completed.stdout!r}, stderr={completed.stderr!r}"
+            f"fixed multidistance layout has {len(cases)} cases, expected {expected_count}"
         )
-
-
-def write_preoptimization_artifacts(
-    *, output_dir: str | Path, excel_path: str | Path,
-    zones_json: str | Path, candidates: Sequence[Mapping[str, Any]],
-    cases: Sequence[Mapping[str, Any]], reference_distance_mm: float,
-    sampling_contract: Mapping[str, Any],
-) -> Path:
-    output = Path(output_dir)
-    output.mkdir(parents=True, exist_ok=True)
-    payload = _read_json(zones_json)
-    counts = {group: sum(case.get("training_group") == group for case in cases) for group in TRAINING_GROUP_COUNTS}
-    if counts != TRAINING_GROUP_COUNTS or len(cases) != TOTAL_TRAINING_CASES:
-        raise ValueError(f"invalid {TOTAL_TRAINING_CASES}-case group contract: {counts}")
-    mismatches = [case["case_id"] for case in cases if case.get("reference_partition_zone") != GROUP_TO_ZONE[case["training_group"]]]
-    if mismatches:
-        raise ValueError("selected reference rays do not belong to declared partitions: " + ", ".join(mismatches))
-    membership_audit = _validate_selected_candidate_membership(candidates, cases)
-    geometry_audit = _validate_selected_case_geometry(
-        payload, cases, candidates, sampling_contract
-    )
-    candidate_payload = {
-        "schema_version": 1, "reference_distance_mm": reference_distance_mm,
-        "sampling_contract": dict(sampling_contract), "candidate_count": len(candidates),
-        "trace_failure_count": sum(row.get("trace_status") != "ok" for row in candidates),
-        "eligible_count": sum(bool(row.get("eligible")) for row in candidates),
-        "candidates": [dict(row) for row in candidates],
-    }
-    candidate_json = output / "candidate_fields.json"
-    candidate_json.write_text(json.dumps(candidate_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    reachability = coverage_audit(payload, candidates, cases)
-    coverage_json = output / "coverage_audit.json"
-    coverage_json.write_text(
-        json.dumps(reachability, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
-    if not bool(reachability["overall_passed"]):
-        raise ValueError(
-            "selected cases fail eligible-domain coverage gates: "
-            + ", ".join(reachability["failed_coverage_gates"])
-        )
-
-    manifest = {
-        "schema_version": 5,
-        "purpose": f"pal_nurbs_dense_field_fps_{TOTAL_TRAINING_CASES}_case_contract",
-        "source": {
-            "excel": {"path": str(excel_path), "sha256": _sha256_file(excel_path)},
-            "zones_json": {"path": str(zones_json), "sha256": _sha256_file(zones_json)},
-        },
-        "reference_geometry": {"object_distance_mm": reference_distance_mm, "ray": "aimed centre-pupil ray", "surface": "Original PAL rear surface", "coordinates": "physical local-surface x/y in mm"},
-        "sampling_contract": dict(sampling_contract),
-        "objective_contract": {"denominator": "per-case Original PAL baseline M2", "J_functional": "(J_far + J_mid + J_near) / 3", "J": "0.85 * J_functional + 0.15 * J_peripheral", "aggregation_order": "mean within region before region weighting"},
-        "coverage_audit": {
-            "path": str(coverage_json.resolve()),
-            "sha256": _sha256_file(coverage_json),
-            "overall_passed": True,
-        },
-        "group_counts": counts,
-        "candidate_membership_audit": membership_audit,
-        "topology_audit": partition_audit(payload, cases),
-        "case_geometry_audit": geometry_audit,
-        "cases": [dict(case) for case in cases],
-    }
-    manifest_json = output / "case_manifest.json"
-    manifest_json.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
-    _run_case_layout_plotter(
-        output=output,
-        zones_json=zones_json,
-        candidate_json=candidate_json,
-        manifest_json=manifest_json,
-    )
-    return output
+    ids = [str(case["case_id"]) for case in cases]
+    if len(ids) != len(set(ids)):
+        raise ValueError("fixed multidistance case IDs are not unique")
+    return attach_objective_weights(cases, weight_spec)

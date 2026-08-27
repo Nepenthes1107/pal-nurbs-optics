@@ -6,7 +6,7 @@
 
 ```text
 biot/                  BIOT 与 PAL-NURBS 实现
-inputs/pal/            PAL 固定输入（分区和 PSF support）
+inputs/pal/            PAL 固定输入（分区和多物距权重）
 tests/                 自动化测试
 results/optimization/  新优化运行；由程序按需创建
 results/archive/       本机保留的旧实验，不进入 Git
@@ -50,13 +50,13 @@ python -m biot.gui
 
 ## PAL-NURBS 合同
 
-- 仅优化 PAL 后表面 cubic NURBS/B-spline 的 `zp`；`xp/yp/weight` 固定，边界控制环固定为零。
-- 控制网格为 `7x7 -> 11x11 -> 19x19`，通过精确 knot refinement 晋级。
-- 80 个真实 case：Far 18、Intermediate 12、Near 18、Peripheral-left/right 各 16。
-- 使用真实可微追迹、GRIN3 固定步长 RK4、连续 OPL、去 pupil tilt FFT PSF；离线 PSF 不参与反传。
-- `J=(0.85*J_functional+0.15*J_peripheral)`，Original PAL 分母固定。
-- 仅使用 trace/PSF health、`P_far`、`ADD` 和单步 sag trust region 约束。
-- 不自动运行历史 192-case posthoc、PSF 数据库、渲染或 SSIM 链。
+- 仅优化 PAL 后表面的固定 cubic NURBS `zp` 控制量；`xp/yp/weight` 固定，外层控制环固定为零。参数网格为单一 `11×11`，实际可训练的内层为 `9×9`。
+- 三个物距分别为 `D500=500 mm`、`D2000=2000 mm` 和 `Dinf=Infinity`。每个物距使用完全相同的 `11×11` FOV 角度网格，总计 `3×121=363` 个真实 case；无有限距离近似 Infinity。
+- case 布局使用基线 PAL 后表面的 chief/reference ray 落点映射到 `inputs/pal/zones.json`。固定网格点不因稀疏、FPS、WFNO 资格或覆盖率筛选而删除；落在 monitored 安全带但未标注分区的点按显式最近分区规则分类，并记录分类模式和距离。
+- 每个 case 依次执行真实可微光线追迹、连续 OPL、去 pupil tilt 的 raw 物理 FFT PSF，再计算能量归一化 PSF 的二阶矩（`mm²`）。PSF 不做 crop、resize、插值、滤波或显示增强，离线 PSF 也不参与反传。
+- loss 为所有 case 的 `objective_weight × PSF_second_moment_mm2` 之和。分区总质量和分区内三物距分配由 `inputs/pal/multidistance_weights.json` 指定，15 个“分区×物距”组合必须都有 case，展开后权重总和严格为 1，不做缺项后的重新归一化。
+- `best_feasible` 只在完整 363-case sweep 且健康、`P_far`、`ADD`、控制量和单步 sag 约束均通过时更新；不使用局部 case、`best_image` 或 `latest` 兜底。
+- 旧的候选点选择、80-case 目标、PSF support 数据库、7×7→11×11→19×19 晋级和精确 refinement audit 不属于当前方法。
 
 ## 从零开始运行
 
@@ -64,7 +64,8 @@ python -m biot.gui
 python run_pal_nurbs.py `
   --output results/optimization/run_001 `
   --excel eye_image_glass_grad3.xlsx --device cuda `
-  --requested-np 1024 --fft-size-px 512 --steps 10 10 10
+  --weights-json inputs/pal/multidistance_weights.json `
+  --requested-np 1024 --fft-size-px 512 --steps 10
 ```
 
 普通 `--resume` 只允许恢复同一运行目录中 identity、配置、输入哈希和实现闭包完全一致的 checkpoint。当前项目不再支持跨平台 training-state/parity 导入。
@@ -78,7 +79,7 @@ python -m pytest tests -q --basetemp .tmp_pytest
 最小 prepare：
 
 ```powershell
-python run_pal_nurbs.py --output .tmp_prepare --excel eye_image_glass_grad3.xlsx --device cpu --prepare-only
+python run_pal_nurbs.py --output .tmp_prepare_multidistance --excel eye_image_glass_grad3.xlsx --device cpu --requested-np 32 --fft-size-px 64 --prepare-only
 ```
 
 正式实验只有在 `summary.json` 存在且 `run_state.status=complete` 时才算完成。r12 只作为历史未完成证据，不是当前运行的恢复入口或收益结论。

@@ -175,7 +175,7 @@ def test_e2e_coordinate_break_uses_biot_vis_rotation_order() -> None:
 
 
 def test_grad3_full_e2e_trace_is_finite_and_nurbs_gradient_reaches_image() -> None:
-    perturbation = FixedWeightNURBSPerturbation(7, device="cpu", dtype=torch.float64)
+    perturbation = FixedWeightNURBSPerturbation(device="cpu", dtype=torch.float64)
     system, temp_path = _build_grad3(distance_mm=500.0, perturbation=perturbation)
     try:
         system.reference_ray = make_aimed_reference_ray(system, device="cpu", dtype=torch.float64)
@@ -215,7 +215,7 @@ def test_grad3_activation_checkpoint_preserves_forward_and_nurbs_gradient(
     gradients = []
     for enabled in (False, True):
         monkeypatch.setattr(e2e_system, "GRIN_ACTIVATION_CHECKPOINT", enabled)
-        perturbation = FixedWeightNURBSPerturbation(7, device="cpu", dtype=torch.float64)
+        perturbation = FixedWeightNURBSPerturbation(device="cpu", dtype=torch.float64)
         system, temp_path = _build_grad3(
             distance_mm=500.0,
             field_x_deg=0.0,
