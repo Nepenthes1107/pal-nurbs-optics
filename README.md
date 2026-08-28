@@ -61,6 +61,16 @@ python -m biot.gui
 - `best_feasible` 只在完整 363-case sweep 且健康、`P_far`、`ADD`、控制量和单步 sag 约束均通过时更新；不使用局部 case、`best_image` 或 `latest` 兜底。
 - 旧的候选点选择、80-case 目标、PSF support 数据库、7×7→11×11→19×19 晋级和精确 refinement audit 不属于当前方法。
 
+## 完成优化后的评价
+
+```bash
+python evaluate_pal_nurbs.py --run results/optimization/run_001 --device cuda
+```
+
+评价在 run 内创建独立 `evaluation/` 身份，固定输出 D500/D1000/Dinf 的
+baseline、optimized、delta：Sag、AverFang 光焦度/像散、PSF/视标拼接和
+Ahumada 加权 MTF。评价网格为 `[-40,40]` degree、步长 10 degree，源 run 不会被改写。
+
 ## 从零开始运行
 
 ```powershell
