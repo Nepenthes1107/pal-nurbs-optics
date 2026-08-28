@@ -48,17 +48,19 @@ from .system import (
     LocalCoordinateBreakSurface,
     _snell,
     build_fitted_e2e_system,
+    implicit_intersection_gradient,
     make_aimed_pupil_rays,
     make_aimed_reference_ray,
+    trace_system_batch_to_image_with_phase,
     trace_system_to_image_with_phase,
 )
 
 
-METHOD_NAME = "pal_multidistance_d500_d1000_dinf_baseline_normalized_m2_astig_a_bspline7"
-RUN_IDENTITY_SCHEMA_VERSION = 3
+METHOD_NAME = "pal_multidistance_batched_baseline_normalized_m2_astig_a_bspline7"
+RUN_IDENTITY_SCHEMA_VERSION = 4
 CASE_LAYOUT_SCHEMA_VERSION = 1
-EVALUATION_PROGRESS_SCHEMA_VERSION = 1
-TRAINING_RESUME_SCHEMA_VERSION = 1
+EVALUATION_PROGRESS_SCHEMA_VERSION = 2
+TRAINING_RESUME_SCHEMA_VERSION = 2
 RUN_STATE_SCHEMA_VERSION = 1
 
 
@@ -77,12 +79,13 @@ class MinimalConfig:
     output: str = "results/optimization/run_001"
     device: str = "cuda"
     wavelength_nm: float = 555.0
-    requested_np: int = 1024
+    requested_np: int = 256
     fft_size_px: int = 512
     pupil_radius_mm: float | None = None
     fov_min_deg: float = -32.0
     fov_max_deg: float = 32.0
     fov_count: int = 11
+    case_batch_size: int = 8
     max_accepted_steps: int = 50
     early_stopping_patience: int = 7
     relative_improvement_threshold: float = 1.0e-4
@@ -99,6 +102,8 @@ class MinimalConfig:
     def __post_init__(self) -> None:
         if int(self.fov_count) != 11:
             raise ValueError("the multidistance PAL method requires fov_count=11")
+        if int(self.case_batch_size) <= 0:
+            raise ValueError("case_batch_size must be positive")
         if not math.isfinite(float(self.fov_min_deg)) or not math.isfinite(float(self.fov_max_deg)):
             raise ValueError("FOV bounds must be finite")
         if float(self.fov_max_deg) <= float(self.fov_min_deg):
@@ -141,11 +146,11 @@ class PALPowerConfig:
 
 @dataclass(frozen=True)
 class FieldResult:
-    """One physical raw FFT PSF and its numerical health metadata."""
+    """Physical raw FFT PSF data for one case or a leading case batch."""
 
     psf: torch.Tensor
     valid_fraction: torch.Tensor
-    pixel_pitch_mm: float
+    pixel_pitch_mm: float | torch.Tensor
     edge_fraction: torch.Tensor
     valid_mask: torch.Tensor | None = None
 
@@ -445,47 +450,57 @@ def _silence_setup_output():
 
 
 def _normalize_psf(psf: torch.Tensor) -> torch.Tensor:
-    if psf.ndim != 2:
-        raise ValueError("physical PSF must be a 2-D tensor")
+    if psf.ndim < 2:
+        raise ValueError("physical PSF must have shape [..., H, W]")
     if not bool(torch.isfinite(psf).all()) or bool((psf < 0.0).any()):
         raise ValueError("physical PSF must be finite and non-negative")
-    energy = psf.sum()
-    if not bool(torch.isfinite(energy)) or not bool(energy > 0.0):
+    energy = psf.sum(dim=(-2, -1), keepdim=True)
+    if not bool(torch.isfinite(energy).all()) or not bool((energy > 0.0).all()):
         raise ValueError("physical PSF must have positive finite energy")
     return psf / energy
 
 
-def psf_second_moment_mm2(psf: torch.Tensor, *, pixel_pitch_mm: float) -> torch.Tensor:
-    """Return the centered intensity second moment in mm².
+def psf_second_moment_mm2(
+    psf: torch.Tensor, *, pixel_pitch_mm: float | torch.Tensor
+) -> torch.Tensor:
+    """Return centered intensity second moments in mm² for ``[...,H,W]``.
 
     The input is the raw physical FFT PSF.  No crop, interpolation, filtering
     or display transform is applied before this calculation.
     """
-    pitch = float(pixel_pitch_mm)
-    if not math.isfinite(pitch) or pitch <= 0.0:
+    pitch = torch.as_tensor(pixel_pitch_mm, device=psf.device, dtype=psf.dtype)
+    if not bool(torch.isfinite(pitch).all()) or bool((pitch <= 0.0).any()):
         raise ValueError("PSF pixel pitch must be finite and positive")
     normalized = _normalize_psf(psf)
-    height, width = normalized.shape
-    y = (torch.arange(height, device=psf.device, dtype=psf.dtype) - 0.5 * (height - 1)) * pitch
-    x = (torch.arange(width, device=psf.device, dtype=psf.dtype) - 0.5 * (width - 1)) * pitch
+    height, width = normalized.shape[-2:]
+    y = torch.arange(height, device=psf.device, dtype=psf.dtype) - 0.5 * (height - 1)
+    x = torch.arange(width, device=psf.device, dtype=psf.dtype) - 0.5 * (width - 1)
     yy, xx = torch.meshgrid(y, x, indexing="ij")
-    cx = (normalized * xx).sum()
-    cy = (normalized * yy).sum()
-    moment = (normalized * ((xx - cx).square() + (yy - cy).square())).sum()
-    if not bool(torch.isfinite(moment)) or bool(moment < 0.0):
+    xx_mm = xx * pitch[..., None, None]
+    yy_mm = yy * pitch[..., None, None]
+    cx = (normalized * xx_mm).sum(dim=(-2, -1))
+    cy = (normalized * yy_mm).sum(dim=(-2, -1))
+    moment = (
+        normalized
+        * (
+            (xx_mm - cx[..., None, None]).square()
+            + (yy_mm - cy[..., None, None]).square()
+        )
+    ).sum(dim=(-2, -1))
+    if not bool(torch.isfinite(moment).all()) or bool((moment < 0.0).any()):
         raise ValueError("PSF second moment is non-finite or negative")
     return moment
 
 
 def _edge_fraction(psf: torch.Tensor, edge_px: int = 5) -> torch.Tensor:
     normalized = _normalize_psf(psf)
-    edge = min(max(int(edge_px), 1), int(normalized.shape[0]) // 2)
-    mask = torch.zeros_like(normalized, dtype=torch.bool)
+    edge = min(max(int(edge_px), 1), int(normalized.shape[-2]) // 2)
+    mask = torch.zeros(normalized.shape[-2:], device=normalized.device, dtype=torch.bool)
     mask[:edge] = True
     mask[-edge:] = True
     mask[:, :edge] = True
     mask[:, -edge:] = True
-    return normalized.masked_select(mask).sum()
+    return torch.where(mask, normalized, torch.zeros_like(normalized)).sum(dim=(-2, -1))
 
 
 def _release_inactive_case_cuda_cache(device: torch.device | str) -> None:
@@ -732,7 +747,10 @@ class MinimalOpticalModel:
             sample_count=self.sample_count,
             psf_size_px=self.config.fft_size_px,
             remove_piston=True,
-            remove_tilt=True,
+            # The non-legacy BIOT reference sphere already defines the
+            # de-tilted physical pupil.  A second fitted linear-phase removal
+            # shifts the authoritative FFT PSF and must not be applied here.
+            remove_tilt=False,
         )
         pitch = system.physical_fft_pixel_pitch_mm
         if pitch is None:
@@ -741,6 +759,64 @@ class MinimalOpticalModel:
             psf=fft.psf,
             valid_fraction=trace.valid.to(dtype=self.dtype).mean(),
             pixel_pitch_mm=float(pitch),
+            edge_fraction=_edge_fraction(fft.psf),
+            valid_mask=trace.valid,
+        )
+
+    def field_batch(self, cases: Sequence[Mapping[str, Any]]) -> FieldResult:
+        """Trace and FFT a true case batch with leading dimension ``B``."""
+        if not cases:
+            raise ValueError("cannot evaluate an empty field batch")
+        systems: list[FittedE2ESystem] = []
+        rays_by_case: list[Any] = []
+        pitches: list[float] = []
+        for case in cases:
+            label = str(case["distance_label"])
+            spec = next((item for item in DISTANCE_SPECS if item.label == label), None)
+            if spec is None:
+                raise ValueError(f"unknown distance label: {label}")
+            system, rays = self._system_and_rays(
+                spec.object_distance_mm,
+                float(case["field_x_deg"]),
+                float(case["field_y_deg"]),
+            )
+            if system.physical_fft_pixel_pitch_mm is None:
+                raise RuntimeError(f"missing physical raw FFT pixel pitch for {case['case_id']}")
+            systems.append(system)
+            rays_by_case.append(rays)
+            pitches.append(float(system.physical_fft_pixel_pitch_mm))
+        # A true case batch multiplies the B-spline Newton-search graph by B.
+        # Use the existing exact implicit-function derivative for intersections:
+        # the converged forward root is unchanged and one in-graph correction
+        # carries its derivative, while the non-physical search history is not
+        # retained eight times.  This is a fixed batch contract, not an OOM
+        # fallback or an adaptive batch-size change.
+        with implicit_intersection_gradient(True):
+            trace = trace_system_batch_to_image_with_phase(
+                systems,
+                rays_by_case,
+                phase_reference="biot_reference_sphere",
+            )
+        if not bool(trace.valid.any(dim=1).all()):
+            failed = [
+                str(case["case_id"])
+                for case, valid in zip(cases, trace.valid.any(dim=1))
+                if not bool(valid)
+            ]
+            raise RuntimeError("no valid rays for case batch: " + ", ".join(failed))
+        fft = torch_fft_psf_from_phase(
+            trace.phase_rad,
+            trace.valid,
+            sample_count=self.sample_count,
+            psf_size_px=self.config.fft_size_px,
+            remove_piston=True,
+            remove_tilt=False,
+        )
+        pitch = torch.as_tensor(pitches, device=self.device, dtype=self.dtype)
+        return FieldResult(
+            psf=fft.psf,
+            valid_fraction=trace.valid.to(dtype=self.dtype).mean(dim=1),
+            pixel_pitch_mm=pitch,
             edge_fraction=_edge_fraction(fft.psf),
             valid_mask=trace.valid,
         )
@@ -1251,7 +1327,7 @@ def _evaluate(
     progress_path: Path | None = None,
     identity_sha256: str | None = None,
 ) -> tuple[float, list[dict[str, Any]], dict[str, Any]]:
-    """Evaluate all cases; only positive-weight normalized metrics backpropagate."""
+    """Evaluate true case batches and backpropagate once per positive-loss batch."""
     if not cases:
         raise ValueError("cannot evaluate an empty case set")
     if with_grad and progress_path is not None:
@@ -1275,82 +1351,126 @@ def _evaluate(
         start_index = int(payload.get("next_case_index", -1))
         if start_index != len(rows) or start_index > len(cases):
             raise ValueError("evaluation progress index is inconsistent")
-    astig_by_zone: dict[str, torch.Tensor] = {}
-    if any(str(case["zone"]) in ("astig_left", "astig_right") for case in cases):
+    batch_size = int(model.config.case_batch_size)
+    if batch_size <= 0:
+        raise ValueError("model case_batch_size must be positive")
+    if start_index < len(cases) and start_index % batch_size != 0:
+        raise ValueError("evaluation progress does not end at a complete case batch")
+    total_batches = (len(cases) + batch_size - 1) // batch_size
+    for batch_start in range(start_index, len(cases), batch_size):
+        batch_cases = cases[batch_start : batch_start + batch_size]
+        batch_end = batch_start + len(batch_cases)
+        weights = [float(case["objective_weight"]) for case in batch_cases]
+        if any(not math.isfinite(weight) or weight < 0.0 for weight in weights):
+            raise ValueError("case batch has invalid objective weights")
         with torch.set_grad_enabled(with_grad):
-            astig_by_zone = model.astig_A_by_zone()
-    astig_weighted_terms: list[torch.Tensor] = []
-    for index, case in enumerate(cases[start_index:], start=start_index + 1):
-        weight = float(case["objective_weight"])
-        if not math.isfinite(weight) or weight < 0.0:
-            raise ValueError(f"case {case['case_id']} has invalid objective weight")
-        with torch.set_grad_enabled(with_grad):
-            result = model.field(case)
-            energy = result.psf.sum()
-            if not bool(torch.isfinite(energy)) or abs(float(energy.detach().cpu()) - 1.0) > 1.0e-10:
-                raise ValueError(f"physical PSF energy is not one for {case['case_id']}")
-            moment = psf_second_moment_mm2(
+            result = model.field_batch(batch_cases)
+            if result.psf.ndim != 3 or int(result.psf.shape[0]) != len(batch_cases):
+                raise ValueError("field_batch must return PSF shape [B,H,W]")
+            energy = result.psf.sum(dim=(-2, -1))
+            if not bool(torch.isfinite(energy).all()) or bool(
+                ((energy - 1.0).abs() > 1.0e-10).any()
+            ):
+                raise ValueError("physical PSF batch energy is not one")
+            moments = psf_second_moment_mm2(
                 result.psf, pixel_pitch_mm=result.pixel_pitch_mm
             )
-            zone = str(case["zone"])
-            if zone in ("astig_left", "astig_right"):
-                metric = astig_by_zone[zone]
-                metric_name = "astig_A_D"
-            else:
-                metric = moment
-                metric_name = "m2_mm2"
-            if baseline_metrics is None:
-                baseline_metric = torch.ones((), device=metric.device, dtype=metric.dtype)
-            else:
-                key = _metric_key(case)
-                if key not in baseline_metrics:
-                    raise ValueError(f"missing baseline metric for {key}")
-                denominator = float(baseline_metrics[key])
-                if not math.isfinite(denominator) or denominator <= 0.0:
-                    raise ValueError(f"baseline metric is invalid for {key}")
-                baseline_metric = torch.as_tensor(denominator, device=metric.device, dtype=metric.dtype)
-            normalized_metric = metric / baseline_metric
-            weighted = normalized_metric * torch.as_tensor(
-                weight, device=metric.device, dtype=metric.dtype
-            )
-            if with_grad and weight > 0.0:
-                if not weighted.requires_grad:
-                    raise RuntimeError(f"case {case['case_id']} is detached from PAL parameters")
-                if metric_name == "astig_A_D":
-                    astig_weighted_terms.append(weighted)
+            astig_by_zone: dict[str, torch.Tensor] = {}
+            if any(
+                str(case["zone"]) in ("astig_left", "astig_right")
+                for case in batch_cases
+            ):
+                astig_by_zone = model.astig_A_by_zone()
+            metric_tensors: list[torch.Tensor] = []
+            metric_names: list[str] = []
+            baseline_values: list[float] = []
+            for case_index, case in enumerate(batch_cases):
+                zone = str(case["zone"])
+                if zone in ("astig_left", "astig_right"):
+                    metric_tensors.append(astig_by_zone[zone])
+                    metric_names.append("astig_A_D")
                 else:
-                    weighted.backward()
-        valid_fraction = float(result.valid_fraction.detach().cpu())
-        edge_fraction = float(result.edge_fraction.detach().cpu())
-        moment_value = float(moment.detach().cpu())
-        metric_value = float(metric.detach().cpu())
-        normalized_value = float(normalized_metric.detach().cpu())
-        energy_value = float(energy.detach().cpu())
-        rows.append(
-            {
-                **dict(case),
-                "m2_mm2": moment_value,
-                "astig_A_D": metric_value if metric_name == "astig_A_D" else 0.0,
-                "loss_metric": metric_value,
-                "loss_metric_name": metric_name,
-                "baseline_metric": float(baseline_metric.detach().cpu()),
-                "normalized_metric": normalized_value,
-                "weighted_loss": float(weighted.detach().cpu()),
-                "weighted_m2_mm2": float(moment_value * weight),
-                "energy": energy_value,
-                "valid_fraction": valid_fraction,
-                "valid_ray_count": int(result.valid_mask.sum().detach().cpu())
-                if result.valid_mask is not None
-                else None,
-                "ray_count": int(result.valid_mask.numel())
-                if result.valid_mask is not None
-                else None,
-                "edge_fraction": edge_fraction,
-                "pixel_pitch_mm": float(result.pixel_pitch_mm),
-            }
+                    metric_tensors.append(moments[case_index])
+                    metric_names.append("m2_mm2")
+                if baseline_metrics is None:
+                    baseline_values.append(1.0)
+                else:
+                    key = _metric_key(case)
+                    if key not in baseline_metrics:
+                        raise ValueError(f"missing baseline metric for {key}")
+                    denominator = float(baseline_metrics[key])
+                    if not math.isfinite(denominator) or denominator <= 0.0:
+                        raise ValueError(f"baseline metric is invalid for {key}")
+                    baseline_values.append(denominator)
+            metrics = torch.stack(metric_tensors)
+            baseline_tensor = torch.as_tensor(
+                baseline_values, device=metrics.device, dtype=metrics.dtype
+            )
+            normalized_metrics = metrics / baseline_tensor
+            weight_tensor = torch.as_tensor(
+                weights, device=metrics.device, dtype=metrics.dtype
+            )
+            weighted = normalized_metrics * weight_tensor
+            positive = weight_tensor > 0.0
+            batch_loss = weighted[positive].sum()
+            if with_grad and bool(positive.any()):
+                if not batch_loss.requires_grad:
+                    raise RuntimeError("positive case-batch loss is detached from PAL parameters")
+                batch_loss.backward()
+        valid_fractions = result.valid_fraction.detach().cpu().tolist()
+        edge_fractions = result.edge_fraction.detach().cpu().tolist()
+        moment_values = moments.detach().cpu().tolist()
+        metric_values = metrics.detach().cpu().tolist()
+        normalized_values = normalized_metrics.detach().cpu().tolist()
+        weighted_values = weighted.detach().cpu().tolist()
+        energy_values = energy.detach().cpu().tolist()
+        pitch_values = torch.as_tensor(result.pixel_pitch_mm).detach().cpu().reshape(-1).tolist()
+        valid_counts = (
+            result.valid_mask.sum(dim=1).detach().cpu().tolist()
+            if result.valid_mask is not None
+            else [None] * len(batch_cases)
         )
+        ray_counts = (
+            [int(result.valid_mask.shape[1])] * len(batch_cases)
+            if result.valid_mask is not None
+            else [None] * len(batch_cases)
+        )
+        for case_index, case in enumerate(batch_cases):
+            rows.append(
+                {
+                    **dict(case),
+                    "m2_mm2": float(moment_values[case_index]),
+                    "astig_A_D": float(metric_values[case_index])
+                    if metric_names[case_index] == "astig_A_D"
+                    else 0.0,
+                    "loss_metric": float(metric_values[case_index]),
+                    "loss_metric_name": metric_names[case_index],
+                    "baseline_metric": float(baseline_values[case_index]),
+                    "normalized_metric": float(normalized_values[case_index]),
+                    "weighted_loss": float(weighted_values[case_index]),
+                    "weighted_m2_mm2": float(moment_values[case_index] * weights[case_index]),
+                    "energy": float(energy_values[case_index]),
+                    "valid_fraction": float(valid_fractions[case_index]),
+                    "valid_ray_count": None
+                    if valid_counts[case_index] is None
+                    else int(valid_counts[case_index]),
+                    "ray_count": ray_counts[case_index],
+                    "edge_fraction": float(edge_fractions[case_index]),
+                    "pixel_pitch_mm": float(pitch_values[case_index]),
+                }
+            )
         result_device = result.psf.device
-        del result, energy, moment, weighted
+        batch_loss_value = float(batch_loss.detach().cpu())
+        del (
+            result,
+            energy,
+            moments,
+            metrics,
+            normalized_metrics,
+            weighted,
+            batch_loss,
+            astig_by_zone,
+        )
         _release_inactive_case_cuda_cache(result_device)
         if progress_path is not None:
             _save_evaluation_progress(
@@ -1359,10 +1479,14 @@ def _evaluate(
                 case_ids=case_ids,
                 rows=rows,
             )
-        if index % 25 == 0 or index == len(cases):
-            print(f"[pal-multidistance] evaluated {index}/{len(cases)} cases (grad={with_grad})", flush=True)
-    if with_grad and astig_weighted_terms:
-        torch.stack(astig_weighted_terms).sum().backward()
+        batch_number = batch_start // batch_size + 1
+        print(
+            "[pal-multidistance] "
+            f"batch {batch_number}/{total_batches} "
+            f"cases {batch_start + 1}-{batch_end}/{len(cases)} "
+            f"grad={with_grad} batch_loss={batch_loss_value:.12g}",
+            flush=True,
+        )
     loss, health = _summarize_rows(rows)
     return loss, rows, health
 
@@ -2003,6 +2127,9 @@ def _run_bound(
                 "min_deg": config.fov_min_deg,
                 "max_deg": config.fov_max_deg,
             },
+            "case_batch_size": config.case_batch_size,
+            "case_batch_count": (len(cases) + config.case_batch_size - 1)
+            // config.case_batch_size,
             "objective": "sum(zone_distance_weight * metric / baseline_metric), metric=M2 for far/corridor/near and M/A A for astig_left/right",
             "baseline_metrics": baseline_metrics,
             "initial_normalized_loss": baseline_loss,

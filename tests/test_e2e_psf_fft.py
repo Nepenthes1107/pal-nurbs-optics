@@ -149,6 +149,57 @@ class TestE2ETorchFFTPSF(unittest.TestCase):
         self.assertTrue(torch.all(torch.isfinite(phase.grad)))
         self.assertGreater(float(phase.grad.abs().sum()), 0.0)
 
+    def test_batched_fft_matches_stacked_scalar_forward_and_gradient(self):
+        sample_count = 17
+        aperture = circular_pupil_mask(sample_count, dtype=torch.float64)
+        ray_count = int(aperture.sum())
+        base = torch.linspace(-1.0, 1.0, ray_count, dtype=torch.float64)
+        phase = torch.stack(
+            (0.2 * base.square(), 0.1 * base + 0.3 * base.square(), -0.4 * base.square())
+        ).requires_grad_(True)
+        valid = torch.ones_like(phase, dtype=torch.bool)
+        valid[1, -3:] = False
+
+        batched = torch_fft_psf_from_phase(
+            phase,
+            valid,
+            sample_count=sample_count,
+            psf_size_px=65,
+            remove_tilt=True,
+        )
+        scalar = [
+            torch_fft_psf_from_phase(
+                phase[index],
+                valid[index],
+                sample_count=sample_count,
+                psf_size_px=65,
+                remove_tilt=True,
+            )
+            for index in range(3)
+        ]
+        expected_psf = torch.stack([item.psf for item in scalar])
+        expected_pupil = torch.stack([item.complex_pupil for item in scalar])
+        expected_valid = torch.stack([item.valid_pupil for item in scalar])
+
+        self.assertTrue(torch.equal(batched.valid_pupil, expected_valid))
+        self.assertTrue(torch.allclose(batched.complex_pupil, expected_pupil, atol=1.0e-14, rtol=0.0))
+        self.assertTrue(torch.allclose(batched.psf, expected_psf, atol=1.0e-14, rtol=0.0))
+        self.assertTrue(
+            torch.allclose(
+                batched.psf.sum(dim=(-2, -1)),
+                torch.ones(3, dtype=torch.float64),
+                atol=1.0e-12,
+                rtol=0.0,
+            )
+        )
+
+        sample = (slice(None), 29, 34)
+        batched.psf[sample].sum().backward(retain_graph=True)
+        batched_gradient = phase.grad.detach().clone()
+        phase.grad = None
+        expected_psf[sample].sum().backward()
+        self.assertTrue(torch.allclose(phase.grad, batched_gradient, atol=1.0e-13, rtol=0.0))
+
     def test_fft_psf_loss_backpropagates_through_tracing_to_pal(self):
         rays = make_pupil_rays(
             sample_count=5,

@@ -12,9 +12,9 @@ class TorchFFTPSFResult:
     """Torch FFT PSF diagnostic bundle.
 
     Shapes:
-        complex_pupil: ``[P, P]`` complex pupil field.
-        psf: ``[H, W]`` energy-normalized image-plane intensity.
-        valid_pupil: ``[P, P]`` boolean aperture and valid-ray mask.
+        complex_pupil: ``[..., P, P]`` complex pupil field.
+        psf: ``[..., H, W]`` energy-normalized image-plane intensity.
+        valid_pupil: ``[..., P, P]`` boolean aperture and valid-ray mask.
 
     Units:
         phase_rad is in radians. PSF pixel spacing is supplied by the caller
@@ -67,12 +67,14 @@ def complex_pupil_from_phase(
     the aperture, or marked invalid, are zero. The output remains
     differentiable with respect to ``phase_rad``.
     """
-    if phase_rad.ndim != 1:
-        raise ValueError("phase_rad must be a 1D tensor matching pupil rays")
+    if phase_rad.ndim < 1:
+        raise ValueError("phase_rad must have shape [..., pupil_rays]")
     aperture = circular_pupil_mask(sample_count, device=phase_rad.device, dtype=phase_rad.dtype)
     ray_count = int(aperture.sum().detach().cpu().item())
-    if phase_rad.numel() != ray_count:
-        raise ValueError(f"phase length {phase_rad.numel()} does not match circular pupil ray count {ray_count}")
+    if int(phase_rad.shape[-1]) != ray_count:
+        raise ValueError(
+            f"phase length {int(phase_rad.shape[-1])} does not match circular pupil ray count {ray_count}"
+        )
 
     valid_flat = torch.ones_like(phase_rad, dtype=torch.bool) if valid is None else valid.to(device=phase_rad.device, dtype=torch.bool)
     if valid_flat.shape != phase_rad.shape:
@@ -87,14 +89,19 @@ def complex_pupil_from_phase(
         remove_tilt=remove_tilt,
     )
 
-    flat_field = torch.zeros((int(sample_count) * int(sample_count),), device=phase_rad.device, dtype=torch.complex128)
+    batch_shape = tuple(int(value) for value in phase_rad.shape[:-1])
+    flat_shape = (*batch_shape, int(sample_count) * int(sample_count))
+    flat_field = torch.zeros(flat_shape, device=phase_rad.device, dtype=torch.complex128)
     phasors = torch.exp(1j * phase.to(torch.complex128)) * valid_flat.to(torch.complex128)
-    flat_mask = aperture.reshape(-1)
-    flat_field = flat_field.masked_scatter(flat_mask, phasors)
-    pupil = flat_field.reshape(int(sample_count), int(sample_count))
-    valid_pupil_flat = torch.zeros_like(flat_mask, dtype=torch.bool)
-    valid_pupil_flat = valid_pupil_flat.masked_scatter(flat_mask, valid_flat)
-    return pupil, valid_pupil_flat.reshape_as(aperture)
+    flat_mask = aperture.reshape(-1).expand(flat_shape)
+    flat_field = flat_field.masked_scatter(flat_mask, phasors.reshape(-1))
+    pupil = flat_field.reshape(*batch_shape, int(sample_count), int(sample_count))
+    valid_pupil_flat = torch.zeros(flat_shape, device=phase_rad.device, dtype=torch.bool)
+    valid_pupil_flat = valid_pupil_flat.masked_scatter(flat_mask, valid_flat.reshape(-1))
+    valid_pupil = valid_pupil_flat.reshape(
+        *batch_shape, int(sample_count), int(sample_count)
+    )
+    return pupil, valid_pupil
 
 
 def _aperture_xy_coordinates(
@@ -118,9 +125,13 @@ def _remove_phase_plane(
     remove_piston: bool,
     remove_tilt: bool,
 ) -> torch.Tensor:
+    if not bool(valid_flat.any(dim=-1).all()):
+        raise ValueError("each pupil case must contain at least one valid ray")
     if not remove_tilt:
-        if remove_piston and torch.any(valid_flat):
-            return phase_rad - phase_rad[valid_flat].mean()
+        if remove_piston:
+            count = valid_flat.sum(dim=-1).to(dtype=phase_rad.dtype)
+            mean = torch.where(valid_flat, phase_rad, torch.zeros_like(phase_rad)).sum(dim=-1) / count
+            return phase_rad - mean.unsqueeze(-1)
         return phase_rad
 
     x, y = _aperture_xy_coordinates(aperture, int(sample_count), dtype=phase_rad.dtype)
@@ -130,9 +141,11 @@ def _remove_phase_plane(
         aperture,
         sample_count=int(sample_count),
     )
-    phase = phase_rad - (slope_x * x + slope_y * y)
-    if remove_piston and torch.any(valid_flat):
-        phase = phase - phase[valid_flat].mean()
+    phase = phase_rad - (slope_x.unsqueeze(-1) * x + slope_y.unsqueeze(-1) * y)
+    if remove_piston:
+        count = valid_flat.sum(dim=-1).to(dtype=phase.dtype)
+        mean = torch.where(valid_flat, phase, torch.zeros_like(phase)).sum(dim=-1) / count
+        phase = phase - mean.unsqueeze(-1)
     return phase
 
 
@@ -151,20 +164,32 @@ def _estimate_wrapped_phase_slopes(
     increment to radians per normalized pupil coordinate.
     """
     n = int(sample_count)
-    flat_phase = torch.zeros((n * n,), device=phase_rad.device, dtype=phase_rad.dtype)
-    flat_valid = torch.zeros((n * n,), device=phase_rad.device, dtype=torch.bool)
-    flat_mask = aperture.reshape(-1)
-    flat_phase = flat_phase.masked_scatter(flat_mask, phase_rad)
-    flat_valid = flat_valid.masked_scatter(flat_mask, valid_flat)
-    phase_grid = flat_phase.reshape(n, n)
-    valid_grid = flat_valid.reshape(n, n)
+    batch_shape = tuple(int(value) for value in phase_rad.shape[:-1])
+    flat_shape = (*batch_shape, n * n)
+    flat_phase = torch.zeros(flat_shape, device=phase_rad.device, dtype=phase_rad.dtype)
+    flat_valid = torch.zeros(flat_shape, device=phase_rad.device, dtype=torch.bool)
+    flat_mask = aperture.reshape(-1).expand(flat_shape)
+    flat_phase = flat_phase.masked_scatter(flat_mask, phase_rad.reshape(-1))
+    flat_valid = flat_valid.masked_scatter(flat_mask, valid_flat.reshape(-1))
+    phase_grid = flat_phase.reshape(*batch_shape, n, n)
+    valid_grid = flat_valid.reshape(*batch_shape, n, n)
     phasor = torch.exp(1j * phase_grid.to(torch.complex128))
     step = torch.as_tensor(2.0 / float(max(1, n - 1)), device=phase_rad.device, dtype=phase_rad.dtype)
 
-    x_pairs = valid_grid[:, 1:] & valid_grid[:, :-1]
-    y_pairs = valid_grid[1:, :] & valid_grid[:-1, :]
-    slope_x = _mean_wrapped_increment(phasor[:, 1:] * torch.conj(phasor[:, :-1]), x_pairs, step, phase_rad)
-    slope_y = _mean_wrapped_increment(phasor[1:, :] * torch.conj(phasor[:-1, :]), y_pairs, step, phase_rad)
+    x_pairs = valid_grid[..., :, 1:] & valid_grid[..., :, :-1]
+    y_pairs = valid_grid[..., 1:, :] & valid_grid[..., :-1, :]
+    slope_x = _mean_wrapped_increment(
+        phasor[..., :, 1:] * torch.conj(phasor[..., :, :-1]),
+        x_pairs,
+        step,
+        phase_rad,
+    )
+    slope_y = _mean_wrapped_increment(
+        phasor[..., 1:, :] * torch.conj(phasor[..., :-1, :]),
+        y_pairs,
+        step,
+        phase_rad,
+    )
     return slope_x, slope_y
 
 
@@ -174,10 +199,13 @@ def _mean_wrapped_increment(
     step: torch.Tensor,
     reference: torch.Tensor,
 ) -> torch.Tensor:
-    if not torch.any(mask):
-        return torch.zeros((), device=reference.device, dtype=reference.dtype)
-    mean_step = unit_steps[mask].mean()
-    return torch.angle(mean_step).to(dtype=reference.dtype) / step
+    reduce_dims = (-2, -1)
+    count = mask.sum(dim=reduce_dims)
+    summed = torch.where(mask, unit_steps, torch.zeros_like(unit_steps)).sum(dim=reduce_dims)
+    safe_count = count.clamp_min(1).to(dtype=summed.real.dtype)
+    mean_step = summed / safe_count
+    slope = torch.angle(mean_step).to(dtype=reference.dtype) / step
+    return torch.where(count > 0, slope, torch.zeros_like(slope))
 
 
 def torch_fft_psf_from_complex_pupil(
@@ -189,33 +217,45 @@ def torch_fft_psf_from_complex_pupil(
 ) -> torch.Tensor:
     """Compute an energy-normalized PSF from a complex pupil using torch FFT.
 
-    Padding intentionally follows BIOT ``Lensdata._pad_pupils()`` closely:
-    a symmetric pad of ``(psf_size_px - pupil_size) // 2 + 1`` is applied, and
-    the FFT result is center-cropped back to ``psf_size_px`` if needed.
+    Padding exactly follows BIOT ``Lensdata._pad_pupils()``: the pupil is
+    centered in an array whose final shape is exactly ``psf_size_px``.  For an
+    odd padding remainder, the extra sample is placed on the high-index side.
     """
-    if complex_pupil.ndim != 2:
-        raise ValueError("complex_pupil must be a 2D tensor")
-    if complex_pupil.shape[0] != complex_pupil.shape[1]:
+    if complex_pupil.ndim < 2:
+        raise ValueError("complex_pupil must have shape [..., P, P]")
+    if complex_pupil.shape[-2] != complex_pupil.shape[-1]:
         raise ValueError("complex_pupil must be square")
     if int(psf_size_px) <= 0:
         raise ValueError("psf_size_px must be positive")
 
-    pupil_size = int(complex_pupil.shape[0])
-    pad = (int(psf_size_px) - pupil_size) // 2 + 1
-    if pad < 0:
+    pupil_size = int(complex_pupil.shape[-1])
+    total_pad = int(psf_size_px) - pupil_size
+    if total_pad < 0:
         raise ValueError("psf_size_px must be at least the pupil size")
-    padded = F.pad(complex_pupil, (pad, pad, pad, pad))
-    amplitude = torch.fft.fftshift(torch.fft.fft2(torch.fft.ifftshift(padded)))
+    pad_low = total_pad // 2
+    pad_high = total_pad - pad_low
+    padded = F.pad(
+        complex_pupil,
+        (pad_low, pad_high, pad_low, pad_high),
+    )
+    amplitude = torch.fft.fftshift(
+        torch.fft.fft2(torch.fft.ifftshift(padded, dim=(-2, -1)), dim=(-2, -1)),
+        dim=(-2, -1),
+    )
     psf = amplitude.real.pow(2) + amplitude.imag.pow(2)
     if psf.shape[-1] != int(psf_size_px):
-        current_h, current_w = psf.shape
+        current_h, current_w = psf.shape[-2:]
         start_h = (current_h - int(psf_size_px)) // 2
         start_w = (current_w - int(psf_size_px)) // 2
-        psf = psf[start_h : start_h + int(psf_size_px), start_w : start_w + int(psf_size_px)]
+        psf = psf[
+            ...,
+            start_h : start_h + int(psf_size_px),
+            start_w : start_w + int(psf_size_px),
+        ]
     if standardize_orientation:
         psf = standardize_fft_psf_orientation(psf)
-    energy = psf.sum()
-    if not torch.isfinite(energy) or energy <= float(eps):
+    energy = psf.sum(dim=(-2, -1), keepdim=True)
+    if not bool(torch.isfinite(energy).all()) or bool((energy <= float(eps)).any()):
         raise ValueError("FFT PSF energy is zero or non-finite")
     return psf / energy
 
@@ -246,4 +286,3 @@ def effective_biot_pupil_sample_count(requested_np: int) -> int:
         raise ValueError("requested pupil sampling must be positive")
     exponent = math.log(requested / 32.0, 2.0)
     return int(32.0 * ((2.0**0.5) ** exponent))
-

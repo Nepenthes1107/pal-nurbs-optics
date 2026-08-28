@@ -5304,7 +5304,8 @@ class Surface(PrettyPrinter):
         return r_new, T_new, d_opl
 
     def trace_to_next_surface(self, p_in, T_in, step_size, z_offset, next_surface,
-                              max_extra_frac=1.6):
+                              max_extra_frac=1.6, case_axis=None,
+                              case_step_h=None, case_max_steps=None):
         """
         在梯度介质中一直积分，直到穿过“下一面”，再把落点精修到该面上。
 
@@ -5322,6 +5323,22 @@ class Surface(PrettyPrinter):
         Returns:
             (p_out, T_out, opl, valid)
         """
+        if case_axis is not None:
+            if int(case_axis) != 0 or p_in.ndim != 3 or T_in.ndim != 3:
+                raise ValueError(
+                    "batched Gradient_3 tracing requires case_axis=0 and [B,N,3] tensors"
+                )
+            return self._trace_to_next_surface_case_batch(
+                p_in,
+                T_in,
+                step_size,
+                z_offset,
+                next_surface,
+                max_extra_frac=max_extra_frac,
+                case_step_h=case_step_h,
+                case_max_steps=case_max_steps,
+            )
+
         z_local_offset = torch.zeros_like(p_in[..., 2])
 
         def signed_gap(rr):
@@ -5365,6 +5382,90 @@ class Surface(PrettyPrinter):
             opl = opl + d_opl
             F = signed_gap(r)
             _ = n_here  # 保留局部折射率读取，便于调试
+
+        valid = torch.isfinite(F) & (F.abs() < 1e-6)
+        return r, T, opl, valid
+
+    def _trace_to_next_surface_case_batch(self, p_in, T_in, step_size, z_offset,
+                                          next_surface, max_extra_frac=1.6,
+                                          case_step_h=None, case_max_steps=None):
+        """Vectorized PAL case batch with independent GRIN integration schedules.
+
+        The first tensor axis is the case axis and the second is the pupil-ray
+        axis.  Each case receives the same ``h`` and loop limits it would have
+        received from an independent call to :meth:`trace_to_next_surface`.
+        """
+        z_local_offset = torch.zeros_like(p_in[..., 2])
+
+        def signed_gap(rr):
+            sag_next = next_surface.get_sag(rr[..., 0], rr[..., 1])
+            return rr[..., 2] - (z_offset + sag_next)
+
+        if (case_step_h is None) != (case_max_steps is None):
+            raise ValueError("case_step_h and case_max_steps must be provided together")
+        if case_step_h is None:
+            Tz = T_in[..., 2].abs().clamp_min(1e-12)
+            t_span = (float(z_offset) / Tz.mean(dim=1)).detach()
+            base_steps = torch.floor(
+                t_span.abs() / max(float(step_size), 1e-9)
+            ).to(dtype=torch.int64) + 1
+            base_steps = base_steps.clamp_min(1)
+            h = (t_span / base_steps.to(dtype=t_span.dtype)).unsqueeze(-1)
+            max_steps = torch.floor(
+                base_steps.to(dtype=t_span.dtype) * float(max_extra_frac)
+            ).to(dtype=torch.int64) + 4
+        else:
+            h = torch.as_tensor(
+                case_step_h, device=p_in.device, dtype=p_in.dtype
+            ).detach()
+            max_steps = torch.as_tensor(
+                case_max_steps, device=p_in.device, dtype=torch.int64
+            ).detach()
+            if h.shape != (int(p_in.shape[0]), 1):
+                raise ValueError("case_step_h must have shape [B,1]")
+            if max_steps.shape != (int(p_in.shape[0]),):
+                raise ValueError("case_max_steps must have shape [B]")
+            if not bool(torch.isfinite(h).all()) or bool((max_steps < 1).any()):
+                raise ValueError("case-batch GRIN schedule is invalid")
+
+        r = p_in.clone()
+        T = T_in.clone()
+        opl = torch.zeros_like(p_in[..., 2])
+        crossed = signed_gap(r) >= 0
+        loop_count = int(max_steps.max().detach().cpu().item())
+        for iteration in range(loop_count):
+            case_active = (iteration < max_steps) & (~crossed.all(dim=1))
+            if not bool(case_active.any()):
+                break
+            r_try, T_try, d_opl = self._rk4_step(r, T, h, z_local_offset)
+            advance = case_active.unsqueeze(-1) & (~crossed)
+            r = torch.where(advance.unsqueeze(-1), r_try, r)
+            T = torch.where(advance.unsqueeze(-1), T_try, T)
+            opl = opl + torch.where(advance, d_opl, torch.zeros_like(d_opl))
+            crossed = crossed | (case_active.unsqueeze(-1) & (signed_gap(r) >= 0))
+
+        F = signed_gap(r)
+        refine_active = torch.ones(
+            (int(p_in.shape[0]),), device=p_in.device, dtype=torch.bool
+        )
+        for _ in range(12):
+            dF_dt = T[..., 2].clone()
+            dF_dt = torch.where(
+                dF_dt.abs() < 1e-12,
+                torch.full_like(dF_dt, 1e-12),
+                dF_dt,
+            )
+            dt = -F / dF_dt
+            dt = torch.where(F.abs() < 1e-12, torch.zeros_like(dt), dt)
+            refine_active = refine_active & (dt.abs().amax(dim=1) >= 1e-13)
+            if not bool(refine_active.any()):
+                break
+            r_try, T_try, d_opl = self._rk4_step(r, T, dt, z_local_offset)
+            advance = refine_active.unsqueeze(-1)
+            r = torch.where(advance.unsqueeze(-1), r_try, r)
+            T = torch.where(advance.unsqueeze(-1), T_try, T)
+            opl = opl + torch.where(advance, d_opl, torch.zeros_like(d_opl))
+            F = signed_gap(r)
 
         valid = torch.isfinite(F) & (F.abs() < 1e-6)
         return r, T, opl, valid

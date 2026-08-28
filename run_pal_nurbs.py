@@ -27,6 +27,12 @@ def main() -> int:
     parser.add_argument("--fov-min-deg", type=float, default=MinimalConfig.fov_min_deg)
     parser.add_argument("--fov-max-deg", type=float, default=MinimalConfig.fov_max_deg)
     parser.add_argument(
+        "--case-batch-size",
+        type=int,
+        default=MinimalConfig.case_batch_size,
+        help="并行追迹、FFT 并执行一次 backward 的 case 数，默认 8",
+    )
+    parser.add_argument(
         "--accepted-steps",
         type=int,
         default=MinimalConfig.max_accepted_steps,
@@ -63,6 +69,7 @@ def main() -> int:
         fft_size_px=args.fft_size_px,
         fov_min_deg=args.fov_min_deg,
         fov_max_deg=args.fov_max_deg,
+        case_batch_size=args.case_batch_size,
         max_accepted_steps=args.accepted_steps,
         early_stopping_patience=args.early_stopping_patience,
         relative_improvement_threshold=args.relative_improvement_threshold,

@@ -1,6 +1,6 @@
 # 当前工程状态
 
-更新时间：2026-08-26。
+更新时间：2026-08-28。
 
 ## 当前主线
 
@@ -24,6 +24,7 @@
 - case 使用真实可微光线追迹和去 pupil tilt 的 raw 物理 FFT PSF；far/corridor/near 的 loss 为 baseline-normalized PSF 二阶矩，astig-left/right 的 loss 为 baseline-normalized M/A 像散量 A。禁止 PSF crop、resize、插值、滤波和离线 PSF 反传。
 - 分区分类以 `zones.json` 的存储 mask 为主；monitored 内未标注单元使用记录在 case metadata 中的最近分区规则，任何固定点都不能静默丢弃。
 - 权重定义在 `inputs/pal/multidistance_weights.json`，联合权重总和严格为 1；far-D500 和 near-Dinf 为严格零权重，case 保留用于 baseline/validation 但不反传。
+- 默认 `case_batch_size=8`：每批执行 `[B,N,3]` 真实张量追迹、`[B,P,P]` FFT PSF、批 loss 聚合和一次 backward；下一批继续在 PAL 参数上累积梯度，完整 363-case sweep 后才执行一次 optimizer step。最后一批使用实际 case 数；OOM 直接失败，不自动缩批。
 - 优化预算为最多 50 个 accepted steps，默认 patience=7、相对改善阈值=1e-4；拒绝步同时恢复 PAL 参数与 Adam optimizer state。
 - `best_feasible` 只能来自完整 363-case sweep，并同时满足 PSF health、`P_far`、`ADD`、控制量和单步 sag 约束。
 
@@ -40,13 +41,13 @@
 - 当前训练 case 数量固定为 `3×121=363`，不是历史 80-case 合同。
 - `best_feasible` 必须来自完整覆盖周期且所有工程与健康约束通过。
 - 当前为去 tilt、单波长结果，不能外推为色差、棱镜、真实视物位置或几何畸变合格。
-- 普通 `--resume` 仅在同一目录 identity、配置、输入哈希和实现闭包完全一致时有效。
+- 普通 `--resume` 仅在同一目录 identity、配置、输入哈希和实现闭包完全一致时有效。当前批处理 method identity 及 run/evaluation/training schema 已更新，旧逐 case run 不兼容。
 - 跨平台 training-state、parity fixture、cloud_run 和 migration 导出链已废弃并删除。
 
 ## 资源与恢复
 
 - Windows/WDDM 下 PyTorch CUDA allocator inactive blocks 曾造成 host commit 压力。
-- 当前实现逐 case 释放图并调用 `torch.cuda.empty_cache()`；GRIN3 使用 activation checkpoint，物理方程和梯度路径不变。
+- 当前实现按完整 case batch 释放图并清理 inactive CUDA cache。普通 B-spline 面使用收敛交点的隐函数梯度，GRIN3 使用 activation checkpoint；GRIN 反向按固定 pupil-ray chunk 重算，但每个 chunk 始终包含整个 case batch，且步长/最大步数由每个 case 的完整光线集合预先确定，不改变单 case 数值轨迹。
 - 长任务必须持续写 checkpoint、history、run state 和退出信息；异常后从最近可验证 checkpoint 恢复，不降低正式采样或门槛。
 
 ## 验证入口
