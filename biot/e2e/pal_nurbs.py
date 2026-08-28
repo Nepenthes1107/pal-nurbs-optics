@@ -241,6 +241,16 @@ def _write_history(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _append_training_log(path: Path, message: str) -> None:
+    """Append one durable human-readable progress record."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    with path.open("a", encoding="utf-8", newline="\n") as handle:
+        handle.write(f"{timestamp} {message}\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
 def _implementation_closure_paths() -> list[Path]:
     root = Path(__file__).resolve().parents[2]
     relative = [
@@ -1326,6 +1336,7 @@ def _evaluate(
     baseline_metrics: Mapping[str, float] | None = None,
     progress_path: Path | None = None,
     identity_sha256: str | None = None,
+    print_progress: bool = True,
 ) -> tuple[float, list[dict[str, Any]], dict[str, Any]]:
     """Evaluate true case batches and backpropagate once per positive-loss batch."""
     if not cases:
@@ -1480,13 +1491,16 @@ def _evaluate(
                 rows=rows,
             )
         batch_number = batch_start // batch_size + 1
-        print(
-            "[pal-multidistance] "
-            f"batch {batch_number}/{total_batches} "
-            f"cases {batch_start + 1}-{batch_end}/{len(cases)} "
-            f"grad={with_grad} batch_loss={batch_loss_value:.12g}",
-            flush=True,
-        )
+        if print_progress and (
+            batch_number == total_batches or batch_number % 8 == 0
+        ):
+            print(
+                "[pal-eval] "
+                f"batch {batch_number}/{total_batches} "
+                f"cases {batch_start + 1}-{batch_end}/{len(cases)} "
+                f"grad={with_grad} loss={batch_loss_value:.6g}",
+                flush=True,
+            )
     loss, health = _summarize_rows(rows)
     return loss, rows, health
 
@@ -1721,6 +1735,13 @@ def _run_bound(
             **details,
         )
 
+    training_log_path = output / "training.log"
+
+    def log_progress(message: str) -> None:
+        line = f"[pal-train] {message}"
+        _append_training_log(training_log_path, line)
+        print(line, flush=True)
+
     summary_path = output / "summary.json"
     if summary_path.is_file():
         summary = _read_json(summary_path)
@@ -1842,6 +1863,10 @@ def _run_bound(
             },
         )
         write_state("baseline_complete", normalized_loss=baseline_loss)
+        log_progress(
+            f"baseline complete cases={len(cases)} loss={baseline_loss:.6g} "
+            f"batch_size={config.case_batch_size}"
+        )
 
         resume_path = output / "resume.pt"
         optimizer = torch.optim.Adam([module.inner_q], lr=config.learning_rate)
@@ -1883,6 +1908,12 @@ def _run_bound(
             _restore_rng_state(payload["rng_state"])
             if history:
                 _write_history(output / "history.csv", history)
+            log_progress(
+                f"resume attempt={completed_attempts} accepted={accepted_steps}/"
+                f"{config.max_accepted_steps} best={best_loss:.6g} "
+                f"patience={no_improvement_accepted_steps}/{config.early_stopping_patience} "
+                f"lr={learning_rate:.6g}"
+            )
         else:
             _save_checkpoint(
                 output / "initial.pt",
@@ -1926,6 +1957,10 @@ def _run_bound(
                     best_power=best_power,
                 ),
             )
+            log_progress(
+                f"training start accepted=0/{config.max_accepted_steps} "
+                f"patience=0/{config.early_stopping_patience} lr={learning_rate:.6g}"
+            )
 
         attempt = completed_attempts
         while accepted_steps < int(config.max_accepted_steps):
@@ -1936,9 +1971,17 @@ def _run_bound(
                 accepted_steps=accepted_steps,
                 max_accepted_steps=config.max_accepted_steps,
             )
+            log_progress(
+                f"attempt={attempt} evaluating accepted={accepted_steps}/"
+                f"{config.max_accepted_steps} cases={len(cases)}"
+            )
             module.zero_grad(set_to_none=True)
             loss, rows, health = _evaluate(
-                model, cases, with_grad=True, baseline_metrics=baseline_metrics
+                model,
+                cases,
+                with_grad=True,
+                baseline_metrics=baseline_metrics,
+                print_progress=False,
             )
             power, old_delta, current_sag = _power_and_sag(
                 base_sag, module, power_config, zones
@@ -2065,6 +2108,16 @@ def _run_bound(
                     best_power=best_power,
                 ),
             )
+            update_label = "ACCEPT" if update_applied else f"REJECT:{update_reason}"
+            feasible_label = "yes" if feasible else "no"
+            log_progress(
+                f"attempt={attempt} accepted={accepted_steps}/"
+                f"{config.max_accepted_steps} update={update_label} "
+                f"loss={float(loss):.6g} best={best_loss:.6g} feasible={feasible_label} "
+                f"rel={relative_improvement:.3e} "
+                f"lr={learning_rate:.6g} patience={no_improvement_accepted_steps}/"
+                f"{config.early_stopping_patience}"
+            )
             if no_improvement_accepted_steps >= int(config.early_stopping_patience):
                 write_state(
                     "early_stopping",
@@ -2072,8 +2125,16 @@ def _run_bound(
                     patience=config.early_stopping_patience,
                     relative_improvement_threshold=config.relative_improvement_threshold,
                 )
+                log_progress(
+                    f"early stopping accepted={accepted_steps}/{config.max_accepted_steps} "
+                    f"patience={no_improvement_accepted_steps}/{config.early_stopping_patience}"
+                )
                 break
             if learning_rate < float(config.minimum_learning_rate) and not update_applied:
+                log_progress(
+                    f"stop learning_rate={learning_rate:.6g} below minimum="
+                    f"{config.minimum_learning_rate:.6g} after rejected update"
+                )
                 break
 
         if not (output / "best_feasible.pt").is_file():
@@ -2091,8 +2152,16 @@ def _run_bound(
             )
         module.load_state_dict(best_state)
         write_state("final_evaluation", best_feasible_step=best_step)
+        log_progress(
+            f"final evaluation best_step={best_step} best_loss={best_loss:.6g} "
+            f"accepted={accepted_steps}/{config.max_accepted_steps} attempts={completed_attempts}"
+        )
         final_loss, final_rows, final_health = _evaluate(
-            model, cases, with_grad=False, baseline_metrics=baseline_metrics
+            model,
+            cases,
+            with_grad=False,
+            baseline_metrics=baseline_metrics,
+            print_progress=False,
         )
         final_power, final_delta, final_sag = _power_and_sag(
             base_sag, module, power_config, zones
@@ -2150,6 +2219,7 @@ def _run_bound(
             "baseline_health": baseline_health,
             "final_health": final_health,
             "runtime_seconds": runtime_seconds,
+            "training_log": "training.log",
         }
         _write_json_atomic(summary_path, summary)
         _write_run_state(
@@ -2191,6 +2261,10 @@ def run(config: MinimalConfig, *, resume: bool = False) -> Path:
                 phase = str(_read_json(state_path).get("phase", phase))
             except Exception:
                 phase = "interrupted"
+        _append_training_log(
+            output / "training.log",
+            f"[pal-train] INTERRUPTED phase={phase} error={type(exc).__name__}: {exc}",
+        )
         _write_run_state(
             output,
             identity_sha256=str(identity["identity_sha256"]),

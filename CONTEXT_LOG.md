@@ -49,6 +49,7 @@
 - Windows/WDDM 下 PyTorch CUDA allocator inactive blocks 曾造成 host commit 压力。
 - 当前实现按完整 case batch 释放图并清理 inactive CUDA cache。普通 B-spline 面使用收敛交点的隐函数梯度，GRIN3 使用 activation checkpoint；GRIN 反向按固定 pupil-ray chunk 重算，但每个 chunk 始终包含整个 case batch，且步长/最大步数由每个 case 的完整光线集合预先确定，不改变单 case 数值轨迹。
 - 长任务必须持续写 checkpoint、history、run state 和退出信息；异常后从最近可验证 checkpoint 恢复，不降低正式采样或门槛。
+- 训练进度同时写入 run 根目录 `training.log`：记录 baseline、resume、每次 attempt 的 accepted/max steps、loss、更新接受/拒绝原因、学习率、early-stopping patience 和中断原因；`history.csv` 仍保存结构化逐 attempt 记录。
 
 ## 验证入口
 

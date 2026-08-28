@@ -57,6 +57,7 @@ python -m biot.gui
 - far/corridor/near 使用能量归一化 PSF 二阶矩（`mm²`），astig-left/right 使用 M/A 中的像散量 A（`D`）；每个 zone×distance 组合除以其 PAL 零残差 baseline 指标。PSF 不做 crop、resize、插值、滤波或显示增强，离线 PSF 也不参与反传。
 - 固定联合权重为 far `(0, 0.050, 0.200)`、corridor `(0.025, 0.200, 0.025)`、near `(0.200, 0.050, 0)`、两个 astig 侧各 `(0.125/3, 0.125/3, 0.125/3)`，距离顺序均为 `D500/D1000/Dinf`；总和严格为 1。零权重 case 仍进入 baseline/validation sweep，但不进入优化梯度。
 - 优化上限为 `50` 个 accepted steps；拒绝步恢复 PAL 参数和完整 Adam state。默认 early stopping 为连续 `7` 个 accepted steps 未达到归一化总 loss 相对改善阈值 `1e-4`。
+- 训练终端每个 attempt 输出一行 accepted-step 摘要；同样内容持久化到每个 run 的 `training.log`，逐步明细另保存在 `history.csv`，中断时会追加中断原因。
 - `best_feasible` 只在完整 363-case sweep 且健康、`P_far`、`ADD`、控制量和单步 sag 约束均通过时更新；不使用局部 case、`best_image` 或 `latest` 兜底。
 - 旧的候选点选择、80-case 目标、PSF support 数据库、7×7→11×11→19×19 晋级和精确 refinement audit 不属于当前方法。
 

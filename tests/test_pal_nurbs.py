@@ -12,6 +12,7 @@ from biot.e2e.pal_nurbs import (
     FieldResult,
     MinimalConfig,
     MinimalOpticalModel,
+    _append_training_log,
     _baseline_metric_table,
     _evaluate,
     psf_second_moment_mm2,
@@ -126,6 +127,16 @@ def test_config_requires_fixed_11_by_11_fov_grid() -> None:
     assert config.case_batch_size == 8
     with pytest.raises(ValueError, match="case_batch_size"):
         MinimalConfig(case_batch_size=0)
+
+
+def test_training_log_appends_durable_human_readable_records(tmp_path) -> None:
+    path = tmp_path / "training.log"
+    _append_training_log(path, "[pal-train] attempt=3 accepted=2/50 update=ACCEPT loss=0.8")
+    _append_training_log(path, "[pal-train] INTERRUPTED phase=training_sweep error=KeyboardInterrupt")
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2
+    assert "attempt=3 accepted=2/50" in lines[0]
+    assert "INTERRUPTED phase=training_sweep" in lines[1]
 
 
 def test_psf_second_moment_is_energy_normalized_and_differentiable() -> None:
