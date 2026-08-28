@@ -184,10 +184,14 @@ class LocalSurface(torch.nn.Module):
         if self.semi_diameter_mm == float("inf"):
             return torch.ones(points_mm.shape[:-1], device=points_mm.device, dtype=torch.bool)
         r2 = points_mm[..., 0].pow(2) + points_mm[..., 1].pow(2)
-        # Match ``optics.Surface.is_valid`` / BIOT_vis exactly.  Its circular
-        # aperture SDF is ``semi_dia**2 - r2`` and accepts values down to
-        # -1e-6 mm^2 so aimed marginal rays are classified identically.
-        return r2 <= self.semi_diameter_mm**2 + 1.0e-6
+        # Match ``optics.Surface.is_valid`` / BIOT_vis.  The Newton solver's
+        # loose residual is 300 nm; convert that radial tolerance to the
+        # circular SDF scale instead of using a fixed 1e-6 mm^2 threshold.
+        solver_tol_mm = 300.0e-6
+        boundary_tolerance = (
+            2.0 * abs(self.semi_diameter_mm) * solver_tol_mm + solver_tol_mm**2
+        )
+        return r2 <= self.semi_diameter_mm**2 + boundary_tolerance
 
     def intersect(
         self,
