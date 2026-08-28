@@ -293,6 +293,12 @@ def evaluate(run: Path, *, device_name: str, resume: bool) -> Path:
     if identity_path.exists() and _json(identity_path).get("identity_sha256") != eval_identity["identity_sha256"]:
         raise ValueError("existing evaluation identity does not match current source/checkpoint")
     _write_json(identity_path, eval_identity)
+    _write_json(evaluation / "evaluation_state.json", {
+        "status": "running",
+        "identity_sha256": eval_identity["identity_sha256"],
+        "completed_nodes": 0,
+        "total_nodes": 486,
+    })
     base_sag, power_config, zones = pal.load_pal(config, device)
     module_baseline = _make_module(config, device, None if hasattr(pal, "DISTANCE_SPECS") else control_count)
     module_optimized = _make_module(config, device, None if hasattr(pal, "DISTANCE_SPECS") else control_count)
@@ -340,7 +346,13 @@ def evaluate(run: Path, *, device_name: str, resume: bool) -> Path:
             np.savez_compressed(evaluation / "mtf" / f"{label}_{state}_map.npz", **{"sag": mtf_scores[label][state][..., 0], "tan": mtf_scores[label][state][..., 1], "mean": mtf_scores[label][state][..., 2]})
             _plot_map(evaluation / "mtf" / f"{label}_{state}_mean.png", mtf_scores[label][state][..., 2], title=f"{label} {state} weighted MTF mean", symmetric=state == "delta")
         _save_stitches(evaluation, label, [r for r in all_records if r["label"] == label], target)
+    files = []
+    for path in sorted(evaluation.rglob("*")):
+        if path.is_file() and path.name not in {"evaluation_manifest.json", "evaluation_state.json"}:
+            files.append({"path": path.relative_to(evaluation).as_posix(), "sha256": _sha256(path), "size": path.stat().st_size})
+    _write_json(evaluation / "evaluation_manifest.json", {"schema_version": 1, "identity_sha256": eval_identity["identity_sha256"], "files": files})
     _write_json(evaluation / "evaluation_summary.json", {"status": "complete", "identity_sha256": eval_identity["identity_sha256"], "psf_count": len(all_records), "distance_labels": [item[0] for item in _distance_cases(config)], "source_run_unchanged": True})
+    _write_json(evaluation / "evaluation_state.json", {"status": "complete", "identity_sha256": eval_identity["identity_sha256"], "completed_nodes": len(all_records), "total_nodes": 486})
     return evaluation
 
 
