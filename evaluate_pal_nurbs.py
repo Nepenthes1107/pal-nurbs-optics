@@ -252,8 +252,21 @@ def evaluate(run: Path, *, device_name: str, resume: bool) -> Path:
         raise FileNotFoundError(run)
     summary = _json(run / "summary.json")
     source_identity = _json(run / "run_identity.json")
+    source_identity_legacy = False
     if hasattr(pal, "_validate_identity_payload"):
-        pal._validate_identity_payload(source_identity)
+        try:
+            pal._validate_identity_payload(source_identity)
+        except ValueError as exc:
+            # A completed legacy main run has an older training schema.  It is
+            # still a valid read-only source if its own content hash verifies;
+            # it must not be treated as a current training identity.
+            claimed = str(source_identity.get("identity_sha256", ""))
+            body = dict(source_identity)
+            body.pop("identity_sha256", None)
+            canonical = getattr(pal, "_canonical_json_sha256", None)
+            if not claimed or not callable(canonical) or canonical(body) != claimed:
+                raise exc
+            source_identity_legacy = True
     evaluation = run / "evaluation"
     identity_path = evaluation / "evaluation_identity.json"
     if identity_path.exists() and not resume:
@@ -270,6 +283,7 @@ def evaluate(run: Path, *, device_name: str, resume: bool) -> Path:
         "evaluation_distances": ["D500", "D1000", "Dinf"],
         "checkpoint_sha256": _sha256(checkpoint_path),
         "checkpoint_path": str(checkpoint_path.relative_to(run)),
+        "source_identity_legacy_schema": bool(source_identity_legacy),
         "aperture_contract": "Newton loose residual mapped to aperture boundary",
         "field_grid_deg": list(FIELD_VALUES),
         "mtf": {"frequency_max_cycles_per_mm": 100.0, "samples": 1000, "csf": "Ahumada-1D", "interpolation": "cubic"},
