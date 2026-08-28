@@ -54,6 +54,7 @@ python -m biot.gui
 - 控制网格为 `7x7 -> 11x11 -> 19x19`，通过精确 knot refinement 晋级。
 - 80 个真实 case：Far 18、Intermediate 12、Near 18、Peripheral-left/right 各 16。
 - 使用真实可微追迹、GRIN3 固定步长 RK4、连续 OPL、去 pupil tilt FFT PSF；离线 PSF 不参与反传。
+- 默认 pupil 采样为 `np=256`、FFT 为 `512`；80 个 case 按 `case_batch_size=8` 做 GPU tensor 追迹和 FFT，每批聚合一次 loss 并 backward，不因 OOM 自动缩小 batch。
 - 追迹失败保持失败关闭，由当前 run 的资格筛选进度记录错误；底层追迹不在项目根目录自动导出 `wrong_result` Excel。
 - `J=(0.85*J_functional+0.15*J_peripheral)`，Original PAL 分母固定。
 - 仅使用 trace/PSF health、`P_far`、`ADD` 和单步 sag trust region 约束。
@@ -65,10 +66,10 @@ python -m biot.gui
 python run_pal_nurbs.py `
   --output results/optimization/run_001 `
   --excel eye_image_glass_grad3.xlsx --device cuda `
-  --requested-np 1024 --fft-size-px 512 --steps 10 10 10
+  --requested-np 256 --fft-size-px 512 --case-batch-size 8 --steps 10 10 10
 ```
 
-普通 `--resume` 只允许恢复同一运行目录中 identity、配置、输入哈希和实现闭包完全一致的 checkpoint。当前项目不再支持跨平台 training-state/parity 导入。
+普通 `--resume` 只允许恢复同一运行目录中 identity、配置、输入哈希和实现闭包完全一致的 checkpoint；本次 batch 接口变化后的旧串行 run 不可恢复，必须使用新输出目录。当前项目不再支持跨平台 training-state/parity 导入。
 
 ## 验证
 

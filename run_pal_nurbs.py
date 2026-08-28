@@ -19,6 +19,10 @@ def main() -> int:
     parser.add_argument("--requested-np", type=int, default=MinimalConfig.requested_np)
     parser.add_argument("--fft-size-px", type=int, default=MinimalConfig.fft_size_px)
     parser.add_argument(
+        "--case-batch-size", type=int, default=MinimalConfig.case_batch_size,
+        help="GPU tensor case batch size；必须为正整数，不自动因 OOM 降级",
+    )
+    parser.add_argument(
         "--candidate-trace-import",
         default=None,
         help=(
@@ -59,7 +63,8 @@ def main() -> int:
     config = MinimalConfig(
         output=args.output, excel=args.excel, support_json=args.support_json, zones_json=args.zones_json,
         device=args.device, requested_np=args.requested_np,
-        fft_size_px=args.fft_size_px, max_steps_7=args.steps[0],
+        fft_size_px=args.fft_size_px, case_batch_size=args.case_batch_size,
+        max_steps_7=args.steps[0],
         max_steps_11=args.steps[1], max_steps_19=args.steps[2],
         candidate_trace_import=args.candidate_trace_import,
         forward_qualification_import=args.forward_qualification_import,

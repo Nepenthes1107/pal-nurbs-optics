@@ -49,6 +49,7 @@ from .system import (
     build_fitted_e2e_system,
     make_aimed_pupil_rays,
     make_aimed_reference_ray,
+    trace_system_batch_to_image_with_phase,
     trace_system_to_image_with_phase,
     _snell,
 )
@@ -64,8 +65,9 @@ class MinimalConfig:
     output: str = "results/optimization/run_001"
     device: str = "cuda"
     wavelength_nm: float = 555.0
-    requested_np: int = 1024
+    requested_np: int = 256
     fft_size_px: int = 512
+    case_batch_size: int = 8
     kernel_size_px: int = 130
     pupil_radius_mm: float | None = None
     learning_rate: float = 2.0e-3
@@ -96,11 +98,19 @@ class MinimalConfig:
     final_phase_qualification_import: str | None = None
     baseline_state_import: str | None = None
 
+    def __post_init__(self) -> None:
+        if int(self.requested_np) <= 0:
+            raise ValueError("requested_np must be positive")
+        if int(self.fft_size_px) <= 0:
+            raise ValueError("fft_size_px must be positive")
+        if int(self.case_batch_size) <= 0:
+            raise ValueError("case_batch_size must be a positive integer")
+
 
 RUN_IDENTITY_SCHEMA_VERSION = 2
 CASE_LAYOUT_STATE_SCHEMA_VERSION = 4
-BASELINE_STATE_SCHEMA_VERSION = 2
-BASELINE_PROGRESS_SCHEMA_VERSION = 2
+BASELINE_STATE_SCHEMA_VERSION = 3
+BASELINE_PROGRESS_SCHEMA_VERSION = 3
 STAGE_RESUME_SCHEMA_VERSION = 1
 RUN_STATE_SCHEMA_VERSION = 1
 STAGE_LADDER = (7, 11, 19)
@@ -353,6 +363,17 @@ class FieldResult:
     valid_mask: torch.Tensor | None = None
 
 
+@dataclass(frozen=True)
+class BatchFieldResult:
+    """批量前向结果；首维是 case，后两维是训练用 PSF kernel。"""
+
+    kernels: torch.Tensor
+    valid_fraction: torch.Tensor
+    pixel_pitch_mm: torch.Tensor
+    edge_fraction: torch.Tensor
+    valid_mask: torch.Tensor | None = None
+
+
 def _elapsed_seconds(output: Path) -> float:
     path = output / "run_state.json"
     if not path.is_file():
@@ -498,6 +519,15 @@ def _normalize_psf(psf: torch.Tensor) -> torch.Tensor:
     return psf / energy
 
 
+def _normalize_psf_batch(psf: torch.Tensor) -> torch.Tensor:
+    if psf.ndim < 3 or not bool(torch.isfinite(psf).all()) or bool((psf < 0).any()):
+        raise ValueError("physical PSF batch must be finite, non-negative and have shape [B,H,W]")
+    energy = psf.sum(dim=(-2, -1), keepdim=True)
+    if not bool(torch.isfinite(energy).all()) or bool((energy <= 0).any()):
+        raise ValueError("each physical PSF in the batch must have positive finite energy")
+    return psf / energy
+
+
 def _release_inactive_case_cuda_cache(device: torch.device | str) -> None:
     """Return completed per-case graph blocks to CUDA/WDDM after tensor deletion.
 
@@ -542,6 +572,39 @@ def psf_second_moment_mm2(psf: torch.Tensor, *, pixel_pitch_mm: float) -> torch.
     cx = (normalized * xx).sum()
     cy = (normalized * yy).sum()
     return (normalized * ((xx - cx).square() + (yy - cy).square())).sum()
+
+
+def psf_second_moment_mm2_batch(
+    psf: torch.Tensor, *, pixel_pitch_mm: torch.Tensor | float,
+) -> torch.Tensor:
+    """Return centroid-relative M2 for every kernel in a real tensor batch."""
+    normalized = _normalize_psf_batch(psf)
+    height, width = normalized.shape[-2:]
+    dtype, device = normalized.dtype, normalized.device
+    y = (torch.arange(height, device=device, dtype=dtype) - 0.5 * (height - 1))
+    x = (torch.arange(width, device=device, dtype=dtype) - 0.5 * (width - 1))
+    yy, xx = torch.meshgrid(y, x, indexing="ij")
+    pitch = torch.as_tensor(pixel_pitch_mm, device=device, dtype=dtype).reshape(-1)
+    if pitch.numel() == 1:
+        pitch = pitch.expand(normalized.shape[0])
+    if pitch.shape[0] != normalized.shape[0]:
+        raise ValueError("pixel_pitch_mm batch length must match PSF batch")
+    pitch = pitch.reshape(-1, 1, 1)
+    xx_mm, yy_mm = xx * pitch, yy * pitch
+    cx = (normalized * xx_mm).sum(dim=(-2, -1), keepdim=True)
+    cy = (normalized * yy_mm).sum(dim=(-2, -1), keepdim=True)
+    return (normalized * ((xx_mm - cx).square() + (yy_mm - cy).square())).sum(dim=(-2, -1))
+
+
+def _edge_fraction_batch(psf: torch.Tensor, edge_px: int = 5) -> torch.Tensor:
+    normalized = _normalize_psf_batch(psf)
+    edge = min(int(edge_px), int(normalized.shape[-2]) // 2, int(normalized.shape[-1]) // 2)
+    mask = torch.zeros_like(normalized, dtype=torch.bool)
+    mask[..., :edge, :] = True
+    mask[..., -edge:, :] = True
+    mask[..., :, :edge] = True
+    mask[..., :, -edge:] = True
+    return torch.where(mask, normalized, torch.zeros_like(normalized)).sum(dim=(-2, -1))
 
 
 def _edge_fraction(psf: torch.Tensor, edge_px: int = 5) -> torch.Tensor:
@@ -779,6 +842,54 @@ class MinimalOpticalModel:
             kernel=kernel, valid_fraction=trace.valid.to(torch.float64).mean(),
             pixel_pitch_mm=self.size_reference_mm[distance] / self.config.kernel_size_px,
             edge_fraction=_edge_fraction(kernel), valid_mask=trace.valid,
+        )
+
+    def field_batch(self, cases: Sequence[Mapping[str, Any]]) -> BatchFieldResult:
+        """Run one true tensor batch through trace, FFT and PSF construction."""
+        if not cases:
+            raise ValueError("cannot evaluate an empty case batch")
+        systems: list[FittedE2ESystem] = []
+        rays: list[object] = []
+        distances: list[float] = []
+        for case in cases:
+            distance = float(case["distance_mm"])
+            x, y = float(case["field_x_deg"]), float(case["field_y_deg"])
+            system, pupil_rays = self._system_and_rays(distance, x, y)
+            systems.append(system)
+            rays.append(pupil_rays)
+            distances.append(distance)
+        trace = trace_system_batch_to_image_with_phase(
+            systems, rays, phase_reference="biot_reference_sphere"
+        )
+        if not bool(trace.valid.any(dim=1).all()):
+            invalid = [str(case["case_id"]) for index, case in enumerate(cases) if not bool(trace.valid[index].any())]
+            raise RuntimeError("no valid rays for case batch: " + ", ".join(invalid))
+        fft = torch_fft_psf_from_phase(
+            trace.phase_rad, trace.valid, sample_count=self.sample_count,
+            psf_size_px=self.config.fft_size_px, remove_piston=True, remove_tilt=True,
+        )
+        physical_pitch = torch.as_tensor(
+            [float(system.physical_fft_pixel_pitch_mm) for system in systems],
+            device=fft.psf.device, dtype=fft.psf.dtype,
+        )
+        kernels = torch.stack([
+            crop_resize_fft_psf(
+                fft.psf[index], pixel_pitch_mm=float(physical_pitch[index].detach().cpu()),
+                size_reference_mm=self.size_reference_mm[distance],
+                output_size_px=self.config.kernel_size_px,
+            )
+            for index, distance in enumerate(distances)
+        ])
+        pixel_pitch = torch.as_tensor(
+            [self.size_reference_mm[distance] / self.config.kernel_size_px for distance in distances],
+            device=kernels.device, dtype=kernels.dtype,
+        )
+        return BatchFieldResult(
+            kernels=kernels,
+            valid_fraction=trace.valid.to(kernels.dtype).mean(dim=1),
+            pixel_pitch_mm=pixel_pitch,
+            edge_fraction=_edge_fraction_batch(kernels),
+            valid_mask=trace.valid,
         )
 
 
@@ -1341,32 +1452,6 @@ def prepare_only(config: MinimalConfig, *, resume: bool = False) -> Path:
     return output / "preoptimization"
 
 
-def _training_baseline_case_row(
-    model: MinimalOpticalModel, case: Mapping[str, Any],
-) -> dict[str, Any]:
-    with torch.no_grad():
-        result = model.field(case)
-        energy = result.kernel.sum()
-        if abs(float(energy.detach().cpu()) - 1.0) > 1e-10:
-            raise ValueError(f"non-unit PSF energy for {case['case_id']}")
-        moment = psf_second_moment_mm2(
-            result.kernel, pixel_pitch_mm=result.pixel_pitch_mm,
-        )
-    row = {
-        **dict(case),
-        "m2_mm2": float(moment.detach().cpu()),
-        "score": 1.0,
-        "valid_fraction": float(result.valid_fraction.detach().cpu()),
-        "valid_fraction_ratio": 1.0,
-        "edge_fraction": float(result.edge_fraction.detach().cpu()),
-    }
-    row["group_loss"] = 1.0
-    result_device = result.kernel.device
-    del result, energy, moment
-    _release_inactive_case_cuda_cache(result_device)
-    return row
-
-
 def _summarize_training_baseline(
     rows: Sequence[Mapping[str, Any]],
 ) -> tuple[float, dict[str, Any]]:
@@ -1401,6 +1486,57 @@ def _validate_baseline_progress_prefix(
     actual_ids = [str(row.get("case_id")) for row in rows]
     if actual_ids != list(expected_ids[: len(rows)]):
         raise ValueError(f"baseline {label} progress case order/IDs do not match")
+
+
+def _case_batches(
+    cases: Sequence[Mapping[str, Any]], batch_size: int,
+) -> Sequence[Sequence[Mapping[str, Any]]]:
+    if int(batch_size) <= 0:
+        raise ValueError("case batch size must be positive")
+    return [cases[start : start + int(batch_size)] for start in range(0, len(cases), int(batch_size))]
+
+
+def _field_batch(model: Any, cases: Sequence[Mapping[str, Any]]) -> BatchFieldResult:
+    """Get a batch result; the scalar adapter is only for lightweight unit doubles."""
+    method = getattr(model, "field_batch", None)
+    if callable(method):
+        result = method(cases)
+        if not isinstance(result, BatchFieldResult):
+            raise TypeError("field_batch must return BatchFieldResult")
+        return result
+    # Production MinimalOpticalModel always implements field_batch.  This
+    # explicit adapter keeps old scalar test doubles useful without making the
+    # production path silently fall back to serial tracing.
+    scalar = [model.field(case) for case in cases]
+    kernels = torch.stack([item.kernel for item in scalar])
+    pitch = torch.as_tensor([item.pixel_pitch_mm for item in scalar], device=kernels.device, dtype=kernels.dtype)
+    return BatchFieldResult(
+        kernels=kernels,
+        valid_fraction=torch.stack([item.valid_fraction.to(kernels.dtype) for item in scalar]),
+        pixel_pitch_mm=pitch,
+        edge_fraction=torch.stack([item.edge_fraction.to(kernels.dtype) for item in scalar]),
+        valid_mask=None,
+    )
+
+
+def _batch_rows(
+    cases: Sequence[Mapping[str, Any]], result: BatchFieldResult,
+    moments: torch.Tensor, baseline_valid: Mapping[str, float] | None,
+    scores: torch.Tensor,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for index, case in enumerate(cases):
+        vf = float(result.valid_fraction[index].detach().cpu())
+        ratio = 1.0 if baseline_valid is None else vf / float(baseline_valid[str(case["case_id"])])
+        rows.append({
+            **dict(case),
+            "m2_mm2": float(moments[index].detach().cpu()),
+            "score": float(scores[index].detach().cpu()),
+            "valid_fraction": vf,
+            "valid_fraction_ratio": ratio,
+            "edge_fraction": float(result.edge_fraction[index].detach().cpu()),
+        })
+    return rows
 
 
 def _evaluate_original_training_baseline_with_resume(
@@ -1451,6 +1587,10 @@ def _evaluate_original_training_baseline_with_resume(
     else:
         training_rows = []
 
+    batch_size = int(getattr(getattr(model, "config", None), "case_batch_size", 1))
+    if len(training_rows) % batch_size != 0 and len(training_rows) != len(training_cases):
+        raise ValueError("baseline progress ends inside a case batch and cannot be resumed")
+
     def save_progress(status: str) -> None:
         _torch_save_atomic(
             path,
@@ -1469,12 +1609,35 @@ def _evaluate_original_training_baseline_with_resume(
 
     if not path.is_file():
         save_progress("training")
-    for index, case in enumerate(
-        training_cases[len(training_rows) :], start=len(training_rows) + 1,
-    ):
-        training_rows.append(_training_baseline_case_row(model, case))
-        save_progress("training" if index < len(training_cases) else "complete")
-        print(f"[pal-nurbs] baseline training {index}/{len(training_cases)}", flush=True)
+    remaining = training_cases[len(training_rows) :]
+    batches = _case_batches(remaining, batch_size)
+    total_batches = (len(training_cases) + batch_size - 1) // batch_size
+    first_batch = len(training_rows) // batch_size
+    for batch_index, batch in enumerate(batches, start=first_batch + 1):
+        with torch.no_grad():
+            result = _field_batch(model, batch)
+            if not bool(torch.isfinite(result.kernels).all()) or bool((result.kernels < 0).any()):
+                raise ValueError("baseline batch contains an invalid physical PSF")
+            energy = result.kernels.sum(dim=(-2, -1))
+            if bool((energy - 1.0).abs().max() > 1e-10):
+                raise ValueError("baseline batch contains a non-unit PSF energy")
+            moments = psf_second_moment_mm2_batch(
+                result.kernels, pixel_pitch_mm=result.pixel_pitch_mm,
+            )
+            scores = torch.ones_like(moments)
+        batch_rows = _batch_rows(batch, result, moments, None, scores)
+        for row in batch_rows:
+            row["group_loss"] = 1.0
+        training_rows.extend(batch_rows)
+        save_progress("training" if len(training_rows) < len(training_cases) else "complete")
+        print(
+            f"[pal-nurbs] baseline training batch {batch_index}/{total_batches} "
+            f"cases {len(training_rows) - len(batch) + 1}-{len(training_rows)}/{len(training_cases)}",
+            flush=True,
+        )
+        result_device = result.kernels.device
+        del result, energy, moments, scores
+        _release_inactive_case_cuda_cache(result_device)
     save_progress("complete")
     baseline_value, baseline_health = _summarize_training_baseline(training_rows)
     return baseline_value, training_rows, baseline_health
@@ -1502,47 +1665,63 @@ def _evaluate(
             f"{sorted(required)}, got {sorted(actual)}"
         )
     minimum_ratio, maximum_edge = math.inf, 0.0
-    for index, case in enumerate(cases, start=1):
+    batch_size = int(getattr(getattr(model, "config", None), "case_batch_size", 1))
+    batches = _case_batches(cases, batch_size)
+    peripheral_count = sum(group_counts[name] for name in PERIPHERAL_GROUPS)
+    for batch_index, batch in enumerate(batches, start=1):
         with torch.set_grad_enabled(with_grad):
-            result = model.field(case)
-            energy = result.kernel.sum()
-            if abs(float(energy.detach().cpu()) - 1.0) > 1e-10:
-                raise ValueError(f"non-unit PSF energy for {case['case_id']}")
-            moment = psf_second_moment_mm2(result.kernel, pixel_pitch_mm=result.pixel_pitch_mm)
+            result = _field_batch(model, batch)
+            energy = result.kernels.sum(dim=(-2, -1))
+            if not bool(torch.isfinite(result.kernels).all()) or bool((result.kernels < 0).any()):
+                raise ValueError("evaluation batch contains an invalid physical PSF")
+            if bool((energy - 1.0).abs().max() > 1e-10):
+                raise ValueError("evaluation batch contains a non-unit PSF energy")
+            moments = psf_second_moment_mm2_batch(result.kernels, pixel_pitch_mm=result.pixel_pitch_mm)
             if baseline is None:
-                score = torch.ones_like(moment)
+                scores = torch.ones_like(moments)
             else:
-                denominator = float(baseline[str(case["case_id"])]["m2_mm2"])
-                if not math.isfinite(denominator) or denominator <= 0.0:
-                    raise ValueError(f"invalid Original PAL M2 denominator for {case['case_id']}: {denominator}")
-                score = moment / denominator
-            group = str(case["training_group"])
-            group_values.setdefault(group, []).append(float(score.detach().cpu()))
+                denominators = []
+                for case in batch:
+                    denominator = float(baseline[str(case["case_id"])]["m2_mm2"])
+                    if not math.isfinite(denominator) or denominator <= 0.0:
+                        raise ValueError(f"invalid Original PAL M2 denominator for {case['case_id']}: {denominator}")
+                    denominators.append(denominator)
+                scores = moments / torch.as_tensor(denominators, device=moments.device, dtype=moments.dtype)
             if with_grad:
-                if not score.requires_grad:
-                    raise RuntimeError(
-                        f"training score is detached from NURBS parameters for {case['case_id']}"
-                    )
-                if group in FUNCTIONAL_GROUPS:
-                    coefficient = functional_weight / (3.0 * group_counts[group])
-                elif group in PERIPHERAL_GROUPS:
-                    peripheral_count = sum(group_counts[name] for name in PERIPHERAL_GROUPS)
-                    coefficient = peripheral_weight / peripheral_count
-                else:
-                    raise ValueError(f"unexpected training group: {group}")
-                score.backward(torch.as_tensor(coefficient, device=score.device, dtype=score.dtype))
-        vf = float(result.valid_fraction.detach().cpu())
-        ratio = 1.0 if baseline_valid is None else vf / float(baseline_valid[str(case["case_id"])])
-        edge = float(result.edge_fraction.detach().cpu())
-        minimum_ratio, maximum_edge = min(minimum_ratio, ratio), max(maximum_edge, edge)
-        rows.append({**dict(case), "m2_mm2": float(moment.detach().cpu()), "score": float(score.detach().cpu()), "valid_fraction": vf, "valid_fraction_ratio": ratio, "edge_fraction": edge})
-        result_device = result.kernel.device
-        del result, energy, moment, score
+                if not bool(scores.requires_grad):
+                    raise RuntimeError("training scores are detached from NURBS parameters")
+                coefficients = torch.as_tensor(
+                    [
+                        functional_weight / (3.0 * group_counts[str(case["training_group"])])
+                        if str(case["training_group"]) in FUNCTIONAL_GROUPS
+                        else peripheral_weight / peripheral_count
+                        for case in batch
+                    ], device=scores.device, dtype=scores.dtype,
+                )
+                batch_loss = (scores * coefficients).sum()
+                if not batch_loss.requires_grad:
+                    raise RuntimeError("batch training loss is detached from NURBS parameters")
+                batch_loss.backward()
+            else:
+                coefficients = torch.zeros_like(scores)
+                batch_loss = torch.zeros((), device=scores.device, dtype=scores.dtype)
+        for index, case in enumerate(batch):
+            group = str(case["training_group"])
+            group_values.setdefault(group, []).append(float(scores[index].detach().cpu()))
+            vf = float(result.valid_fraction[index].detach().cpu())
+            ratio = 1.0 if baseline_valid is None else vf / float(baseline_valid[str(case["case_id"])])
+            minimum_ratio = min(minimum_ratio, ratio)
+            maximum_edge = max(maximum_edge, float(result.edge_fraction[index].detach().cpu()))
+        rows.extend(_batch_rows(batch, result, moments, baseline_valid, scores))
+        completed = min(batch_index * batch_size, len(cases))
+        print(
+            f"[pal-nurbs] batch {batch_index}/{len(batches)} cases "
+            f"{completed - len(batch) + 1}-{completed}/{len(cases)} grad={with_grad} "
+            f"batch_loss={float(batch_loss.detach().cpu()):.6g}", flush=True,
+        )
+        result_device = result.kernels.device
+        del result, energy, moments, scores, coefficients, batch_loss
         _release_inactive_case_cuda_cache(result_device)
-        if index % 16 == 0 or index == len(cases):
-            print(f"[pal-nurbs] evaluated {index}/{len(cases)} cases (grad={with_grad})", flush=True)
-    if abs(functional_weight - 0.85) > 1e-12 or abs(peripheral_weight - 0.15) > 1e-12:
-        raise ValueError("Phase 16 dense/FPS objective weights are fixed at 0.85/0.15")
     group_losses = {
         name: sum(group_values[name]) / len(group_values[name])
         for name in FUNCTIONAL_GROUPS + PERIPHERAL_GROUPS
@@ -1552,7 +1731,6 @@ def _evaluate(
     group_summary = {f"J_{name}": float(value) for name, value in group_losses.items()}
     group_summary["J_mid"] = group_summary["J_intermediate"]
     functional = sum(group_losses[name] for name in FUNCTIONAL_GROUPS) / 3.0
-    peripheral_count = sum(len(group_values[name]) for name in PERIPHERAL_GROUPS)
     peripheral = sum(sum(group_values[name]) for name in PERIPHERAL_GROUPS) / peripheral_count
     objective_value = functional_weight * functional + peripheral_weight * peripheral
     group_summary.update({
@@ -1593,18 +1771,34 @@ def _accumulate_startup_case_gradients(
     config: MinimalConfig,
     cases: Sequence[Mapping[str, Any]],
 ) -> torch.Tensor:
-    """Backpropagate each startup M2 immediately while accumulating one total gradient."""
+    """Backpropagate the startup batch once while accumulating its total gradient."""
 
+    if not cases:
+        raise ValueError("startup gradient check requires at least one case")
+    if not callable(getattr(model, "field_batch", None)):
+        # Test doubles from the legacy unit suite do not model the production
+        # batch interface. Keep their historical event contract isolated here.
+        pixel_pitch_mm = model.size_reference_mm[2000.0] / config.kernel_size_px
+        for case in cases:
+            result = model.field(case)
+            case_loss = psf_second_moment_mm2(result.kernel, pixel_pitch_mm=pixel_pitch_mm)
+            case_loss.backward()
+            result_device = result.kernel.device
+            del case_loss, result
+            _release_inactive_case_cuda_cache(result_device)
+        grad = module.inner_q.grad
+        if grad is None or not bool(torch.isfinite(grad).all()) or int((grad.abs() > 0).sum()) < 2:
+            raise RuntimeError("startup gradient check failed: fewer than two finite non-zero zp gradients")
+        return grad.detach().clone()
+    result = _field_batch(model, cases)
     pixel_pitch_mm = model.size_reference_mm[2000.0] / config.kernel_size_px
-    for case in cases:
-        result = model.field(case)
-        case_loss = psf_second_moment_mm2(
-            result.kernel, pixel_pitch_mm=pixel_pitch_mm,
-        )
-        case_loss.backward()
-        result_device = result.kernel.device
-        del case_loss, result
-        _release_inactive_case_cuda_cache(result_device)
+    moments = psf_second_moment_mm2_batch(
+        result.kernels, pixel_pitch_mm=pixel_pitch_mm,
+    )
+    moments.sum().backward()
+    result_device = result.kernels.device
+    del result, moments
+    _release_inactive_case_cuda_cache(result_device)
     grad = module.inner_q.grad
     if grad is None or not bool(torch.isfinite(grad).all()) or int((grad.abs() > 0).sum()) < 2:
         raise RuntimeError("startup gradient check failed: fewer than two finite non-zero zp gradients")

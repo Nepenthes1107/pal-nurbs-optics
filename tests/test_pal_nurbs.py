@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 from dataclasses import replace
 from pathlib import Path
 
@@ -10,6 +11,7 @@ import torch
 
 import biot.e2e.pal_nurbs as pal_nurbs
 from biot.e2e.pal_nurbs import (
+    BatchFieldResult,
     FieldResult,
     MinimalConfig,
     MinimalOpticalModel,
@@ -209,6 +211,56 @@ def test_joint_loss_uses_region_means_then_085_015_weighting() -> None:
     assert torch.allclose(
         evaluated_gradient, reference_parameter.grad, atol=2.0e-15, rtol=2.0e-15
     )
+
+
+def test_evaluate_uses_one_backward_per_partial_case_batch() -> None:
+    parameter = torch.nn.Parameter(torch.tensor(-0.5, dtype=torch.float64))
+    backward_calls: list[int] = []
+    parameter.register_hook(lambda gradient: backward_calls.append(1))
+
+    class Model:
+        config = MinimalConfig(device="cpu", case_batch_size=2, kernel_size_px=3)
+
+        def __init__(self) -> None:
+            self.batch_calls: list[list[str]] = []
+
+        def field_batch(self, batch: list[dict[str, object]]) -> BatchFieldResult:
+            self.batch_calls.append([str(case["case_id"]) for case in batch])
+            scales = torch.as_tensor(
+                [float(case["scale"]) for case in batch], dtype=torch.float64,
+            )
+            edge = torch.sigmoid(parameter * scales)
+            zero = torch.zeros_like(edge)
+            kernels = torch.stack(
+                (
+                    torch.stack((zero, zero, zero), dim=-1),
+                    torch.stack((zero, 1.0 - edge, edge), dim=-1),
+                    torch.stack((zero, zero, zero), dim=-1),
+                ), dim=-2,
+            )
+            return BatchFieldResult(
+                kernels=kernels,
+                valid_fraction=torch.ones_like(edge),
+                pixel_pitch_mm=torch.ones_like(edge),
+                edge_fraction=torch.zeros_like(edge),
+            )
+
+    cases = [
+        {"case_id": "f", "training_group": "far", "scale": 1.0},
+        {"case_id": "m", "training_group": "intermediate", "scale": 2.0},
+        {"case_id": "n", "training_group": "near", "scale": 3.0},
+        {"case_id": "pl", "training_group": "peripheral_left", "scale": 4.0},
+        {"case_id": "pr", "training_group": "peripheral_right", "scale": 5.0},
+    ]
+    baseline = {case["case_id"]: {"m2_mm2": 1.0} for case in cases}
+    model = Model()
+    value, rows, health = _evaluate(model, cases, baseline, with_grad=True)
+    assert len(model.batch_calls) == 3
+    assert model.batch_calls[-1] == ["pr"]
+    assert len(rows) == len(cases)
+    assert math.isfinite(value)
+    assert math.isfinite(health["J_total"])
+    assert len(backward_calls) == 3
 
 
 def test_joint_loss_rejects_incomplete_extra_or_mixed_training_groups() -> None:
