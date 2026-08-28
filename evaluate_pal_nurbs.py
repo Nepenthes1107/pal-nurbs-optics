@@ -70,6 +70,11 @@ def _finite_array(name: str, value: np.ndarray) -> np.ndarray:
     return arr
 
 
+def _json_distance(value: Any) -> float | str:
+    value = float(value)
+    return "inf" if math.isinf(value) else value
+
+
 def _load_config(run: Path, device: str) -> Any:
     saved = _json(run / "config.json")
     allowed = set(getattr(pal.MinimalConfig, "__dataclass_fields__", {}))
@@ -261,7 +266,7 @@ def evaluate(run: Path, *, device_name: str, resume: bool) -> Path:
     eval_identity_body = {
         "schema_version": EVAL_SCHEMA,
         "source_run_identity_sha256": str(source_identity.get("identity_sha256", "")),
-        "source_training_distances": [config.near_object_distance_mm, config.intermediate_object_distance_mm, config.far_object_distance_mm] if not hasattr(pal, "DISTANCE_SPECS") else [spec.serialized_distance for spec in pal.DISTANCE_SPECS],
+        "source_training_distances": [_json_distance(config.near_object_distance_mm), _json_distance(config.intermediate_object_distance_mm), _json_distance(config.far_object_distance_mm)] if not hasattr(pal, "DISTANCE_SPECS") else [spec.serialized_distance for spec in pal.DISTANCE_SPECS],
         "evaluation_distances": ["D500", "D1000", "Dinf"],
         "checkpoint_sha256": _sha256(checkpoint_path),
         "checkpoint_path": str(checkpoint_path.relative_to(run)),
