@@ -82,8 +82,8 @@ class MinimalConfig:
     minimum_valid_fraction_ratio: float = 0.5
     minimum_stage_relative_improvement: float = 1.0e-3
     seed: int = 42
-    far_object_distance_mm: float = 100000.0
-    intermediate_object_distance_mm: float = 2000.0
+    far_object_distance_mm: float = float("inf")
+    intermediate_object_distance_mm: float = 1000.0
     near_object_distance_mm: float = 500.0
     candidate_field_min_deg: float = -55.0
     candidate_field_max_deg: float = 55.0
@@ -107,7 +107,7 @@ class MinimalConfig:
             raise ValueError("case_batch_size must be a positive integer")
 
 
-RUN_IDENTITY_SCHEMA_VERSION = 2
+RUN_IDENTITY_SCHEMA_VERSION = 3
 CASE_LAYOUT_STATE_SCHEMA_VERSION = 4
 BASELINE_STATE_SCHEMA_VERSION = 3
 BASELINE_PROGRESS_SCHEMA_VERSION = 3
@@ -987,7 +987,7 @@ def _trace_preoptimization_case_geometry(
     cases: Sequence[Mapping[str, Any]],
     *,
     zones_json: str | Path,
-    reference_distance_mm: float = 100000.0,
+    reference_distance_mm: float = float("inf"),
 ) -> list[dict[str, Any]]:
     zones_payload = json.loads(Path(zones_json).read_text(encoding="utf-8-sig"))
     result: list[dict[str, Any]] = []
@@ -1284,7 +1284,7 @@ def _prepare_case_layout(
     cache_audit = _retain_training_cache(
         model,
         training_cases,
-        extra_cases=_startup_cases(),
+        extra_cases=_startup_cases(config),
     )
     _write_json_atomic(
         output / "preoptimization" / "forward_qualification_audit.json",
@@ -1793,7 +1793,7 @@ def _accumulate_startup_case_gradients(
     if not callable(getattr(model, "field_batch", None)):
         # Test doubles from the legacy unit suite do not model the production
         # batch interface. Keep their historical event contract isolated here.
-        pixel_pitch_mm = model.size_reference_mm[2000.0] / config.kernel_size_px
+        pixel_pitch_mm = model.size_reference_mm[config.intermediate_object_distance_mm] / config.kernel_size_px
         for case in cases:
             result = model.field(case)
             case_loss = psf_second_moment_mm2(result.kernel, pixel_pitch_mm=pixel_pitch_mm)
@@ -1806,7 +1806,7 @@ def _accumulate_startup_case_gradients(
             raise RuntimeError("startup gradient check failed: fewer than two finite non-zero zp gradients")
         return grad.detach().clone()
     result = _field_batch(model, cases)
-    pixel_pitch_mm = model.size_reference_mm[2000.0] / config.kernel_size_px
+    pixel_pitch_mm = model.size_reference_mm[config.intermediate_object_distance_mm] / config.kernel_size_px
     moments = psf_second_moment_mm2_batch(
         result.kernels, pixel_pitch_mm=pixel_pitch_mm,
     )
@@ -1820,17 +1820,17 @@ def _accumulate_startup_case_gradients(
     return grad.detach().clone()
 
 
-def _startup_cases() -> list[dict[str, Any]]:
+def _startup_cases(config: MinimalConfig) -> list[dict[str, Any]]:
     return [
         {
             "case_id": "startup_center",
-            "distance_mm": 2000.0,
+            "distance_mm": float(config.intermediate_object_distance_mm),
             "field_x_deg": 0.0,
             "field_y_deg": 0.0,
         },
         {
             "case_id": "startup_edge",
-            "distance_mm": 2000.0,
+            "distance_mm": float(config.intermediate_object_distance_mm),
             "field_x_deg": 40.0,
             "field_y_deg": 40.0,
         },
@@ -2099,7 +2099,7 @@ def _run_bound(
             "ADD_D": float(baseline_power_tensors["ADD_D"].detach().cpu()),
         }
         # 保留原有最小启动检查：中心/边缘真实 PSF 与非零有限梯度。
-        startup_cases = _startup_cases()
+        startup_cases = _startup_cases(config)
         _accumulate_startup_case_gradients(model, module, config, startup_cases)
         module.zero_grad(set_to_none=True)
 

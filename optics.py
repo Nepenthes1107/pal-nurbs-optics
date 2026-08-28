@@ -5111,7 +5111,9 @@ class Surface(PrettyPrinter):
             A SDF mask.
         """
         if self.is_square:
-            return torch.max(self.semi_dia - torch.abs(p), dim=-1)[0]
+            # A square stop is bounded by the largest absolute coordinate;
+            # the SDF is therefore the minimum of the two per-axis margins.
+            return torch.min(self.semi_dia - torch.abs(p), dim=-1)[0]
         else:  # is round
             r_2 = torch.sum(p ** 2, dim=-1)
             if is_fixed == None:
@@ -5125,9 +5127,24 @@ class Surface(PrettyPrinter):
     def is_valid(self, p, is_fixed=True):
         """
         If a 2D point p is valid, i.e. if p is within the surface's aperture.
+
+        The Newton intersection accepts a bounded residual up to
+        ``NEWTONS_TOLERANCE_LOOSE``.  Use the corresponding aperture-boundary
+        tolerance so a ray is not rejected merely because the solver and the
+        aperture test use different numerical scales.
         """
-        tolerance = -1e-6
-        return (self.sdf_approx(p, is_fixed=is_fixed) >= -1e-6).bool()
+        solver_tol = float(self.NEWTONS_TOLERANCE_LOOSE)
+        if self.is_square:
+            boundary_tolerance = solver_tol
+        elif np.isfinite(self.semi_dia):
+            # Circular SDF is ``semi_dia**2 - r**2``.  A radial error d
+            # changes it by 2*r*d + d**2; retain both terms at the boundary.
+            boundary_tolerance = (
+                2.0 * abs(float(self.semi_dia)) * solver_tol + solver_tol**2
+            )
+        else:
+            boundary_tolerance = 0.0
+        return (self.sdf_approx(p, is_fixed=is_fixed) >= -boundary_tolerance).bool()
 
     def ray_surface_intersection(self, distance, ray, active=None, option='implicit', is_fixed=True):
         """

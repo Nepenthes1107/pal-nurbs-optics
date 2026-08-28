@@ -90,7 +90,7 @@ def test_startup_cases_backward_immediately_and_match_summed_loss_gradient() -> 
         {"case_id": "case_1", "scale": 0.7},
         {"case_id": "case_2", "scale": 1.3},
     ]
-    config = MinimalConfig(device="cpu", kernel_size_px=3)
+    config = MinimalConfig(device="cpu", kernel_size_px=3, intermediate_object_distance_mm=2000.0)
 
     class Model:
         size_reference_mm = {2000.0: 3.0}
@@ -906,6 +906,7 @@ def test_interrupted_training_resume_matches_uninterrupted_adam_state(
     interrupted_config = MinimalConfig(
         output=str(tmp_path / "interrupted"),
         device="cpu",
+        intermediate_object_distance_mm=2000.0,
         max_steps_7=2,
         max_steps_11=0,
         max_steps_19=0,
