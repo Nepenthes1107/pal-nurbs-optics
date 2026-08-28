@@ -1647,6 +1647,11 @@ def _evaluate(
     model: MinimalOpticalModel, cases: Sequence[Mapping[str, Any]], baseline: Mapping[str, Mapping[str, float]] | None,
     *, with_grad: bool, baseline_valid: Mapping[str, float] | None = None,
     functional_weight: float = 0.85, peripheral_weight: float = 0.15,
+    progress_stage: str | None = None,
+    progress_step: str | None = None,
+    progress_learning_rate: float | None = None,
+    progress_update: str = "PENDING",
+    print_progress: bool = True,
 ) -> tuple[float, list[dict[str, Any]], dict[str, float]]:
     rows, group_values = [], {}
     if not cases:
@@ -1687,24 +1692,21 @@ def _evaluate(
                         raise ValueError(f"invalid Original PAL M2 denominator for {case['case_id']}: {denominator}")
                     denominators.append(denominator)
                 scores = moments / torch.as_tensor(denominators, device=moments.device, dtype=moments.dtype)
+            coefficients = torch.as_tensor(
+                [
+                    functional_weight / (3.0 * group_counts[str(case["training_group"])])
+                    if str(case["training_group"]) in FUNCTIONAL_GROUPS
+                    else peripheral_weight / peripheral_count
+                    for case in batch
+                ], device=scores.device, dtype=scores.dtype,
+            )
+            batch_loss = (scores * coefficients).sum()
             if with_grad:
                 if not bool(scores.requires_grad):
                     raise RuntimeError("training scores are detached from NURBS parameters")
-                coefficients = torch.as_tensor(
-                    [
-                        functional_weight / (3.0 * group_counts[str(case["training_group"])])
-                        if str(case["training_group"]) in FUNCTIONAL_GROUPS
-                        else peripheral_weight / peripheral_count
-                        for case in batch
-                    ], device=scores.device, dtype=scores.dtype,
-                )
-                batch_loss = (scores * coefficients).sum()
                 if not batch_loss.requires_grad:
                     raise RuntimeError("batch training loss is detached from NURBS parameters")
                 batch_loss.backward()
-            else:
-                coefficients = torch.zeros_like(scores)
-                batch_loss = torch.zeros((), device=scores.device, dtype=scores.dtype)
         for index, case in enumerate(batch):
             group = str(case["training_group"])
             group_values.setdefault(group, []).append(float(scores[index].detach().cpu()))
@@ -1714,11 +1716,24 @@ def _evaluate(
             maximum_edge = max(maximum_edge, float(result.edge_fraction[index].detach().cpu()))
         rows.extend(_batch_rows(batch, result, moments, baseline_valid, scores))
         completed = min(batch_index * batch_size, len(cases))
-        print(
-            f"[pal-nurbs] batch {batch_index}/{len(batches)} cases "
-            f"{completed - len(batch) + 1}-{completed}/{len(cases)} grad={with_grad} "
-            f"batch_loss={float(batch_loss.detach().cpu()):.6g}", flush=True,
-        )
+        if print_progress and (batch_index % 8 == 0 or batch_index == len(batches)):
+            batch_loss_value = float(batch_loss.detach().cpu())
+            if progress_stage is None:
+                print(
+                    f"[pal-eval] batch={batch_index}/{len(batches)} "
+                    f"cases={completed - len(batch) + 1}-{completed}/{len(cases)} "
+                    f"loss={batch_loss_value:.6g}", flush=True,
+                )
+            else:
+                step_text = "-" if progress_step is None else progress_step
+                lr_text = "-" if progress_learning_rate is None else f"{progress_learning_rate:.6g}"
+                print(
+                    f"[pal-train] stage={progress_stage} step={step_text} "
+                    f"batch={batch_index}/{len(batches)} "
+                    f"cases={completed - len(batch) + 1}-{completed}/{len(cases)} "
+                    f"loss={batch_loss_value:.6g} update={progress_update} lr={lr_text}",
+                    flush=True,
+                )
         result_device = result.kernels.device
         del result, energy, moments, scores, coefficients, batch_loss
         _release_inactive_case_cuda_cache(result_device)
@@ -1837,6 +1852,16 @@ def _write_history(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
         _replace_atomic(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _append_training_log(path: Path, message: str) -> None:
+    """Append one durable, human-readable PAL training progress record."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    with path.open("a", encoding="utf-8", newline="\n") as handle:
+        handle.write(f"{timestamp} {message}\n")
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def _make_stage_resume_payload(
@@ -1972,6 +1997,13 @@ def _run_bound(
             elapsed_seconds=prior_elapsed + time.time() - session_start,
             **details,
         )
+
+    training_log_path = output / "training.log"
+
+    def log_progress(message: str) -> None:
+        line = f"[pal-train] {message}"
+        _append_training_log(training_log_path, line)
+        print(line, flush=True)
 
     summary_path = output / "summary.json"
     if summary_path.is_file():
@@ -2111,6 +2143,12 @@ def _run_bound(
     )
     cache_audit = _retain_training_cache(model, training_cases)
     write_state("baseline_complete", cache_audit=cache_audit)
+    log_progress(
+        f"stage=baseline step=complete "
+        f"batch={(len(training_cases) + config.case_batch_size - 1) // config.case_batch_size}/"
+        f"{(len(training_cases) + config.case_batch_size - 1) // config.case_batch_size} "
+        f"loss={baseline_value:.6g} update=INITIAL lr=-"
+    )
 
     stage_summaries: list[dict[str, Any]] = []
     stage_specs = (
@@ -2190,6 +2228,11 @@ def _run_bound(
                     control_count=control_count,
                     completed_step=completed_step,
                 )
+                log_progress(
+                    f"stage={control_count}x{control_count} "
+                    f"step={completed_step}/{max_steps} batch=complete "
+                    f"loss={best:.6g} update=RESUME lr={lr:.6g}"
+                )
                 if (
                     control_count == 11
                     and float(stage_summary["relative_stage_improvement"])
@@ -2221,6 +2264,10 @@ def _run_bound(
                     with_grad=False,
                     baseline_valid=baseline_valid,
                     **objective_options,
+                    progress_stage=f"{control_count}x{control_count}",
+                    progress_step=f"0/{max_steps}",
+                    progress_learning_rate=config.learning_rate,
+                    progress_update="INITIAL",
                 )
             stage_initial = current
             stage_initial_groups = _joint_metric_fields(current, health)
@@ -2258,9 +2305,18 @@ def _run_bound(
                     best_health=best_health,
                 ),
             )
+            log_progress(
+                f"stage={control_count}x{control_count} step=0/{max_steps} "
+                f"batch=complete loss={stage_initial:.6g} update=INITIAL lr={lr:.6g}"
+            )
 
         if lr >= config.minimum_learning_rate:
             for step in range(completed_step + 1, int(max_steps) + 1):
+                log_progress(
+                    f"stage={control_count}x{control_count} step={step}/{max_steps} "
+                    f"batch=0/{(len(training_cases) + config.case_batch_size - 1) // config.case_batch_size} "
+                    f"loss=- update=PENDING lr={lr:.6g}"
+                )
                 module.zero_grad(set_to_none=True)
                 optimizer.param_groups[0]["lr"] = lr
                 current, _, health = _evaluate(
@@ -2270,6 +2326,9 @@ def _run_bound(
                     with_grad=True,
                     baseline_valid=baseline_valid,
                     **objective_options,
+                    progress_stage=f"{control_count}x{control_count}",
+                    progress_step=f"{step}/{max_steps}",
+                    progress_learning_rate=lr,
                 )
                 if module.inner_q.grad is None or not bool(torch.isfinite(module.inner_q.grad).all()):
                     raise RuntimeError("non-finite Adam gradient")
@@ -2329,6 +2388,11 @@ def _run_bound(
                         with_grad=False,
                         baseline_valid=baseline_valid,
                         **objective_options,
+                        progress_stage=f"{control_count}x{control_count}",
+                        progress_step=f"{step}/{max_steps}",
+                        progress_learning_rate=trial_lr,
+                        progress_update="TRIAL",
+                        print_progress=False,
                     )
                     if (
                         candidate_health["minimum_valid_fraction_ratio"]
@@ -2402,6 +2466,13 @@ def _run_bound(
                     ),
                 )
                 _write_history(stage_dir / "history.csv", history)
+                log_progress(
+                    f"stage={control_count}x{control_count} step={step}/{max_steps} "
+                    f"batch={(len(training_cases) + config.case_batch_size - 1) // config.case_batch_size}/"
+                    f"{(len(training_cases) + config.case_batch_size - 1) // config.case_batch_size} "
+                    f"loss={candidate if accepted else current:.6g} "
+                    f"update={'ACCEPT' if accepted else 'REJECT:' + reason} lr={lr:.6g}"
+                )
                 write_state(
                     "stage_training",
                     control_count=control_count,
@@ -2467,7 +2538,15 @@ def _run_bound(
             control_count=control_count,
             completed_step=len(history),
         )
+        log_progress(
+            f"stage={control_count}x{control_count} step={len(history)}/{max_steps} "
+            f"batch=complete loss={best:.6g} update=STAGE_COMPLETE lr={lr:.6g}"
+        )
         if control_count == 11 and improvement < config.minimum_stage_relative_improvement:
+            log_progress(
+                f"stop after stage=11x11 relative_improvement={improvement:.3e} "
+                f"threshold={config.minimum_stage_relative_improvement:.3e}"
+            )
             break
 
     write_state("final_training_evaluation")
@@ -2519,6 +2598,7 @@ def _run_bound(
         "P_far_change_D": final_p_far_D - float(baseline_power["P_far_D"]),
         "ADD_change_D": final_add_D - float(baseline_power["ADD_D"]),
         "runtime_seconds": runtime_seconds,
+        "training_log": "training.log",
         "trace_psf_exception": False,
         "health": final_health,
     }
@@ -2559,6 +2639,10 @@ def run(config: MinimalConfig, *, resume: bool = False) -> Path:
                 phase = str(_read_json(state_path).get("phase", phase))
             except Exception:
                 phase = "interrupted"
+        _append_training_log(
+            output / "training.log",
+            f"[pal-train] INTERRUPTED stage_phase={phase} error={type(exc).__name__}: {exc}",
+        )
         _write_run_state(
             output,
             identity_sha256=str(identity["identity_sha256"]),

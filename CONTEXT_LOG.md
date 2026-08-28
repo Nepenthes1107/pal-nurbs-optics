@@ -15,6 +15,7 @@
 - 历史证据：`results/archive/`，不进入 Git，也不参与新实验身份。
 - 当前入口：`run_pal_nurbs.py`；PAL 实现位于 `biot/e2e/pal_nurbs.py` 和 `biot/e2e/pal_case_layout.py`。
 - `main` 的 80-case/分阶段架构已接入真实 GPU tensor case batch：默认 `case_batch_size=8`、`requested_np=256`、FFT `512`；每批完成追迹和 FFT 后聚合一次 loss/backward，最后一批按实际数量运行，不做 OOM 自动降级。
+- `main` 的分阶段训练输出统一显示 `stage/step/batch/loss/update/lr`，并写入 run 根目录 `training.log`；各阶段 `history.csv` 和 resume checkpoint 继续作为结构化恢复依据。
 
 ## 历史 r12
 

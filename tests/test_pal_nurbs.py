@@ -16,6 +16,7 @@ from biot.e2e.pal_nurbs import (
     MinimalConfig,
     MinimalOpticalModel,
     PALPowerConfig,
+    _append_training_log,
     _accumulate_startup_case_gradients,
     _load_stage_resume_state,
     _make_stage_resume_payload,
@@ -213,7 +214,9 @@ def test_joint_loss_uses_region_means_then_085_015_weighting() -> None:
     )
 
 
-def test_evaluate_uses_one_backward_per_partial_case_batch() -> None:
+def test_evaluate_uses_one_backward_per_partial_case_batch(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     parameter = torch.nn.Parameter(torch.tensor(-0.5, dtype=torch.float64))
     backward_calls: list[int] = []
     parameter.register_hook(lambda gradient: backward_calls.append(1))
@@ -254,13 +257,32 @@ def test_evaluate_uses_one_backward_per_partial_case_batch() -> None:
     ]
     baseline = {case["case_id"]: {"m2_mm2": 1.0} for case in cases}
     model = Model()
-    value, rows, health = _evaluate(model, cases, baseline, with_grad=True)
+    value, rows, health = _evaluate(
+        model,
+        cases,
+        baseline,
+        with_grad=True,
+        progress_stage="7x7",
+        progress_step="1/10",
+        progress_learning_rate=2.0e-3,
+    )
     assert len(model.batch_calls) == 3
     assert model.batch_calls[-1] == ["pr"]
     assert len(rows) == len(cases)
     assert math.isfinite(value)
     assert math.isfinite(health["J_total"])
     assert len(backward_calls) == 3
+    assert "stage=7x7 step=1/10 batch=3/3" in capsys.readouterr().out
+
+
+def test_main_training_log_is_append_only_and_readable(tmp_path) -> None:
+    path = tmp_path / "training.log"
+    _append_training_log(path, "[pal-train] stage=7x7 step=1/10 batch=46/46 loss=1 update=ACCEPT lr=0.002")
+    _append_training_log(path, "[pal-train] INTERRUPTED stage_phase=stage_training error=RuntimeError")
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2
+    assert "stage=7x7 step=1/10" in lines[0]
+    assert "INTERRUPTED stage_phase=stage_training" in lines[1]
 
 
 def test_joint_loss_rejects_incomplete_extra_or_mixed_training_groups() -> None:
