@@ -53,6 +53,7 @@ python -m biot.gui
 - 仅优化 PAL 后表面 cubic NURBS/B-spline 的 `zp`；`xp/yp/weight` 固定，边界控制环固定为零。
 - 控制网格为 `7x7 -> 11x11 -> 19x19`，通过精确 knot refinement 晋级。
 - 80 个真实 case：Far 18、Intermediate 12、Near 18、Peripheral-left/right 各 16。
+- 三个物距统一为 `D500=500 mm`、`D1000=1000 mm`、`Dinf=Infinity`；Infinity 使用真实无穷远条件。
 - 使用真实可微追迹、GRIN3 固定步长 RK4、连续 OPL、去 pupil tilt FFT PSF；离线 PSF 不参与反传。
 - 默认 pupil 采样为 `np=256`、FFT 为 `512`；80 个 case 按 `case_batch_size=8` 做 GPU tensor 追迹和 FFT，每批聚合一次 loss 并 backward，不因 OOM 自动缩小 batch。
 - 训练输出统一包含 `stage`、`step`、`batch`、`loss`、`update` 和 `lr`；每个 run 的 `training.log` 持久化同样的进度摘要，中断时追加异常信息，各阶段仍保留结构化 `history.csv`。
@@ -60,6 +61,18 @@ python -m biot.gui
 - `J=(0.85*J_functional+0.15*J_peripheral)`，Original PAL 分母固定。
 - 仅使用 trace/PSF health、`P_far`、`ADD` 和单步 sag trust region 约束。
 - 不自动运行历史 192-case posthoc、PSF 数据库、渲染或 SSIM 链。
+
+## 完成优化后的评价
+
+评价不会改写训练 run，并在 run 内创建独立的 `evaluation/` 身份。它生成
+Sag、AverFang 光焦度/像散、三物距 PSF/视标拼接和 Ahumada 加权 MTF
+（baseline/optimized/delta）产物：
+
+```powershell
+python evaluate_pal_nurbs.py --run results/optimization/run_001 --device cuda
+```
+
+评价网格为 `[-40,40]` degree、步长 10 degree。旧 run 的训练物距会在评价身份中如实记录；评价物距固定为 D500/D1000/Dinf，不能据此改写旧训练结论。`inputs/evaluation/E1.xlsx` 是受控视标输入；`.venv` 和 `results/` 不上传到 Git。
 
 ## 从零开始运行
 

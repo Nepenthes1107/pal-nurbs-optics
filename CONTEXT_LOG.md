@@ -16,6 +16,8 @@
 - 当前入口：`run_pal_nurbs.py`；PAL 实现位于 `biot/e2e/pal_nurbs.py` 和 `biot/e2e/pal_case_layout.py`。
 - `main` 的 80-case/分阶段架构已接入真实 GPU tensor case batch：默认 `case_batch_size=8`、`requested_np=256`、FFT `512`；每批完成追迹和 FFT 后聚合一次 loss/backward，最后一批按实际数量运行，不做 OOM 自动降级。
 - `main` 的分阶段训练输出统一显示 `stage/step/batch/loss/update/lr`，并写入 run 根目录 `training.log`；各阶段 `history.csv` 和 resume checkpoint 继续作为结构化恢复依据。
+- 新训练合同统一使用 `D500/D1000/Dinf`；已完成的旧 `run_001` 保持历史训练身份，不原位改写。
+- `evaluate_pal_nurbs.py` 在 `<run>/evaluation` 生成独立评价身份和 486 个三物距×双状态×81 场点的 PSF/weighted-MTF 节点，以及 Sag/AverFang/拼接图。
 
 ## 历史 r12
 
@@ -40,6 +42,7 @@
 - startup gradient 的中心/边缘 case 会作为 `_retain_training_cache()` 的显式 `extra_cases` 在缓存冻结前物化；不增加额外全局完整性扫描，baseline 后仍仅保留正式训练 case。
 - 底层前向追迹失败只抛出异常，不再向项目根目录自动写入 `optimization/wrong_result`；PAL 候选失败由对应 run 的资格筛选进度文件记录。
 - 长任务必须持续写 checkpoint、history、run state 和退出信息；异常后从最近可验证 checkpoint 恢复，不降低正式采样或门槛。
+- 孔径判定与 BIOT_vis 对齐：圆孔径采用 `2*r*300e-6+(300e-6)^2` 的 SDF 容差，方孔径采用 `300e-6 mm` 线性容差；真超口径仍失败关闭。
 
 ## 验证入口
 
