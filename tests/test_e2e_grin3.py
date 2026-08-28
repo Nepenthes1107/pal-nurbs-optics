@@ -12,7 +12,10 @@ import torch
 from basics import Material, Ray
 import biot.e2e.system as e2e_system
 from biot.e2e.pal_nurbs import FixedWeightNURBSPerturbation
-from biot.e2e.psf_fft import effective_biot_pupil_sample_count
+from biot.e2e.psf_fft import (
+    effective_biot_pupil_sample_count,
+    torch_fft_psf_from_phase,
+)
 from biot.e2e.system import (
     FitSpec,
     LocalGradient3Surface,
@@ -336,7 +339,8 @@ def test_grad3_e2e_image_spots_and_phase_match_authoritative_biot_trace(
 @pytest.mark.parametrize(
     ("distance_mm", "field_x_deg", "field_y_deg"),
     (
-        (2000.0, 30.0, -20.0),
+        (500.0, -30.0, 20.0),
+        (1000.0, 0.0, 0.0),
         ("Infinity", 20.0, 10.0),
     ),
 )
@@ -382,13 +386,21 @@ def test_grad3_e2e_reference_sphere_complex_pupil_matches_biot_fft_psf_i(
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
             io.StringIO()
         ):
-            pupils, _ = system.lens.fft_psf_i(
+            pupils, d_delta = system.lens.fft_psf_i(
                 requested_np,
                 64,
                 torch.tensor(system.wavelength_nm, dtype=torch.float64),
                 Hx=0.0,
                 Hy=0.0,
                 legacy_pupil_phase=False,
+            )
+            biot_psf = system.lens._compute_psf(
+                pupils,
+                64,
+                d_delta,
+                0.0,
+                display_size_um=None,
+                methods="fft",
             )
         biot_pupil = torch.from_numpy(np.asarray(pupils[0])).to(torch.complex128)
         assert biot_pupil.shape == e2e_pupil.shape
@@ -400,6 +412,20 @@ def test_grad3_e2e_reference_sphere_complex_pupil_matches_biot_fft_psf_i(
         aligned_e2e = e2e_pupil * torch.exp(1j * torch.angle(cross))
         assert torch.allclose(
             aligned_e2e[mask], biot_pupil[mask], atol=1.0e-8, rtol=0.0
+        )
+        e2e_psf = torch_fft_psf_from_phase(
+            e2e.phase_rad,
+            e2e.valid,
+            sample_count=sample_count,
+            psf_size_px=64,
+            remove_piston=True,
+            remove_tilt=False,
+        ).psf
+        assert torch.allclose(
+            e2e_psf,
+            torch.from_numpy(np.asarray(biot_psf)).to(torch.float64),
+            atol=1.0e-10,
+            rtol=1.0e-9,
         )
     finally:
         if temp_path is not None:

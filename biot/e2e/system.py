@@ -19,6 +19,7 @@ from .surfaces import SurfaceDomain
 
 
 GRIN_ACTIVATION_CHECKPOINT = True
+GRIN_CASE_BATCH_RAY_CHUNK_SIZE = 2048
 
 
 def _safe_denominator(value: torch.Tensor, eps: float = 1.0e-12) -> torch.Tensor:
@@ -34,42 +35,46 @@ def _as_float(value) -> float:
 
 
 def rotation_matrix_xyz(
-    tilt_x_deg: float,
-    tilt_y_deg: float,
-    tilt_z_deg: float,
+    tilt_x_deg: float | torch.Tensor,
+    tilt_y_deg: float | torch.Tensor,
+    tilt_z_deg: float | torch.Tensor,
     *,
     device: torch.device | str,
     dtype: torch.dtype,
 ) -> torch.Tensor:
     """BIOT/BIOT_vis CoordinateBreak passive rotation: Rz @ Ry @ Rx."""
-    tx = torch.deg2rad(torch.as_tensor(float(tilt_x_deg), device=device, dtype=dtype))
-    ty = torch.deg2rad(torch.as_tensor(float(tilt_y_deg), device=device, dtype=dtype))
-    tz = torch.deg2rad(torch.as_tensor(float(tilt_z_deg), device=device, dtype=dtype))
-    one = torch.ones((), device=device, dtype=dtype)
-    zero = torch.zeros((), device=device, dtype=dtype)
+    tx = torch.deg2rad(torch.as_tensor(tilt_x_deg, device=device, dtype=dtype))
+    ty = torch.deg2rad(torch.as_tensor(tilt_y_deg, device=device, dtype=dtype))
+    tz = torch.deg2rad(torch.as_tensor(tilt_z_deg, device=device, dtype=dtype))
+    tx, ty, tz = torch.broadcast_tensors(tx, ty, tz)
+    one = torch.ones_like(tx)
+    zero = torch.zeros_like(tx)
     cx, sx = torch.cos(tx), torch.sin(tx)
     cy, sy = torch.cos(ty), torch.sin(ty)
     cz, sz = torch.cos(tz), torch.sin(tz)
     rx = torch.stack(
         (
-            torch.stack((one, zero, zero)),
-            torch.stack((zero, cx, -sx)),
-            torch.stack((zero, sx, cx)),
-        )
+            torch.stack((one, zero, zero), dim=-1),
+            torch.stack((zero, cx, -sx), dim=-1),
+            torch.stack((zero, sx, cx), dim=-1),
+        ),
+        dim=-2,
     )
     ry = torch.stack(
         (
-            torch.stack((cy, zero, sy)),
-            torch.stack((zero, one, zero)),
-            torch.stack((-sy, zero, cy)),
-        )
+            torch.stack((cy, zero, sy), dim=-1),
+            torch.stack((zero, one, zero), dim=-1),
+            torch.stack((-sy, zero, cy), dim=-1),
+        ),
+        dim=-2,
     )
     rz = torch.stack(
         (
-            torch.stack((cz, -sz, zero)),
-            torch.stack((sz, cz, zero)),
-            torch.stack((zero, zero, one)),
-        )
+            torch.stack((cz, -sz, zero), dim=-1),
+            torch.stack((sz, cz, zero), dim=-1),
+            torch.stack((zero, zero, one), dim=-1),
+        ),
+        dim=-2,
     )
     return rz @ ry @ rx
 
@@ -94,13 +99,13 @@ class E2EPhaseTraceResult:
     """Fitted-system trace result with optical path and FFT pupil phase.
 
     Shapes:
-        spots_mm: ``[N, 2]`` image-surface landing coordinates in mm.
-        valid: ``[N]`` final valid-ray mask.
-        optical_path_mm: ``[N]`` accumulated path to the image surface in mm.
-        reference_opl_mm: ``[N]`` continuous OPL at the selected phase
+        spots_mm: ``[..., N, 2]`` image-surface landing coordinates in mm.
+        valid: ``[..., N]`` final valid-ray mask.
+        optical_path_mm: ``[..., N]`` accumulated path to the image surface in mm.
+        reference_opl_mm: ``[..., N]`` continuous OPL at the selected phase
             reference, including the launch term.  Its complex phasor equals
             ``phase_rad`` on valid rays without phase unwrapping.
-        phase_rad: ``[N]`` phase in radians, using ``wavelength_nm``.
+        phase_rad: ``[..., N]`` phase in radians, using ``wavelength_nm``.
 
     The optical path includes the BIOT/BIOT_vis launch term relative to the
     separately aimed centre-pupil reference ray and every refractive segment.
@@ -187,13 +192,14 @@ class LocalSurface(torch.nn.Module):
     def intersect(
         self,
         ray: RayBundle,
-        distance_mm: float,
+        distance_mm: float | torch.Tensor,
         *,
         newton_iterations: int = 12,
         tolerance_mm: float = 1.0e-7,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         dz = ray.directions[..., 2]
-        t0 = (float(distance_mm) - ray.origins_mm[..., 2]) / _safe_denominator(dz)
+        distance = torch.as_tensor(distance_mm, device=ray.device, dtype=ray.dtype)
+        t0 = (distance - ray.origins_mm[..., 2]) / _safe_denominator(dz)
         local_origin = ray.origins_mm + t0[..., None] * ray.directions
         local_origin = local_origin.clone()
         local_origin[..., 2] = 0.0
@@ -301,11 +307,12 @@ class LocalAsphereSurface(LocalSurface):
         dz_dy = dz_dr2 * 2.0 * y_mm
         return sag, dz_dx, dz_dy
 
-    def intersect(self, ray: RayBundle, distance_mm: float, **kwargs) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def intersect(self, ray: RayBundle, distance_mm: float | torch.Tensor, **kwargs) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.curvature_inv_mm != 0.0 or self.coeff:
             return super().intersect(ray, distance_mm, **kwargs)
         dz = ray.directions[..., 2]
-        t = (float(distance_mm) - ray.origins_mm[..., 2]) / _safe_denominator(dz)
+        distance = torch.as_tensor(distance_mm, device=ray.device, dtype=ray.dtype)
+        t = (distance - ray.origins_mm[..., 2]) / _safe_denominator(dz)
         points = ray.origins_mm + t[..., None] * ray.directions
         points = points.clone()
         points[..., 2] = 0.0
@@ -368,6 +375,8 @@ class LocalGradient3Surface(LocalSurface):
         points_mm: torch.Tensor,
         optical_momentum: torch.Tensor,
         next_surface: LocalSurface,
+        *,
+        case_axis: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         adapter = _LocalSagAdapter(next_surface)
 
@@ -380,6 +389,7 @@ class LocalGradient3Surface(LocalSurface):
                 self.integration_step_mm,
                 self.thickness_mm,
                 adapter,
+                case_axis=case_axis,
             )
 
         if (
@@ -387,6 +397,59 @@ class LocalGradient3Surface(LocalSurface):
             and torch.is_grad_enabled()
             and (points_mm.requires_grad or optical_momentum.requires_grad)
         ):
+            if case_axis == 0:
+                if points_mm.ndim != 3 or optical_momentum.shape != points_mm.shape:
+                    raise ValueError("case-batch GRIN tensors must have shape [B,N,3]")
+                # The authoritative scalar solver derives one fixed RK4 schedule
+                # from all pupil rays in each case.  Derive that same schedule
+                # before ray chunking, then reuse it for every chunk so memory
+                # reduction cannot alter a case's numerical trajectory.
+                tz = optical_momentum[..., 2].abs().clamp_min(1.0e-12)
+                t_span = (float(self.thickness_mm) / tz.mean(dim=1)).detach()
+                base_steps = torch.floor(
+                    t_span.abs() / max(float(self.integration_step_mm), 1.0e-9)
+                ).to(dtype=torch.int64) + 1
+                base_steps = base_steps.clamp_min(1)
+                case_step_h = (
+                    t_span / base_steps.to(dtype=t_span.dtype)
+                ).unsqueeze(-1)
+                case_max_steps = torch.floor(
+                    base_steps.to(dtype=t_span.dtype) * 1.6
+                ).to(dtype=torch.int64) + 4
+
+                def trace_grin_chunk(
+                    points: torch.Tensor, momentum: torch.Tensor,
+                ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+                    return self.source.trace_to_next_surface(
+                        points,
+                        momentum,
+                        self.integration_step_mm,
+                        self.thickness_mm,
+                        adapter,
+                        case_axis=0,
+                        case_step_h=case_step_h,
+                        case_max_steps=case_max_steps,
+                    )
+
+                chunk_outputs: list[
+                    tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+                ] = []
+                ray_count = int(points_mm.shape[1])
+                for ray_start in range(0, ray_count, GRIN_CASE_BATCH_RAY_CHUNK_SIZE):
+                    ray_end = min(
+                        ray_start + GRIN_CASE_BATCH_RAY_CHUNK_SIZE, ray_count
+                    )
+                    chunk_outputs.append(
+                        checkpoint(
+                            trace_grin_chunk,
+                            points_mm[:, ray_start:ray_end],
+                            optical_momentum[:, ray_start:ray_end],
+                        )
+                    )
+                return tuple(
+                    torch.cat([output[index] for output in chunk_outputs], dim=1)
+                    for index in range(4)
+                )
             # Forward physics is unchanged. Backward deterministically recomputes
             # the fixed-step RK4 segment instead of retaining every step tensor.
             return checkpoint(trace_grin, points_mm, optical_momentum)
@@ -923,6 +986,435 @@ def trace_system_to_image(system: FittedE2ESystem, rays: RayBundle) -> E2ETraceR
         valid=trace.valid,
         weights=trace.weights,
         final_ray=trace.final_ray,
+    )
+
+
+def _equal_tensor_or_value(left, right) -> bool:
+    if torch.is_tensor(left) or torch.is_tensor(right):
+        if not torch.is_tensor(left) or not torch.is_tensor(right):
+            return False
+        return bool(torch.equal(left, right))
+    return left == right
+
+
+def _assert_surface_batch_compatible(
+    reference: LocalSurface,
+    candidate: LocalSurface,
+    *,
+    surface_index: int,
+) -> None:
+    if type(candidate) is not type(reference):
+        raise ValueError(f"case-batch surface type mismatch at index {surface_index}")
+    for name in ("semi_diameter_mm", "n_after", "is_aperture"):
+        if getattr(candidate, name) != getattr(reference, name):
+            raise ValueError(f"case-batch surface {name} mismatch at index {surface_index}")
+    if isinstance(reference, LocalCoordinateBreakSurface):
+        # Field-dependent tilts are intentionally handled by batched rotations.
+        return
+    for name in (
+        "curvature_inv_mm",
+        "conic",
+        "coeff",
+        "degree",
+        "degree_x",
+        "degree_y",
+        "domain",
+        "thickness_mm",
+        "integration_step_mm",
+    ):
+        if hasattr(reference, name) and not _equal_tensor_or_value(
+            getattr(reference, name), getattr(candidate, name)
+        ):
+            raise ValueError(f"case-batch surface {name} mismatch at index {surface_index}")
+    reference_state = reference.state_dict()
+    candidate_state = candidate.state_dict()
+    if set(reference_state) != set(candidate_state):
+        raise ValueError(f"case-batch surface state keys mismatch at index {surface_index}")
+    for name, value in reference_state.items():
+        if not torch.equal(value, candidate_state[name]):
+            raise ValueError(
+                f"case-batch surface tensor {name} mismatch at index {surface_index}"
+            )
+    if isinstance(reference, LocalGradient3Surface):
+        source_names = (
+            "c", "k", "coeff", "n0", "Nr2", "Nr4", "Nr6",
+            "Nz1", "Nz2", "Nz3", "delta_t", "material_name",
+        )
+        for name in source_names:
+            if not _equal_tensor_or_value(
+                getattr(reference.source, name), getattr(candidate.source, name)
+            ):
+                raise ValueError(
+                    f"case-batch Gradient_3 {name} mismatch at index {surface_index}"
+                )
+
+
+def _assert_system_batch_compatible(systems: Sequence[FittedE2ESystem]) -> None:
+    if not systems:
+        raise ValueError("cannot batch an empty optical-system sequence")
+    reference = systems[0]
+    for case_index, system in enumerate(systems[1:], start=1):
+        if len(system.surfaces) != len(reference.surfaces):
+            raise ValueError(f"case-batch surface count mismatch for case {case_index}")
+        if len(system.surface_distances_mm) != len(reference.surface_distances_mm):
+            raise ValueError(f"case-batch distance count mismatch for case {case_index}")
+        if not math.isclose(
+            float(system.wavelength_nm), float(reference.wavelength_nm), rel_tol=0.0, abs_tol=0.0
+        ):
+            raise ValueError(f"case-batch wavelength mismatch for case {case_index}")
+        for surface_index, (left, right) in enumerate(
+            zip(reference.surfaces, system.surfaces)
+        ):
+            _assert_surface_batch_compatible(left, right, surface_index=surface_index)
+        _assert_surface_batch_compatible(
+            reference.image_surface,
+            system.image_surface,
+            surface_index=len(reference.surfaces),
+        )
+
+
+def _stack_ray_bundles(rays: Sequence[RayBundle]) -> RayBundle:
+    if not rays:
+        raise ValueError("cannot stack an empty ray sequence")
+    reference_shape = tuple(rays[0].origins_mm.shape)
+    if any(tuple(ray.origins_mm.shape) != reference_shape for ray in rays):
+        raise ValueError("case-batch rays must have matching shapes")
+    launch_states = [ray.launch_opl_mm is not None for ray in rays]
+    if any(state != launch_states[0] for state in launch_states):
+        raise ValueError("case-batch launch OPL presence must match")
+    launch = None
+    if launch_states[0]:
+        launch = torch.stack([ray.launch_opl_mm for ray in rays], dim=0)
+    return RayBundle(
+        origins_mm=torch.stack([ray.origins_mm for ray in rays], dim=0),
+        directions=torch.stack([ray.directions for ray in rays], dim=0),
+        weights=torch.stack([ray.weights for ray in rays], dim=0),
+        wavelength_nm=torch.stack([ray.wavelength_nm.reshape(()) for ray in rays], dim=0),
+        launch_opl_mm=launch,
+    )
+
+
+@dataclass(frozen=True)
+class _BatchImageSurfaceTrace:
+    spots_mm: torch.Tensor
+    valid: torch.Tensor
+    image_ray: RayBundle
+    optical_path_mm: torch.Tensor
+    continuous_opl_mm: torch.Tensor
+    phase_to_image_rad: torch.Tensor
+    image_ior: torch.Tensor
+
+
+def _apply_case_batch_coordinate_break(
+    surfaces: Sequence[LocalCoordinateBreakSurface], ray: RayBundle
+) -> RayBundle:
+    rotations = rotation_matrix_xyz(
+        torch.as_tensor(
+            [surface.tilt_x_deg for surface in surfaces],
+            device=ray.device,
+            dtype=ray.dtype,
+        ),
+        torch.as_tensor(
+            [surface.tilt_y_deg for surface in surfaces],
+            device=ray.device,
+            dtype=ray.dtype,
+        ),
+        torch.as_tensor(
+            [surface.tilt_z_deg for surface in surfaces],
+            device=ray.device,
+            dtype=ray.dtype,
+        ),
+        device=ray.device,
+        dtype=ray.dtype,
+    )
+    origins = torch.einsum("bij,bnj->bni", rotations, ray.origins_mm)
+    directions = torch.einsum("bij,bnj->bni", rotations, ray.directions)
+    return ray.with_state(origins, directions, weights=ray.weights)
+
+
+def _trace_case_batch_to_image_surface(
+    systems: Sequence[FittedE2ESystem],
+    rays: RayBundle,
+    *,
+    launch_reference_mm: torch.Tensor,
+) -> _BatchImageSurfaceTrace:
+    batch_size = len(systems)
+    if rays.origins_mm.ndim != 3 or int(rays.origins_mm.shape[0]) != batch_size:
+        raise ValueError("batched rays must have shape [B,N,3]")
+    current = rays.normalized()
+    active = torch.ones_like(current.weights, dtype=torch.bool)
+    n_current = torch.as_tensor(
+        [float(system.initial_ior) for system in systems],
+        device=current.device,
+        dtype=current.dtype,
+    ).reshape(batch_size, 1)
+    wavelength_mm = torch.as_tensor(
+        [float(system.wavelength_nm) * 1.0e-6 for system in systems],
+        device=current.device,
+        dtype=current.dtype,
+    ).reshape(batch_size, 1)
+    initial_distance = (
+        torch.sum(current.origins_mm * current.directions, dim=-1)
+        if current.launch_opl_mm is None
+        else current.launch_opl_mm
+    )
+    initial_relative_opl = initial_distance - launch_reference_mm
+    phase_rad = initial_relative_opl * (2.0 * torch.pi / wavelength_mm)
+    optical_path = initial_relative_opl.clone()
+    continuous_opl = initial_relative_opl
+
+    for surface_index in range(len(systems[0].surfaces)):
+        case_surfaces = [system.surfaces[surface_index] for system in systems]
+        surface = case_surfaces[0]
+        distances = torch.as_tensor(
+            [float(system.surface_distances_mm[surface_index]) for system in systems],
+            device=current.device,
+            dtype=current.dtype,
+        ).reshape(batch_size, 1)
+        points, hit_valid, segment_distance = surface.intersect(current, distances)
+        normals = surface.normal_at(points)
+        if isinstance(surface, LocalGradient3Surface):
+            n_entry = surface.index_at(points)
+            refracted, refract_valid = _snell(
+                current.directions, normals, n_current, n_entry
+            )
+        else:
+            refracted, refract_valid = _snell(
+                current.directions, normals, n_current, surface.n_after
+            )
+        step_valid = active & hit_valid & refract_valid
+        segment_opl = segment_distance * n_current
+        phase_rad = phase_rad + torch.where(
+            step_valid,
+            2.0 * torch.pi * segment_opl / wavelength_mm,
+            torch.zeros_like(segment_opl),
+        )
+        optical_path = optical_path + torch.where(
+            step_valid, segment_opl, torch.zeros_like(segment_distance)
+        )
+        continuous_opl = continuous_opl + torch.where(
+            step_valid, segment_opl, torch.zeros_like(segment_distance)
+        )
+        if isinstance(surface, LocalGradient3Surface):
+            if surface_index + 1 >= len(systems[0].surfaces):
+                raise RuntimeError("Gradient 3 medium has no terminating surface")
+            next_surfaces = [system.surfaces[surface_index + 1] for system in systems]
+            optical_momentum = n_entry[..., None] * refracted
+            grin_points, grin_momentum, grin_opl, grin_valid = surface.trace_to_next_surface(
+                points,
+                optical_momentum,
+                next_surfaces[0],
+                case_axis=0,
+            )
+            n_exit = surface.index_at(grin_points)
+            grin_direction = normalize_vector(
+                grin_momentum / _safe_denominator(n_exit)[..., None]
+            )
+            grin_finite = (
+                torch.all(torch.isfinite(grin_points), dim=-1)
+                & torch.all(torch.isfinite(grin_direction), dim=-1)
+                & torch.isfinite(grin_opl)
+                & torch.isfinite(n_exit)
+                & (n_exit > 0.0)
+            )
+            active = step_valid & grin_valid & grin_finite
+            phase_rad = phase_rad + torch.where(
+                active,
+                2.0 * torch.pi * grin_opl / wavelength_mm,
+                torch.zeros_like(grin_opl),
+            )
+            optical_path = optical_path + torch.where(
+                active, grin_opl, torch.zeros_like(grin_opl)
+            )
+            continuous_opl = continuous_opl + torch.where(
+                active, grin_opl, torch.zeros_like(grin_opl)
+            )
+            current = current.with_state(
+                grin_points,
+                grin_direction,
+                weights=current.weights * active.to(current.dtype),
+            )
+            n_current = n_exit
+            continue
+        active = step_valid
+        current = current.with_state(
+            points,
+            refracted,
+            weights=current.weights * active.to(current.dtype),
+        )
+        if isinstance(surface, LocalCoordinateBreakSurface):
+            current = _apply_case_batch_coordinate_break(case_surfaces, current)
+        else:
+            current = surface.after_interaction(current)
+        n_current = torch.as_tensor(
+            surface.n_after, device=current.device, dtype=current.dtype
+        )
+
+    image_surface = systems[0].image_surface
+    image_distances = torch.as_tensor(
+        [float(system.image_distance_mm) for system in systems],
+        device=current.device,
+        dtype=current.dtype,
+    ).reshape(batch_size, 1)
+    image_points, image_valid, image_distance = image_surface.intersect(
+        current, image_distances
+    )
+    valid = active & image_valid
+    image_opl = image_distance * n_current
+    phase_to_image = phase_rad + torch.where(
+        valid,
+        2.0 * torch.pi * image_opl / wavelength_mm,
+        torch.zeros_like(image_opl),
+    )
+    optical_path_to_image = optical_path + torch.where(
+        valid, image_opl, torch.zeros_like(image_distance)
+    )
+    continuous_opl_to_image = continuous_opl + torch.where(
+        valid, image_opl, torch.zeros_like(image_distance)
+    )
+    image_ray = current.with_state(
+        image_points,
+        current.directions,
+        weights=current.weights * valid.to(current.dtype),
+    )
+    return _BatchImageSurfaceTrace(
+        spots_mm=image_points[..., :2],
+        valid=valid,
+        image_ray=image_ray,
+        optical_path_mm=optical_path_to_image,
+        continuous_opl_mm=continuous_opl_to_image,
+        phase_to_image_rad=phase_to_image,
+        image_ior=torch.as_tensor(
+            n_current, device=current.device, dtype=current.dtype
+        ),
+    )
+
+
+def _case_batch_reference_sphere_path_mm(
+    systems: Sequence[FittedE2ESystem],
+    image_ray: RayBundle,
+    sensor_intersection_mm: torch.Tensor,
+    reference_points_mm: torch.Tensor,
+    *,
+    valid_mask: torch.Tensor,
+) -> torch.Tensor:
+    batch_size = len(systems)
+    chief_z = torch.as_tensor(
+        [biot_fft_defocus_shift_mm(system) for system in systems],
+        device=image_ray.device,
+        dtype=image_ray.dtype,
+    ).reshape(batch_size, 1)
+    radius = -(
+        torch.as_tensor(
+            [float(system.exit_pupil_position_mm) for system in systems],
+            device=image_ray.device,
+            dtype=image_ray.dtype,
+        ).reshape(batch_size, 1)
+        - chief_z
+    )
+    if not bool(torch.isfinite(radius).all()) or bool((radius == 0.0).any()):
+        raise RuntimeError("case-batch reference-sphere radii must be finite and non-zero")
+    valid = valid_mask.to(device=image_ray.device, dtype=torch.bool)
+    if valid.shape != image_ray.directions[..., 2].shape:
+        raise ValueError("case-batch reference-sphere valid mask shape mismatch")
+    if not bool(valid.any(dim=1).all()):
+        raise RuntimeError("each case-batch reference sphere requires valid rays")
+    dx, dy, dz = (image_ray.directions[..., index] for index in range(3))
+    if not bool(torch.isfinite(torch.where(valid, dz, torch.zeros_like(dz))).all()):
+        raise RuntimeError("valid case-batch reference-sphere directions are non-finite")
+    if bool(torch.where(valid, dz == 0.0, torch.zeros_like(valid)).any()):
+        raise RuntimeError("valid case-batch reference-sphere axial directions are zero")
+    denominator = torch.where(valid, dz, torch.ones_like(dz))
+    projected_distance = -(
+        radius - chief_z + image_ray.origins_mm[..., 2]
+    ) / denominator
+    projected = sensor_intersection_mm + image_ray.directions * projected_distance[..., None]
+    pupil_ref = projected - reference_points_mm
+    pupil_ref = pupil_ref.clone()
+    pupil_ref[..., 2] = 0.0
+    xn, yn = pupil_ref[..., 0], pupil_ref[..., 1]
+    b = dz - (dx * xn + dy * yn) / radius
+    h = (xn.square() + yn.square()) / radius
+    discriminant = b.square() - h / radius
+    valid_discriminant = torch.where(valid, discriminant, torch.ones_like(discriminant))
+    if not bool(torch.isfinite(valid_discriminant).all()) or bool((valid_discriminant < 0.0).any()):
+        raise RuntimeError("valid case-batch rays do not intersect the reference sphere")
+    sqrt_disc = torch.sqrt(valid_discriminant)
+    delta1 = b - sqrt_disc
+    delta2 = b + sqrt_disc
+    delta = torch.where(delta1.abs() < delta2.abs(), delta1, delta2)
+    reference_path = projected_distance + delta * radius
+    if not bool(torch.isfinite(torch.where(valid, reference_path, torch.zeros_like(reference_path))).all()):
+        raise RuntimeError("valid case-batch reference paths are non-finite")
+    return torch.where(valid, reference_path, torch.zeros_like(reference_path))
+
+
+def trace_system_batch_to_image_with_phase(
+    systems: Sequence[FittedE2ESystem],
+    rays_by_case: Sequence[RayBundle],
+    *,
+    phase_reference: str = "image_surface",
+) -> E2EPhaseTraceResult:
+    """Trace a true tensorized case batch with shapes ``[B,N,...]``."""
+    if phase_reference not in {"image_surface", "biot_reference_sphere"}:
+        raise ValueError("phase_reference must be 'image_surface' or 'biot_reference_sphere'")
+    systems = tuple(systems)
+    rays_by_case = tuple(rays_by_case)
+    if len(systems) != len(rays_by_case):
+        raise ValueError("case-batch systems and rays must have matching lengths")
+    _assert_system_batch_compatible(systems)
+    reference_rays: list[RayBundle] = []
+    for case_index, system in enumerate(systems):
+        if system.reference_ray is None:
+            raise RuntimeError(f"case {case_index} is missing its pre-aimed reference ray")
+        reference_rays.append(system.reference_ray)
+    stacked_reference = _stack_ray_bundles(reference_rays)
+    if stacked_reference.launch_opl_mm is None:
+        raise RuntimeError("case-batch reference rays are missing launch OPL")
+    launch_reference = stacked_reference.launch_opl_mm.reshape(len(systems), -1)[:, :1]
+    reference_trace = _trace_case_batch_to_image_surface(
+        systems,
+        stacked_reference,
+        launch_reference_mm=launch_reference,
+    )
+
+    stacked_rays = _stack_ray_bundles(rays_by_case)
+    main_trace = _trace_case_batch_to_image_surface(
+        systems,
+        stacked_rays,
+        launch_reference_mm=launch_reference,
+    )
+    phase_rad = main_trace.phase_to_image_rad
+    reference_opl = main_trace.continuous_opl_mm
+    if phase_reference == "biot_reference_sphere":
+        reference_points = reference_trace.image_ray.origins_mm
+        reference_path = _case_batch_reference_sphere_path_mm(
+            systems,
+            main_trace.image_ray,
+            main_trace.image_ray.origins_mm,
+            reference_points,
+            valid_mask=main_trace.valid,
+        )
+        # Match the scalar BIOT path: the reference-sphere segment propagates
+        # in the medium immediately before the image plane.  The image
+        # surface's ``n_after`` describes the material after that plane and is
+        # not the optical-path multiplier for this segment.
+        n_image = main_trace.image_ior
+        wavelength_mm = torch.as_tensor(
+            [float(system.wavelength_nm) * 1.0e-6 for system in systems],
+            device=phase_rad.device,
+            dtype=phase_rad.dtype,
+        ).reshape(len(systems), 1)
+        phase_rad = phase_rad + 2.0 * torch.pi * reference_path * n_image / wavelength_mm
+        reference_opl = reference_opl + reference_path * n_image
+    return E2EPhaseTraceResult(
+        spots_mm=main_trace.spots_mm,
+        valid=main_trace.valid,
+        weights=stacked_rays.weights,
+        final_ray=main_trace.image_ray,
+        optical_path_mm=main_trace.optical_path_mm,
+        reference_opl_mm=reference_opl,
+        phase_rad=phase_rad,
     )
 
 
