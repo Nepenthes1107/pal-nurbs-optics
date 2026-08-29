@@ -377,6 +377,15 @@ class BatchFieldResult:
     valid_mask: torch.Tensor | None = None
 
 
+@dataclass(frozen=True)
+class RawPSFBatchResult:
+    """评价用原生 FFT PSF 批量结果；首维严格对应输入 case 顺序。"""
+
+    psf: torch.Tensor
+    valid_fraction: torch.Tensor
+    pixel_pitch_mm: torch.Tensor
+
+
 def _elapsed_seconds(output: Path) -> float:
     path = output / "run_state.json"
     if not path.is_file():
@@ -933,6 +942,51 @@ class MinimalOpticalModel:
             pixel_pitch_mm=pixel_pitch,
             edge_fraction=_edge_fraction_batch(kernels),
             valid_mask=trace.valid,
+        )
+
+    def raw_psf_batch(self, cases: Sequence[Mapping[str, Any]]) -> RawPSFBatchResult:
+        """为离线评价执行真实 case 小批量追迹与原生 FFT PSF 计算。"""
+        if not cases:
+            raise ValueError("cannot evaluate an empty raw PSF case batch")
+        systems: list[FittedE2ESystem] = []
+        rays: list[object] = []
+        pitches: list[float] = []
+        for case in cases:
+            distance = float(case["distance_mm"])
+            x, y = float(case["field_x_deg"]), float(case["field_y_deg"])
+            system, pupil_rays = self._system_and_rays(distance, x, y)
+            pitch = system.physical_fft_pixel_pitch_mm
+            if pitch is None or not math.isfinite(float(pitch)) or float(pitch) <= 0.0:
+                raise RuntimeError(
+                    f"invalid physical raw FFT pixel pitch for {case['case_id']}"
+                )
+            systems.append(system)
+            rays.append(pupil_rays)
+            pitches.append(float(pitch))
+        trace = trace_system_batch_to_image_with_phase(
+            systems, rays, phase_reference="biot_reference_sphere"
+        )
+        if not bool(trace.valid.any(dim=1).all()):
+            invalid = [
+                str(case["case_id"])
+                for index, case in enumerate(cases)
+                if not bool(trace.valid[index].any())
+            ]
+            raise RuntimeError("no valid rays for raw PSF case batch: " + ", ".join(invalid))
+        fft = torch_fft_psf_from_phase(
+            trace.phase_rad,
+            trace.valid,
+            sample_count=self.sample_count,
+            psf_size_px=self.config.fft_size_px,
+            remove_piston=True,
+            remove_tilt=True,
+        )
+        return RawPSFBatchResult(
+            psf=fft.psf,
+            valid_fraction=trace.valid.to(dtype=fft.psf.dtype).mean(dim=1),
+            pixel_pitch_mm=torch.as_tensor(
+                pitches, device=fft.psf.device, dtype=fft.psf.dtype
+            ),
         )
 
 

@@ -5,6 +5,7 @@ import json
 import math
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -82,6 +83,57 @@ def test_real_trace_psf_m2_has_nurbs_gradient() -> None:
     assert module.inner_q.grad is not None
     assert torch.isfinite(module.inner_q.grad).all()
     assert float(module.inner_q.grad.abs().max()) > 0.0
+
+
+def test_raw_psf_batch_uses_one_true_batch_and_preserves_case_axis(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = object.__new__(MinimalOpticalModel)
+    model.config = MinimalConfig(device="cpu", requested_np=16, fft_size_px=8)
+    model.device = torch.device("cpu")
+    model.sample_count = 4
+    trace_calls: list[int] = []
+
+    class System:
+        def __init__(self, pitch: float) -> None:
+            self.physical_fft_pixel_pitch_mm = pitch
+
+    def system_and_rays(distance: float, x: float, y: float):
+        del distance, y
+        return System(0.01 + x * 0.001), object()
+
+    model._system_and_rays = system_and_rays
+
+    def trace_batch(systems, rays, *, phase_reference):
+        assert phase_reference == "biot_reference_sphere"
+        assert len(systems) == len(rays) == 3
+        trace_calls.append(len(systems))
+        return SimpleNamespace(
+            phase_rad=torch.zeros((3, 4), dtype=torch.float64),
+            valid=torch.ones((3, 4), dtype=torch.bool),
+        )
+
+    def fft_batch(phase, valid, **kwargs):
+        assert phase.shape == valid.shape == (3, 4)
+        assert kwargs["psf_size_px"] == 8
+        psf = torch.zeros((3, 8, 8), dtype=torch.float64)
+        psf[:, 4, 4] = 1.0
+        return SimpleNamespace(psf=psf)
+
+    monkeypatch.setattr(pal_nurbs, "trace_system_batch_to_image_with_phase", trace_batch)
+    monkeypatch.setattr(pal_nurbs, "torch_fft_psf_from_phase", fft_batch)
+    cases = [
+        {"case_id": f"c{index}", "distance_mm": 500.0,
+         "field_x_deg": float(index), "field_y_deg": 0.0}
+        for index in range(3)
+    ]
+    result = model.raw_psf_batch(cases)
+    assert trace_calls == [3]
+    assert result.psf.shape == (3, 8, 8)
+    assert torch.equal(result.valid_fraction, torch.ones(3, dtype=torch.float64))
+    assert torch.allclose(
+        result.pixel_pitch_mm, torch.tensor([0.01, 0.011, 0.012], dtype=torch.float64)
+    )
 
 
 def test_startup_cases_backward_immediately_and_match_summed_loss_gradient() -> None:

@@ -73,21 +73,24 @@ def test_condition_hdf5_resumes_exact_nodes_and_fails_on_corruption(
         def __init__(self, fail_after: int | None) -> None:
             self.calls = 0
             self.fail_after = fail_after
+            self.batch_sizes: list[int] = []
 
-        def field(self, case):
-            del case
+        def raw_psf_batch(self, batch):
             self.calls += 1
             if self.fail_after is not None and self.calls > self.fail_after:
                 raise RuntimeError("synthetic interruption")
-            raw = torch.zeros((8, 8), dtype=torch.float64)
-            raw[4, 4] = 1.0
-            common = {"valid_fraction": torch.tensor(0.75, dtype=torch.float64)}
-            if hasattr(evaluator.pal, "DISTANCE_SPECS"):
-                return SimpleNamespace(psf=raw, pixel_pitch_mm=0.01, **common)
-            return SimpleNamespace(raw_psf=raw, raw_pixel_pitch_mm=0.01, **common)
+            size = len(batch)
+            self.batch_sizes.append(size)
+            raw = torch.zeros((size, 8, 8), dtype=torch.float64)
+            raw[:, 4, 4] = 1.0
+            return SimpleNamespace(
+                psf=raw,
+                pixel_pitch_mm=torch.full((size,), 0.01, dtype=torch.float64),
+                valid_fraction=torch.full((size,), 0.75, dtype=torch.float64),
+            )
 
     root = tmp_path / "psf_database"
-    first = Model(fail_after=2)
+    first = Model(fail_after=1)
     with pytest.raises(RuntimeError, match="synthetic interruption"):
         evaluator._build_condition_database(
             root,
@@ -100,10 +103,11 @@ def test_condition_hdf5_resumes_exact_nodes_and_fails_on_corruption(
             checkpoint_sha256="checkpoint",
             resume=False,
             completed_conditions=0,
+            psf_batch_size=3,
         )
     partial = root / "D500_baseline.partial.h5"
     with h5py.File(partial, "r") as handle:
-        assert handle["completed"][:].tolist() == [1, 1, 0, 0]
+        assert handle["completed"][:].tolist() == [1, 1, 1, 0]
 
     resumed = Model(fail_after=None)
     final = evaluator._build_condition_database(
@@ -117,8 +121,11 @@ def test_condition_hdf5_resumes_exact_nodes_and_fails_on_corruption(
         checkpoint_sha256="checkpoint",
         resume=True,
         completed_conditions=0,
+        psf_batch_size=3,
     )
-    assert resumed.calls == 2
+    assert first.batch_sizes == [3]
+    assert resumed.calls == 1
+    assert resumed.batch_sizes == [1]
     assert final.name == "D500_baseline.h5"
     assert not partial.exists()
     with h5py.File(final, "r") as handle:
@@ -167,3 +174,12 @@ def test_blur_scale_one_matches_reference_and_scale_four_is_display_only() -> No
 
 def test_evaluate_default_blur_scale_is_four() -> None:
     assert evaluator.evaluate.__kwdefaults__["blur_scale"] == 4.0
+
+
+def test_evaluate_default_psf_batch_size_is_eight() -> None:
+    assert evaluator.evaluate.__kwdefaults__["psf_batch_size"] == 8
+
+
+def test_native_psf_batch_rejects_scalar_only_model() -> None:
+    with pytest.raises(TypeError, match="must implement raw_psf_batch"):
+        evaluator._native_psf_batch(SimpleNamespace(), [{"case_id": "c0"}])

@@ -72,7 +72,7 @@ python -m biot.gui
 和视标 stitch；同时输出 Sag 和 AverFang 光焦度/像散：
 
 ```powershell
-python evaluate_pal_nurbs.py --run results/optimization/run_001 --device cuda --blur-scale 4
+python evaluate_pal_nurbs.py --run results/optimization/run_001 --device cuda --psf-batch-size 8 --blur-scale 4
 ```
 
 每个条件文件保存 81 个场点的原始 512×512 FFT PSF 和统一物理裁剪后的
@@ -80,6 +80,12 @@ python evaluate_pal_nurbs.py --run results/optimization/run_001 --device cuda --
 评价网格为 `[-40,40]` degree、步长 10 degree。`--resume` 精确核验并跳过
 HDF5 中已完成节点；损坏或身份不符的节点失败关闭。`--blur-scale` 默认 4，
 只控制视标拼接的显示模糊，不改变 PSF 数据库、MTF 或 PSF stitch。
+PSF 追迹通过必选的 `raw_psf_batch()` 接口做 CUDA case 小批量并行，
+`--psf-batch-size` 默认 8；最后一批按实际剩余场点数运行，OOM 或批量追迹
+失败直接终止，不自动缩批也不回退到串行。恢复时仅对未完成场点重新分批，
+已完成节点仍逐个核验并跳过。
+批量生成已提升评价 identity schema；改造前未完成的串行评价不能用
+新 `--resume` 接续，应保留为历史证据并在新的空 `evaluation/` 目录从头评价。
 
 旧 run 的训练物距会在评价身份中如实记录；评价物距固定为
 D500/D1000/Dinf，不能据此改写旧训练结论。`inputs/evaluation/E1.xlsx` 是受控

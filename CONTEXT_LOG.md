@@ -21,6 +21,7 @@
   分别保存为六个 HDF5，每个文件含 81 个场点的原始 FFT PSF、130×130 渲染
   PSF及最小恢复信息。只有数据库整体 `complete` 后才运行 weighted-MTF Mean、
   PSF stitch 和 chart stitch；chart 的 `blur-scale` 默认 4且仅影响显示。
+- PSF 数据库默认通过 `raw_psf_batch()` 以 `psf_batch_size=8` 做原生 FFT PSF case 批量追迹；批大小纳入评价 identity。已完成 HDF5 节点仍逐个核验，未完成节点按小批量恢复；不自动缩批或串行回退。
 
 ## 历史 r12
 
@@ -59,3 +60,5 @@ python run_pal_nurbs.py --output .tmp_prepare --excel eye_image_glass_grad3.xlsx
 2026-08-28 验收：PAL-NURBS 定向测试 `21 passed`，完整测试 `154 passed`，无跳过；真实 2-case CPU batch smoke 的 kernel shape、能量归一化和 PAL 梯度检查通过。GUI smoke 使用 `pytest-qt==4.4.0`。PyTorch 2.0.1 在 Windows 中文路径下的 checkpoint 原子写入改用 Python 二进制文件句柄，仍采用原 torch 序列化、`fsync` 和原子替换。
 
 2026-08-29 验收：周边 A 目标及统一 HDF5 PSF 数据库/评价链的 `.venv\Scripts\python.exe -m pytest tests -q --basetemp .tmp_pytest_main_full` 为 `165 passed`，无失败；其中评价器定向测试为 `7 passed`。本次未启动正式优化或完整 486-field PSF 数据库生成。
+
+2026-08-29 CUDA 评价批量化验收：评价器与 PAL 定向测试 `32 passed`；`.venv\Scripts\python.exe -m pytest tests -q --basetemp .tmp_pytest_eval_batch_main_full` 为 `168 passed`，无失败。批量接口测试确认 3 个 case 只调用一次真实 batch trace，并验证最后 1 个未完成节点的精确恢复。本次未启动正式优化或完整 486-field 评价。
