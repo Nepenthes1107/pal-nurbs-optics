@@ -57,3 +57,5 @@ python run_pal_nurbs.py --output .tmp_prepare --excel eye_image_glass_grad3.xlsx
 ```
 
 2026-08-28 验收：PAL-NURBS 定向测试 `21 passed`，完整测试 `154 passed`，无跳过；真实 2-case CPU batch smoke 的 kernel shape、能量归一化和 PAL 梯度检查通过。GUI smoke 使用 `pytest-qt==4.4.0`。PyTorch 2.0.1 在 Windows 中文路径下的 checkpoint 原子写入改用 Python 二进制文件句柄，仍采用原 torch 序列化、`fsync` 和原子替换。
+
+2026-08-29 验收：周边 A 目标及统一 HDF5 PSF 数据库/评价链的 `.venv\Scripts\python.exe -m pytest tests -q --basetemp .tmp_pytest_main_full` 为 `165 passed`，无失败；其中评价器定向测试为 `7 passed`。本次未启动正式优化或完整 486-field PSF 数据库生成。
