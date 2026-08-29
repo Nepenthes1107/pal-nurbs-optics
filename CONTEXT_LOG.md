@@ -17,7 +17,10 @@
 - `main` 的 80-case/分阶段架构已接入真实 GPU tensor case batch：默认 `case_batch_size=8`、`requested_np=256`、FFT `512`；每批完成追迹和 FFT 后聚合一次 loss/backward，最后一批按实际数量运行，不做 OOM 自动降级。
 - `main` 的分阶段训练输出统一显示 `stage/step/batch/loss/update/lr`，并写入 run 根目录 `training.log`；各阶段 `history.csv` 和 resume checkpoint 继续作为结构化恢复依据。
 - 新训练合同统一使用 `D500/D1000/Dinf`；已完成的旧 `run_001` 保持历史训练身份，不原位改写。
-- `evaluate_pal_nurbs.py` 在 `<run>/evaluation` 生成独立评价身份和 486 个三物距×双状态×81 场点的 PSF/weighted-MTF 节点，以及 Sag/AverFang/拼接图。
+- `evaluate_pal_nurbs.py` 在 `<run>/evaluation` 生成独立评价身份；三物距×双状态
+  分别保存为六个 HDF5，每个文件含 81 个场点的原始 FFT PSF、130×130 渲染
+  PSF及最小恢复信息。只有数据库整体 `complete` 后才运行 weighted-MTF Mean、
+  PSF stitch 和 chart stitch；chart 的 `blur-scale` 默认 4且仅影响显示。
 
 ## 历史 r12
 

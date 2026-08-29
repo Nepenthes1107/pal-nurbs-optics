@@ -1,8 +1,7 @@
-"""Evaluate a completed PAL-NURBS run without modifying the training run.
+"""Fail-closed evaluation for a completed PAL-NURBS run.
 
-The evaluator writes all products below ``<run>/evaluation`` and keeps a
-separate evaluation identity.  It supports both the main 7->11->19 runner and
-the fixed multidistance 7x7 runner by inspecting the checkpoint/config shape.
+The source run is read-only. Evaluation first seals six resumable HDF5 PSF
+databases, then derives weighted-MTF mean maps, PSF stitches, and chart stitches.
 """
 
 from __future__ import annotations
@@ -11,28 +10,40 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import platform
-import shutil
 import sys
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+import h5py
 import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
+import scipy
 import torch
-from scipy.interpolate import CubicSpline, RegularGridInterpolator
+from scipy.interpolate import CubicSpline
+from scipy.ndimage import gaussian_filter, zoom
 from scipy.signal import fftconvolve
 
 from optics import compute_dc_normalized_mtf
 from biot.e2e import pal_nurbs as pal
 
 
-EVAL_SCHEMA = 1
-FIELD_VALUES = tuple(float(v) for v in np.arange(-40.0, 40.0 + 0.1, 10.0))
+EVAL_SCHEMA = 2
+PSF_DATABASE_SCHEMA = 1
+STAGE_MANIFEST_SCHEMA = 1
+FIELD_VALUES = tuple(float(value) for value in np.arange(-40.0, 40.0 + 0.1, 10.0))
+FIELD_COUNT = len(FIELD_VALUES) ** 2
+RAW_SIZE_PX = 512
+RENDER_SIZE_PX = 130
+CROP_PHYSICAL_SIZE_MM = 0.184378803949209
+TILE_GAP_PX = 5
+PSF_DISPLAY_SMOOTH_SIGMA = 2.0
+FIGURE_DPI = 160
 COMMON_FREQ = np.linspace(0.0, 100.0, 1000, dtype=np.float64)
 CSF_MM_PER_DEG = 0.291
 CSF_F0 = 4.1726
@@ -50,6 +61,13 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _canonical_sha256(payload: Any) -> str:
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _json(path: Path) -> dict[str, Any]:
     value = json.loads(path.read_text(encoding="utf-8-sig"))
     if not isinstance(value, dict):
@@ -59,14 +77,12 @@ def _json(path: Path) -> dict[str, Any]:
 
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
-
-
-def _finite_array(name: str, value: np.ndarray) -> np.ndarray:
-    arr = np.asarray(value, dtype=np.float64)
-    if not np.isfinite(arr).all():
-        raise ValueError(f"{name} contains non-finite values")
-    return arr
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
 
 
 def _json_distance(value: Any) -> float | str:
@@ -83,7 +99,9 @@ def _load_config(run: Path, device: str) -> Any:
     return pal.MinimalConfig(**values)
 
 
-def _load_checkpoint(run: Path, summary: Mapping[str, Any], device: torch.device) -> tuple[Path, dict[str, Any]]:
+def _load_checkpoint(
+    run: Path, summary: Mapping[str, Any], device: torch.device
+) -> tuple[Path, dict[str, Any]]:
     if hasattr(pal, "DISTANCE_SPECS"):
         candidate = run / "final.pt"
     else:
@@ -99,7 +117,9 @@ def _load_checkpoint(run: Path, summary: Mapping[str, Any], device: torch.device
     return candidate, payload
 
 
-def _make_module(config: Any, device: torch.device, control_count: int | None = None) -> torch.nn.Module:
+def _make_module(
+    config: Any, device: torch.device, control_count: int | None = None
+) -> torch.nn.Module:
     if control_count is None:
         return pal.FixedWeightNURBSPerturbation(device=device, dtype=torch.float64)
     return pal.FixedWeightNURBSPerturbation(control_count, device=device, dtype=torch.float64)
@@ -107,36 +127,25 @@ def _make_module(config: Any, device: torch.device, control_count: int | None = 
 
 def _distance_cases(config: Any) -> list[tuple[str, float, list[dict[str, Any]]]]:
     if hasattr(pal, "DISTANCE_SPECS"):
-        specs = list(pal.DISTANCE_SPECS)
-        result = []
-        for spec in specs:
-            rows = []
-            for row, fy in enumerate(FIELD_VALUES):
-                for col, fx in enumerate(FIELD_VALUES):
-                    rows.append({
-                        "case_id": f"{spec.label}_r{row:02d}_c{col:02d}",
-                        "distance_label": spec.label,
-                        "field_x_deg": fx,
-                        "field_y_deg": fy,
-                    })
-            result.append((str(spec.label), float(spec.object_distance_mm), rows))
-        return result
-    # Evaluation is deliberately fixed to the new three-distance contract.
-    # This also lets a legacy main/run_001 be measured without rewriting its
-    # historical training config.
-    specs = (("D500", 500.0), ("D1000", 1000.0), ("Dinf", float("inf")))
-    result = []
+        specs = [(str(spec.label), float(spec.object_distance_mm)) for spec in pal.DISTANCE_SPECS]
+    else:
+        specs = [("D500", 500.0), ("D1000", 1000.0), ("Dinf", float("inf"))]
+    result: list[tuple[str, float, list[dict[str, Any]]]] = []
     for label, distance in specs:
-        rows = []
-        for row, fy in enumerate(FIELD_VALUES):
-            for col, fx in enumerate(FIELD_VALUES):
-                rows.append({
-                    "case_id": f"{label}_r{row:02d}_c{col:02d}",
-                    "distance_mm": distance,
-                    "field_x_deg": fx,
-                    "field_y_deg": fy,
-                })
-        result.append((label, distance, rows))
+        cases: list[dict[str, Any]] = []
+        for row, field_y in enumerate(FIELD_VALUES):
+            for column, field_x in enumerate(FIELD_VALUES):
+                case = {
+                    "case_id": f"{label}_r{row:02d}_c{column:02d}",
+                    "field_x_deg": field_x,
+                    "field_y_deg": field_y,
+                }
+                if hasattr(pal, "DISTANCE_SPECS"):
+                    case["distance_label"] = label
+                else:
+                    case["distance_mm"] = distance
+                cases.append(case)
+        result.append((label, distance, cases))
     return result
 
 
@@ -147,208 +156,922 @@ def _state_map(module: torch.nn.Module, state: Mapping[str, Any]) -> None:
     module.load_state_dict(dict(state), strict=True)
 
 
-def _plot_map(path: Path, values: np.ndarray, *, title: str, xlabel: str = "field X (deg)", ylabel: str = "field Y (deg)", symmetric: bool = False) -> None:
-    arr = np.asarray(values, dtype=np.float64)
-    fig, ax = plt.subplots(figsize=(7, 6), constrained_layout=True)
+def _plot_map(path: Path, values: np.ndarray, *, title: str, symmetric: bool = False) -> None:
+    array = np.asarray(values, dtype=np.float64)
+    figure, axis = plt.subplots(figsize=(7, 6), constrained_layout=True)
     if symmetric:
-        limit = float(np.nanmax(np.abs(arr)))
-        limit = max(limit, np.finfo(np.float64).eps)
-        image = ax.imshow(arr, origin="upper", extent=[-40, 40, -40, 40], cmap="coolwarm", vmin=-limit, vmax=limit)
+        limit = max(float(np.nanmax(np.abs(array))), np.finfo(np.float64).eps)
+        image = axis.imshow(
+            array, origin="upper", extent=[-40, 40, -40, 40], cmap="coolwarm",
+            vmin=-limit, vmax=limit,
+        )
     else:
-        image = ax.imshow(arr, origin="upper", extent=[-40, 40, -40, 40], cmap="viridis")
-    ax.set(title=title, xlabel=xlabel, ylabel=ylabel)
-    fig.colorbar(image, ax=ax)
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
+        image = axis.imshow(
+            array, origin="upper", extent=[-40, 40, -40, 40], cmap="viridis"
+        )
+    axis.set(title=title, xlabel="field X (deg)", ylabel="field Y (deg)")
+    figure.colorbar(image, ax=axis)
+    figure.savefig(path, dpi=150)
+    plt.close(figure)
 
 
-def _save_sag_and_averfang(root: Path, base_sag: torch.Tensor, module: torch.nn.Module, power_config: Any, zones: Mapping[str, torch.Tensor]) -> None:
+def _save_sag_and_averfang(
+    root: Path, base_sag: torch.Tensor, module: torch.nn.Module, power_config: Any
+) -> None:
     sag_dir = root / "sag"
     sag_dir.mkdir(parents=True, exist_ok=True)
     sag = base_sag.detach().cpu().numpy().astype(np.float64)
-    coord = torch.linspace(-float(power_config.semi_diameter_mm), float(power_config.semi_diameter_mm), sag.shape[0], dtype=torch.float64, device=base_sag.device)
+    coord = torch.linspace(
+        -float(power_config.semi_diameter_mm), float(power_config.semi_diameter_mm),
+        sag.shape[0], dtype=torch.float64, device=base_sag.device,
+    )
     yy, xx = torch.meshgrid(coord, coord, indexing="ij")
     delta = module.delta_raw(xx, yy).detach().cpu().numpy().astype(np.float64)
-    optimized = sag + delta
-    for name, value in (("baseline", sag), ("optimized", optimized), ("delta", delta)):
-        np.savez_compressed(sag_dir / f"{name}.npz", sag_mm=value, x_mm=coord.cpu().numpy(), physical_y_mm=coord.cpu().numpy()[::-1])
-        _plot_map(sag_dir / f"{name}.png", value * (1e6 if name == "delta" else 1.0), title=f"{name} sag ({'um' if name == 'delta' else 'mm'})", symmetric=name == "delta")
+    for name, value in (("baseline", sag), ("optimized", sag + delta), ("delta", delta)):
+        np.savez_compressed(
+            sag_dir / f"{name}.npz", sag_mm=value, x_mm=coord.cpu().numpy(),
+            physical_y_mm=coord.cpu().numpy()[::-1],
+        )
+        _plot_map(
+            sag_dir / f"{name}.png", value * (1e6 if name == "delta" else 1.0),
+            title=f"{name} sag ({'um' if name == 'delta' else 'mm'})",
+            symmetric=name == "delta",
+        )
     maps_dir = root / "averfang"
     maps_dir.mkdir(parents=True, exist_ok=True)
     outputs: dict[str, dict[str, np.ndarray]] = {}
-    for name, value in (("baseline", base_sag), ("optimized", base_sag + torch.as_tensor(delta, device=base_sag.device))):
+    for name, value in (
+        ("baseline", base_sag),
+        ("optimized", base_sag + torch.as_tensor(delta, device=base_sag.device)),
+    ):
         computed = pal.torch_averfang_maps(value, power_config)
-        outputs[name] = {key: computed[key].detach().cpu().numpy() for key in ("power_D", "A_D", "astigmatism_D")}
+        outputs[name] = {
+            key: computed[key].detach().cpu().numpy()
+            for key in ("power_D", "A_D", "astigmatism_D")
+        }
         np.savez_compressed(maps_dir / f"{name}.npz", **outputs[name])
-    outputs["delta"] = {key: outputs["optimized"][key] - outputs["baseline"][key] for key in outputs["baseline"]}
+    outputs["delta"] = {
+        key: outputs["optimized"][key] - outputs["baseline"][key]
+        for key in outputs["baseline"]
+    }
     np.savez_compressed(maps_dir / "delta.npz", **outputs["delta"])
     for key, label in (("power_D", "power (D)"), ("astigmatism_D", "astigmatism (D)")):
         for name in ("baseline", "optimized", "delta"):
-            _plot_map(maps_dir / f"{name}_{key}.png", outputs[name][key], title=f"{name} {label}", symmetric=name == "delta")
-    _write_json(maps_dir / "metadata.json", {"units": {"power_D": "D", "astigmatism_D": "D"}, "source": "PAL torch_averfang_maps"})
+            _plot_map(
+                maps_dir / f"{name}_{key}.png", outputs[name][key],
+                title=f"{name} {label}", symmetric=name == "delta",
+            )
+    _write_json(
+        maps_dir / "metadata.json",
+        {"units": {"power_D": "D", "A_D": "D", "astigmatism_D": "D"},
+         "source": "PAL torch_averfang_maps"},
+    )
+
+
+def _normalize_physical_psf(name: str, value: np.ndarray) -> np.ndarray:
+    array = np.asarray(value, dtype=np.float64)
+    if array.ndim != 2 or not np.isfinite(array).all():
+        raise ValueError(f"{name} must be a finite 2-D array")
+    if np.any(array < 0.0):
+        raise ValueError(f"{name} contains negative energy")
+    energy = float(array.sum())
+    if not math.isfinite(energy) or energy <= 0.0:
+        raise ValueError(f"{name} has invalid energy: {energy}")
+    if abs(energy - 1.0) > 1.0e-10:
+        raise ValueError(f"{name} energy is not normalized: {energy}")
+    return array
+
+
+def _normalize_psf_energy(name: str, value: np.ndarray) -> np.ndarray:
+    array = np.asarray(value, dtype=np.float64)
+    if array.ndim != 2 or not np.isfinite(array).all() or np.any(array < 0.0):
+        raise ValueError(f"{name} must be finite, non-negative, and 2-D")
+    energy = float(array.sum())
+    if not math.isfinite(energy) or energy <= 0.0:
+        raise ValueError(f"{name} has invalid energy: {energy}")
+    normalized = array / energy
+    if abs(float(normalized.sum()) - 1.0) > 1.0e-10:
+        raise ValueError(f"{name} energy normalization failed")
+    return normalized
+
+
+def _render_psf(raw_psf: np.ndarray, raw_pixel_pitch_mm: float) -> tuple[np.ndarray, float]:
+    raw = _normalize_physical_psf("raw PSF", raw_psf)
+    pitch = float(raw_pixel_pitch_mm)
+    if not math.isfinite(pitch) or pitch <= 0.0:
+        raise ValueError(f"invalid raw pixel pitch: {pitch}")
+    crop_size_px = max(1, round(CROP_PHYSICAL_SIZE_MM / pitch))
+    height, width = raw.shape
+    if crop_size_px > height or crop_size_px > width:
+        raise ValueError(
+            "raw PSF support is smaller than the required physical crop: "
+            f"required={CROP_PHYSICAL_SIZE_MM:.15g} mm, "
+            f"available={min(height, width) * pitch:.15g} mm"
+        )
+    center_x, center_y = (width + 1) / 2.0, (height + 1) / 2.0
+    x_start = max(1, math.floor(center_x - crop_size_px / 2.0))
+    y_start = max(1, math.floor(center_y - crop_size_px / 2.0))
+    x_end = min(width, x_start + crop_size_px - 1)
+    y_end = min(height, y_start + crop_size_px - 1)
+    x_start = max(1, x_end - crop_size_px + 1)
+    y_start = max(1, y_end - crop_size_px + 1)
+    crop = _normalize_psf_energy(
+        "physical crop", raw[y_start - 1 : y_end, x_start - 1 : x_end]
+    )
+    if crop.shape != (crop_size_px, crop_size_px):
+        raise ValueError(f"physical crop shape is inconsistent: {crop.shape}")
+    resized = crop.copy() if crop.shape == (RENDER_SIZE_PX, RENDER_SIZE_PX) else zoom(
+        crop, (RENDER_SIZE_PX / crop.shape[0], RENDER_SIZE_PX / crop.shape[1]),
+        order=3, mode="nearest", prefilter=True,
+    )
+    if resized.shape != (RENDER_SIZE_PX, RENDER_SIZE_PX):
+        raise ValueError(f"render PSF resize produced wrong shape: {resized.shape}")
+    render = _normalize_psf_energy("render PSF", np.maximum(resized, 0.0))
+    return render, float(crop_size_px * pitch / RENDER_SIZE_PX)
+
+
+def _native_psf(result: Any) -> tuple[np.ndarray, float, float]:
+    """Use the explicit branch contract; never guess or fall back between fields."""
+    if hasattr(pal, "DISTANCE_SPECS"):
+        tensor, pitch = result.psf, result.pixel_pitch_mm
+    else:
+        tensor, pitch = result.raw_psf, result.raw_pixel_pitch_mm
+        if tensor is None or pitch is None:
+            raise RuntimeError("main FieldResult lacks its required raw FFT PSF contract")
+    return (
+        tensor.detach().cpu().numpy().astype(np.float64),
+        float(torch.as_tensor(pitch).detach().cpu()),
+        float(result.valid_fraction.detach().cpu()),
+    )
+
+
+def _node_sha256(
+    field_xy: np.ndarray, raw_psf: np.ndarray, render_psf: np.ndarray,
+    raw_pitch: float, render_pitch: float, valid_fraction: float,
+) -> str:
+    digest = hashlib.sha256()
+    values = (
+        ("field_xy_deg", np.asarray(field_xy, dtype="<f8")),
+        ("raw_psf", np.asarray(raw_psf, dtype="<f8")),
+        ("render_psf", np.asarray(render_psf, dtype="<f8")),
+        ("scalars", np.asarray([raw_pitch, render_pitch, valid_fraction], dtype="<f8")),
+    )
+    for name, value in values:
+        digest.update(name.encode("ascii"))
+        digest.update(np.asarray(value.shape, dtype="<i8").tobytes())
+        digest.update(np.ascontiguousarray(value).tobytes())
+    return digest.hexdigest()
+
+
+def _condition_contract(
+    *, label: str, distance: float, state: str,
+    identity_sha256: str, checkpoint_sha256: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": PSF_DATABASE_SCHEMA,
+        "evaluation_identity_sha256": identity_sha256,
+        "source_checkpoint_sha256": checkpoint_sha256,
+        "condition": f"{label}_{state}",
+        "distance_label": label,
+        "object_distance_mm": _json_distance(distance),
+        "state": state,
+        "field_values_deg": list(FIELD_VALUES),
+        "raw_shape": [RAW_SIZE_PX, RAW_SIZE_PX],
+        "render_shape": [RENDER_SIZE_PX, RENDER_SIZE_PX],
+        "crop_physical_size_mm": CROP_PHYSICAL_SIZE_MM,
+        "orientation": "BIOT physical arrays; field rows stored in ascending Y",
+    }
+
+
+def _create_partial_database(path: Path, contract: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fields = np.asarray(
+        [(x, y) for y in FIELD_VALUES for x in FIELD_VALUES], dtype=np.float64
+    )
+    with h5py.File(path, "x") as handle:
+        handle.attrs["contract_json"] = json.dumps(
+            contract, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+        )
+        handle.attrs["contract_sha256"] = _canonical_sha256(contract)
+        handle.attrs["status"] = "running"
+        handle.create_dataset("field_xy_deg", data=fields, dtype="f8")
+        handle.create_dataset(
+            "raw_psf", shape=(FIELD_COUNT, RAW_SIZE_PX, RAW_SIZE_PX), dtype="f8",
+            chunks=(1, RAW_SIZE_PX, RAW_SIZE_PX), compression="gzip",
+            compression_opts=4, shuffle=True, fillvalue=np.nan,
+        )
+        handle.create_dataset(
+            "render_psf", shape=(FIELD_COUNT, RENDER_SIZE_PX, RENDER_SIZE_PX), dtype="f8",
+            chunks=(1, RENDER_SIZE_PX, RENDER_SIZE_PX), compression="gzip",
+            compression_opts=4, shuffle=True, fillvalue=np.nan,
+        )
+        for name in ("raw_pixel_pitch_mm", "render_pixel_pitch_mm", "valid_fraction"):
+            handle.create_dataset(name, shape=(FIELD_COUNT,), dtype="f8", fillvalue=np.nan)
+        handle.create_dataset("completed", shape=(FIELD_COUNT,), dtype="u1", fillvalue=0)
+        handle.create_dataset("node_sha256", shape=(FIELD_COUNT,), dtype="S64")
+        handle.flush()
+
+
+def _validate_contract(handle: h5py.File, contract: Mapping[str, Any]) -> None:
+    if str(handle.attrs.get("contract_sha256", "")) != _canonical_sha256(contract):
+        raise ValueError(f"PSF database contract mismatch: {handle.filename}")
+    if json.loads(str(handle.attrs.get("contract_json", ""))) != dict(contract):
+        raise ValueError(f"PSF database contract payload mismatch: {handle.filename}")
+    expected = {
+        "field_xy_deg": (FIELD_COUNT, 2),
+        "raw_psf": (FIELD_COUNT, RAW_SIZE_PX, RAW_SIZE_PX),
+        "render_psf": (FIELD_COUNT, RENDER_SIZE_PX, RENDER_SIZE_PX),
+        "raw_pixel_pitch_mm": (FIELD_COUNT,), "render_pixel_pitch_mm": (FIELD_COUNT,),
+        "valid_fraction": (FIELD_COUNT,), "completed": (FIELD_COUNT,),
+        "node_sha256": (FIELD_COUNT,),
+    }
+    if set(handle.keys()) != set(expected):
+        raise ValueError(f"PSF database datasets differ from schema: {handle.filename}")
+    for name, shape in expected.items():
+        if handle[name].shape != shape:
+            raise ValueError(f"PSF database dataset {name} has wrong shape: {handle[name].shape}")
+
+
+def _validate_database_node(
+    handle: h5py.File, index: int, *, verify_render_contract: bool
+) -> None:
+    if int(handle["completed"][index]) != 1:
+        raise ValueError(f"PSF database node {index} is incomplete")
+    field_xy = np.asarray(handle["field_xy_deg"][index], dtype=np.float64)
+    expected_field = np.asarray(
+        (FIELD_VALUES[index % len(FIELD_VALUES)], FIELD_VALUES[index // len(FIELD_VALUES)]),
+        dtype=np.float64,
+    )
+    if not np.array_equal(field_xy, expected_field):
+        raise ValueError(f"PSF database node {index} field coordinate mismatch")
+    raw = _normalize_physical_psf("stored raw PSF", handle["raw_psf"][index])
+    render = _normalize_physical_psf("stored render PSF", handle["render_psf"][index])
+    if raw.shape != (RAW_SIZE_PX, RAW_SIZE_PX) or render.shape != (RENDER_SIZE_PX, RENDER_SIZE_PX):
+        raise ValueError(f"PSF database node {index} shape mismatch")
+    raw_pitch = float(handle["raw_pixel_pitch_mm"][index])
+    render_pitch = float(handle["render_pixel_pitch_mm"][index])
+    valid_fraction = float(handle["valid_fraction"][index])
+    if not math.isfinite(raw_pitch) or raw_pitch <= 0.0:
+        raise ValueError(f"PSF database node {index} raw pixel pitch is invalid")
+    if not math.isfinite(render_pitch) or render_pitch <= 0.0:
+        raise ValueError(f"PSF database node {index} render pixel pitch is invalid")
+    if not math.isfinite(valid_fraction) or not 0.0 <= valid_fraction <= 1.0:
+        raise ValueError(f"PSF database node {index} valid fraction is invalid")
+    if verify_render_contract:
+        expected_render, expected_pitch = _render_psf(raw, raw_pitch)
+        if not np.allclose(render, expected_render, rtol=1e-12, atol=1e-12):
+            raise ValueError(f"PSF database node {index} render PSF contract mismatch")
+        if not math.isclose(render_pitch, expected_pitch, rel_tol=1e-12, abs_tol=1e-15):
+            raise ValueError(f"PSF database node {index} render pitch contract mismatch")
+    expected_hash = _node_sha256(field_xy, raw, render, raw_pitch, render_pitch, valid_fraction)
+    saved_hash = bytes(handle["node_sha256"][index]).decode("ascii")
+    if saved_hash != expected_hash:
+        raise ValueError(f"PSF database node {index} SHA-256 mismatch")
+
+
+def _validate_condition_file(
+    path: Path, contract: Mapping[str, Any], *, verify_render_contract: bool
+) -> None:
+    with h5py.File(path, "r") as handle:
+        _validate_contract(handle, contract)
+        if str(handle.attrs.get("status", "")) != "complete":
+            raise ValueError(f"PSF database condition is not complete: {path}")
+        for index in range(FIELD_COUNT):
+            _validate_database_node(handle, index, verify_render_contract=verify_render_contract)
+
+
+def _write_database_state(
+    root: Path, *, identity_sha256: str, status: str,
+    completed_conditions: int, completed_nodes: int, current_condition: str | None,
+) -> None:
+    _write_json(
+        root / "psf_database_state.json",
+        {"schema_version": PSF_DATABASE_SCHEMA, "status": status,
+         "identity_sha256": identity_sha256, "completed_conditions": completed_conditions,
+         "total_conditions": 6, "completed_nodes": completed_nodes,
+         "total_nodes": 6 * FIELD_COUNT, "current_condition": current_condition},
+    )
+
+
+def _build_condition_database(
+    root: Path, *, label: str, distance: float, state: str,
+    cases: Sequence[Mapping[str, Any]], model: Any, identity_sha256: str,
+    checkpoint_sha256: str, resume: bool, completed_conditions: int,
+) -> Path:
+    final_path = root / f"{label}_{state}.h5"
+    partial_path = root / f"{label}_{state}.partial.h5"
+    contract = _condition_contract(
+        label=label, distance=distance, state=state,
+        identity_sha256=identity_sha256, checkpoint_sha256=checkpoint_sha256,
+    )
+    if final_path.is_file():
+        if partial_path.exists():
+            raise ValueError(f"both final and partial PSF databases exist for {label}/{state}")
+        _validate_condition_file(final_path, contract, verify_render_contract=True)
+        return final_path
+    if partial_path.exists() and not resume:
+        raise FileExistsError(f"partial PSF database exists; use --resume: {partial_path}")
+    if not partial_path.exists():
+        _create_partial_database(partial_path, contract)
+    with h5py.File(partial_path, "r+") as handle:
+        _validate_contract(handle, contract)
+        if str(handle.attrs.get("status", "")) != "running":
+            raise ValueError(f"partial PSF database has invalid status: {partial_path}")
+        for index, case in enumerate(cases):
+            if int(handle["completed"][index]) == 1:
+                _validate_database_node(handle, index, verify_render_contract=True)
+                continue
+            with torch.no_grad():
+                field_result = model.field(case)
+            raw, raw_pitch, valid_fraction = _native_psf(field_result)
+            raw = _normalize_physical_psf("native raw PSF", raw)
+            if raw.shape != (RAW_SIZE_PX, RAW_SIZE_PX):
+                raise ValueError(
+                    f"native raw PSF for {case['case_id']} has shape {raw.shape}, "
+                    f"expected {(RAW_SIZE_PX, RAW_SIZE_PX)}"
+                )
+            render, render_pitch = _render_psf(raw, raw_pitch)
+            field_xy = np.asarray(
+                [float(case["field_x_deg"]), float(case["field_y_deg"])], dtype=np.float64
+            )
+            digest = _node_sha256(field_xy, raw, render, raw_pitch, render_pitch, valid_fraction)
+            handle["raw_psf"][index] = raw
+            handle["render_psf"][index] = render
+            handle["raw_pixel_pitch_mm"][index] = raw_pitch
+            handle["render_pixel_pitch_mm"][index] = render_pitch
+            handle["valid_fraction"][index] = valid_fraction
+            handle["node_sha256"][index] = digest.encode("ascii")
+            handle.flush()
+            handle["completed"][index] = 1
+            handle.flush()
+            _write_database_state(
+                root, identity_sha256=identity_sha256, status="running",
+                completed_conditions=completed_conditions,
+                completed_nodes=completed_conditions * FIELD_COUNT + int(handle["completed"][:].sum()),
+                current_condition=f"{label}_{state}",
+            )
+        for index in range(FIELD_COUNT):
+            _validate_database_node(handle, index, verify_render_contract=True)
+        handle.attrs["status"] = "complete"
+        handle.flush()
+    os.replace(partial_path, final_path)
+    _validate_condition_file(final_path, contract, verify_render_contract=True)
+    return final_path
+
+
+def _database_conditions(config: Any) -> list[tuple[str, float, str, list[dict[str, Any]]]]:
+    return [
+        (label, distance, state, cases)
+        for label, distance, cases in _distance_cases(config)
+        for state in ("baseline", "optimized")
+    ]
+
+
+def _build_psf_database(
+    evaluation: Path, *, config: Any, modules: Mapping[str, torch.nn.Module],
+    identity_sha256: str, checkpoint_sha256: str, resume: bool,
+) -> Path:
+    root = evaluation / "psf_database"
+    root.mkdir(parents=True, exist_ok=True)
+    manifest_path = root / "psf_database_manifest.json"
+    state_path = root / "psf_database_state.json"
+    if manifest_path.is_file():
+        _validate_psf_database(evaluation, config=config, identity_sha256=identity_sha256)
+        return manifest_path
+    if state_path.is_file() and not resume:
+        raise FileExistsError(f"PSF database state exists; use --resume: {state_path}")
+    _write_database_state(
+        root, identity_sha256=identity_sha256, status="running",
+        completed_conditions=0, completed_nodes=0, current_condition=None,
+    )
+    files: list[dict[str, Any]] = []
+    for index, (label, distance, state, cases) in enumerate(_database_conditions(config)):
+        model = pal.MinimalOpticalModel(config, modules[state])
+        try:
+            path = _build_condition_database(
+                root, label=label, distance=distance, state=state, cases=cases,
+                model=model, identity_sha256=identity_sha256,
+                checkpoint_sha256=checkpoint_sha256, resume=resume,
+                completed_conditions=index,
+            )
+        finally:
+            model.close()
+        files.append(
+            {"condition": f"{label}_{state}", "path": path.name,
+             "sha256": _sha256(path), "size": path.stat().st_size}
+        )
+        _write_database_state(
+            root, identity_sha256=identity_sha256, status="running",
+            completed_conditions=index + 1, completed_nodes=(index + 1) * FIELD_COUNT,
+            current_condition=None,
+        )
+    _write_json(
+        manifest_path,
+        {"schema_version": PSF_DATABASE_SCHEMA, "status": "complete",
+         "identity_sha256": identity_sha256, "condition_count": len(files), "files": files},
+    )
+    _write_database_state(
+        root, identity_sha256=identity_sha256, status="complete",
+        completed_conditions=6, completed_nodes=6 * FIELD_COUNT, current_condition=None,
+    )
+    _validate_psf_database(evaluation, config=config, identity_sha256=identity_sha256)
+    return manifest_path
+
+
+def _validate_psf_database(
+    evaluation: Path, *, config: Any, identity_sha256: str
+) -> dict[str, Any]:
+    root = evaluation / "psf_database"
+    state = _json(root / "psf_database_state.json")
+    manifest = _json(root / "psf_database_manifest.json")
+    if state.get("status") != "complete" or manifest.get("status") != "complete":
+        raise ValueError("PSF database is not complete")
+    if state.get("identity_sha256") != identity_sha256 or manifest.get("identity_sha256") != identity_sha256:
+        raise ValueError("PSF database identity mismatch")
+    expected = _database_conditions(config)
+    records = list(manifest.get("files", []))
+    if len(records) != len(expected) or int(manifest.get("condition_count", -1)) != 6:
+        raise ValueError("PSF database manifest does not contain exactly six conditions")
+    by_condition = {str(record.get("condition")): record for record in records}
+    checkpoint_sha256 = str(_json(evaluation / "evaluation_identity.json")["checkpoint_sha256"])
+    for label, distance, state_name, _ in expected:
+        condition = f"{label}_{state_name}"
+        if condition not in by_condition:
+            raise ValueError(f"PSF database manifest lacks {condition}")
+        record = by_condition[condition]
+        path = root / str(record["path"])
+        if not path.is_file() or _sha256(path) != str(record["sha256"]):
+            raise ValueError(f"PSF database file hash mismatch: {condition}")
+        contract = _condition_contract(
+            label=label, distance=distance, state=state_name,
+            identity_sha256=identity_sha256, checkpoint_sha256=checkpoint_sha256,
+        )
+        _validate_condition_file(path, contract, verify_render_contract=False)
+    return manifest
 
 
 def _weighted_mtf(psf: np.ndarray, pitch_mm: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    psf = _finite_array("PSF", psf)
-    if np.any(psf < -1e-15) or psf.sum() <= 0.0:
-        raise ValueError("PSF must be non-negative with positive energy")
-    psf = np.maximum(psf, 0.0)
-    psf /= psf.sum()
+    psf = _normalize_physical_psf("weighted-MTF PSF", psf)
     mtf = np.asarray(compute_dc_normalized_mtf(psf), dtype=np.float64)
-    n = int(mtf.shape[0])
-    center = n // 2
-    freq = (1.0 / ((n + 1) * float(pitch_mm))) * np.arange(center + 1, dtype=np.float64)
-    sag = mtf[center, center : center + center + 1]
-    tan = mtf[center : center + center + 1, center]
-    if freq[-1] < 100.0:
-        raise ValueError(f"native MTF support ends at {freq[-1]:g} cycles/mm, below 100")
-    freq = freq[: min(freq.size, sag.size, tan.size)]
-    sag = np.clip(np.asarray(sag[: freq.size], dtype=np.float64), 0.0, 1.0)
-    tan = np.clip(np.asarray(tan[: freq.size], dtype=np.float64), 0.0, 1.0)
-    sag_i = CubicSpline(freq, sag, extrapolate=False)(COMMON_FREQ)
-    tan_i = CubicSpline(freq, tan, extrapolate=False)(COMMON_FREQ)
-    if not np.isfinite(sag_i).all() or not np.isfinite(tan_i).all():
+    size, center = int(mtf.shape[0]), int(mtf.shape[0]) // 2
+    frequency = (1.0 / ((size + 1) * float(pitch_mm))) * np.arange(center + 1)
+    sagittal = mtf[center, center : center + center + 1]
+    tangential = mtf[center : center + center + 1, center]
+    count = min(frequency.size, sagittal.size, tangential.size)
+    frequency = np.asarray(frequency[:count], dtype=np.float64)
+    sagittal = np.clip(np.asarray(sagittal[:count], dtype=np.float64), 0.0, 1.0)
+    tangential = np.clip(np.asarray(tangential[:count], dtype=np.float64), 0.0, 1.0)
+    if frequency[-1] < 100.0:
+        raise ValueError(f"native MTF support ends at {frequency[-1]:g} cycles/mm, below 100")
+    sagittal_common = CubicSpline(frequency, sagittal, extrapolate=False)(COMMON_FREQ)
+    tangential_common = CubicSpline(frequency, tangential, extrapolate=False)(COMMON_FREQ)
+    if not np.isfinite(sagittal_common).all() or not np.isfinite(tangential_common).all():
         raise ValueError("MTF interpolation produced non-finite values")
-    cpdeg = COMMON_FREQ * CSF_MM_PER_DEG
-    sech = lambda x: 1.0 / np.cosh(x)
-    weight = np.maximum(CSF_GAIN * (sech((cpdeg / CSF_F0) ** CSF_P) - CSF_A * sech(cpdeg / CSF_F1)), 0.0)
-    norm = float(np.trapz(weight, COMMON_FREQ))
-    if not math.isfinite(norm) or norm <= 0.0:
+    cycles_per_degree = COMMON_FREQ * CSF_MM_PER_DEG
+    sech = lambda value: 1.0 / np.cosh(value)
+    weight = np.maximum(
+        CSF_GAIN * (sech((cycles_per_degree / CSF_F0) ** CSF_P)
+                    - CSF_A * sech(cycles_per_degree / CSF_F1)), 0.0,
+    )
+    normalization = float(np.trapz(weight, COMMON_FREQ))
+    if not math.isfinite(normalization) or normalization <= 0.0:
         raise ValueError("Ahumada CSF normalization is invalid")
-    sag_score = float(np.trapz(weight * sag_i, COMMON_FREQ) / norm)
-    tan_score = float(np.trapz(weight * tan_i, COMMON_FREQ) / norm)
-    return np.asarray([sag_score, tan_score, 0.5 * (sag_score + tan_score)]), sag_i, tan_i
+    sagittal_score = float(np.trapz(weight * sagittal_common, COMMON_FREQ) / normalization)
+    tangential_score = float(np.trapz(weight * tangential_common, COMMON_FREQ) / normalization)
+    return (
+        np.asarray([sagittal_score, tangential_score,
+                    0.5 * (sagittal_score + tangential_score)]),
+        sagittal_common, tangential_common,
+    )
 
 
-def _save_stitches(root: Path, label: str, records: Sequence[Mapping[str, Any]], target: np.ndarray) -> None:
-    out = root / "stitches"
-    out.mkdir(parents=True, exist_ok=True)
-    for state in ("baseline", "optimized"):
-        canvas_psf = np.zeros((9 * 130, 9 * 130), dtype=np.float64)
-        canvas_chart = np.zeros_like(canvas_psf)
-        for record in records:
-            if record["state"] != state:
-                continue
-            tile = np.asarray(record["psf"], dtype=np.float64)
-            chart = fftconvolve(target, tile, mode="same")
-            row = int(record["row"])
-            col = int(record["col"])
-            y0, x0 = row * 130, col * 130
-            canvas_psf[y0:y0 + 130, x0:x0 + 130] = tile
-            canvas_chart[y0:y0 + 130, x0:x0 + 130] = chart
-        for name, image in (("psf_stitch", canvas_psf), ("chart_stitch", canvas_chart)):
-            np.savez_compressed(out / f"{label}_{state}_{name}.npz", image=image)
-            fig, ax = plt.subplots(figsize=(10, 10), constrained_layout=True)
-            ax.imshow(image, origin="upper", cmap="gray")
-            ax.set(title=f"{label} {state} {name}")
-            fig.savefig(out / f"{label}_{state}_{name}.png", dpi=120)
-            plt.close(fig)
+def _stage_is_complete(path: Path, config: Mapping[str, Any]) -> bool:
+    if not path.is_file():
+        return False
+    manifest = _json(path)
+    if manifest.get("status") != "complete" or manifest.get("config_sha256") != _canonical_sha256(config):
+        return False
+    for record in manifest.get("files", []):
+        artifact = path.parent / str(record["path"])
+        if not artifact.is_file() or _sha256(artifact) != str(record["sha256"]):
+            raise ValueError(f"completed stage artifact hash mismatch: {artifact}")
+    return True
 
 
-def evaluate(run: Path, *, device_name: str, resume: bool) -> Path:
+def _write_stage_manifest(
+    path: Path, *, config: Mapping[str, Any], files: Sequence[Path]
+) -> None:
+    _write_json(
+        path,
+        {"schema_version": STAGE_MANIFEST_SCHEMA, "status": "complete",
+         "config": dict(config), "config_sha256": _canonical_sha256(config),
+         "files": [
+             {"path": artifact.relative_to(path.parent).as_posix(),
+              "sha256": _sha256(artifact), "size": artifact.stat().st_size}
+             for artifact in sorted(files)
+         ]},
+    )
+
+
+def _condition_path(evaluation: Path, label: str, state: str) -> Path:
+    return evaluation / "psf_database" / f"{label}_{state}.h5"
+
+
+def _run_weighted_mtf(
+    evaluation: Path, *, config: Any, identity_sha256: str, database_sha256: str
+) -> None:
+    output = evaluation / "weighted_mtf"
+    output.mkdir(parents=True, exist_ok=True)
+    stage_config = {
+        "identity_sha256": identity_sha256,
+        "psf_database_manifest_sha256": database_sha256,
+        "algorithm": "Ahumada-1D mean of sagittal/tangential",
+        "frequency_support_cycles_per_mm": [0.0, 100.0],
+        "samples": len(COMMON_FREQ), "published_maps": "mean_only",
+    }
+    manifest_path = output / "weighted_mtf_manifest.json"
+    if _stage_is_complete(manifest_path, stage_config):
+        return
+    files: list[Path] = []
+    for label, _, _ in _distance_cases(config):
+        maps: dict[str, np.ndarray] = {}
+        for state in ("baseline", "optimized"):
+            with h5py.File(_condition_path(evaluation, label, state), "r") as handle:
+                scores = [
+                    _weighted_mtf(handle["raw_psf"][index],
+                                  float(handle["raw_pixel_pitch_mm"][index]))[0][2]
+                    for index in range(FIELD_COUNT)
+                ]
+            maps[state] = np.asarray(scores).reshape(len(FIELD_VALUES), len(FIELD_VALUES))[::-1]
+        maps["delta"] = maps["optimized"] - maps["baseline"]
+        for state in ("baseline", "optimized", "delta"):
+            numeric = output / f"{label}_{state}_mean_map.npz"
+            image = output / f"{label}_{state}_mean.png"
+            np.savez_compressed(
+                numeric, mean=maps[state], field_x_deg=np.asarray(FIELD_VALUES),
+                field_y_deg=np.asarray(FIELD_VALUES[::-1]),
+            )
+            _plot_map(image, maps[state], title=f"{label} {state} weighted MTF mean",
+                      symmetric=state == "delta")
+            files.extend((numeric, image))
+    _write_stage_manifest(manifest_path, config=stage_config, files=files)
+
+
+def _normalize_display(image: np.ndarray) -> np.ndarray:
+    array = np.asarray(image, dtype=np.float64)
+    if not np.isfinite(array).all():
+        raise ValueError("display image contains non-finite values")
+    minimum, maximum = float(array.min()), float(array.max())
+    return np.zeros_like(array) if maximum <= minimum else (array - minimum) / (maximum - minimum)
+
+
+def _resize_for_blur_control(image: np.ndarray, target_shape: tuple[int, int]) -> np.ndarray:
+    array = np.asarray(image, dtype=np.float64)
+    if array.ndim != 2:
+        raise ValueError(f"expected a 2-D display image, got {array.shape}")
+    target_height, target_width = int(target_shape[0]), int(target_shape[1])
+    if target_height < 1 or target_width < 1:
+        raise ValueError(f"invalid display target shape: {target_shape}")
+    if array.shape == (target_height, target_width):
+        return array.copy()
+    resized = zoom(
+        array, (target_height / array.shape[0], target_width / array.shape[1]),
+        order=1, mode="nearest", prefilter=False,
+    )
+    if resized.shape != (target_height, target_width):
+        raise ValueError(f"display resize produced wrong shape: {resized.shape}")
+    return resized
+
+
+def _zero_pad_center(image: np.ndarray, target_shape: tuple[int, int]) -> np.ndarray:
+    array = np.asarray(image, dtype=np.float64)
+    target_height, target_width = int(target_shape[0]), int(target_shape[1])
+    if target_height < array.shape[0] or target_width < array.shape[1]:
+        raise ValueError(f"padding target {target_shape} is smaller than {array.shape}")
+    padded = np.zeros((target_height, target_width), dtype=np.float64)
+    row, column = (target_height - array.shape[0]) // 2, (target_width - array.shape[1]) // 2
+    padded[row : row + array.shape[0], column : column + array.shape[1]] = array
+    return padded
+
+
+def _five_degree_ticks(values: np.ndarray) -> np.ndarray:
+    low = int(np.ceil(float(values.min()) / 5.0) * 5)
+    high = int(np.floor(float(values.max()) / 5.0) * 5)
+    ticks = np.arange(low, high + 1, 5, dtype=int)
+    return ticks if ticks.size else values
+
+
+def _style_stitch_axis(axis: Any, fields: np.ndarray) -> None:
+    axis.set_xlabel("field X (Degrees)", fontfamily="Times New Roman", fontsize=18)
+    axis.set_ylabel("field Y (Degrees)", fontfamily="Times New Roman", fontsize=18)
+    axis.set_xticks(_five_degree_ticks(fields))
+    axis.set_yticks(_five_degree_ticks(fields))
+    axis.tick_params(direction="in", top=True, right=True, labelsize=14)
+    for tick in axis.get_xticklabels() + axis.get_yticklabels():
+        tick.set_fontfamily("Times New Roman")
+    for spine in axis.spines.values():
+        spine.set_linewidth(0.8)
+
+
+def _stitch_canvas(tiles: np.ndarray, field_xy: np.ndarray) -> np.ndarray:
+    values_x = np.asarray(sorted(set(float(value) for value in field_xy[:, 0])))
+    values_y = np.asarray(sorted(set(float(value) for value in field_xy[:, 1])))
+    if values_x.size != len(FIELD_VALUES) or values_y.size != len(FIELD_VALUES):
+        raise ValueError("stitch field grid is incomplete")
+    side = RENDER_SIZE_PX
+    canvas = np.zeros(
+        (values_y.size * side + (values_y.size - 1) * TILE_GAP_PX,
+         values_x.size * side + (values_x.size - 1) * TILE_GAP_PX), dtype=np.float64,
+    )
+    for index, (field_x, field_y) in enumerate(field_xy):
+        row = values_y.size - 1 - int(np.where(values_y == field_y)[0][0])
+        column = int(np.where(values_x == field_x)[0][0])
+        row_start, column_start = row * (side + TILE_GAP_PX), column * (side + TILE_GAP_PX)
+        canvas[row_start : row_start + side, column_start : column_start + side] = tiles[index]
+    return canvas
+
+
+def _save_psf_stitch_figure(path: Path, image: np.ndarray) -> None:
+    fields = np.asarray(FIELD_VALUES)
+    smoothed = gaussian_filter(image, sigma=PSF_DISPLAY_SMOOTH_SIGMA)
+    figure, axis = plt.subplots(figsize=(8.4, 6.3), dpi=FIGURE_DPI)
+    shown = axis.imshow(
+        smoothed, extent=[fields.min(), fields.max(), fields.min(), fields.max()],
+        origin="upper", cmap="jet", vmin=0.0, vmax=float(np.nanmax(smoothed)), aspect="auto",
+    )
+    _style_stitch_axis(axis, fields)
+    colorbar = figure.colorbar(shown, ax=axis, fraction=0.046, pad=0.04)
+    colorbar.ax.tick_params(direction="in", labelsize=12)
+    for tick in colorbar.ax.get_yticklabels():
+        tick.set_fontfamily("Times New Roman")
+    figure.tight_layout()
+    figure.savefig(path, dpi=FIGURE_DPI, bbox_inches="tight")
+    plt.close(figure)
+
+
+def _save_chart_stitch_figure(path: Path, image: np.ndarray) -> None:
+    fields = np.asarray(FIELD_VALUES)
+    display = 1.0 - _normalize_display(image)
+    figure, axis = plt.subplots(figsize=(8.4, 6.3), dpi=FIGURE_DPI)
+    shown = axis.imshow(
+        display, extent=[fields.min(), fields.max(), fields.min(), fields.max()],
+        origin="upper", cmap="gray_r", vmin=0.0, vmax=1.0, aspect="auto",
+    )
+    _style_stitch_axis(axis, fields)
+    colorbar = figure.colorbar(shown, ax=axis, fraction=0.046, pad=0.04)
+    colorbar.set_ticks([0.0, 0.5, 1.0])
+    colorbar.ax.invert_yaxis()
+    colorbar.ax.tick_params(direction="in", labelsize=12)
+    for tick in colorbar.ax.get_yticklabels():
+        tick.set_fontfamily("Times New Roman")
+    figure.tight_layout()
+    figure.savefig(path, dpi=FIGURE_DPI, bbox_inches="tight")
+    plt.close(figure)
+
+
+def _run_psf_stitches(
+    evaluation: Path, *, config: Any, identity_sha256: str, database_sha256: str
+) -> None:
+    output = evaluation / "stitches" / "psf"
+    output.mkdir(parents=True, exist_ok=True)
+    stage_config = {
+        "identity_sha256": identity_sha256,
+        "psf_database_manifest_sha256": database_sha256,
+        "source_dataset": "render_psf", "tile_gap_px": TILE_GAP_PX,
+        "display_smooth_sigma": PSF_DISPLAY_SMOOTH_SIGMA, "origin": "upper",
+        "dpi": FIGURE_DPI,
+    }
+    manifest_path = output / "psf_stitch_manifest.json"
+    if _stage_is_complete(manifest_path, stage_config):
+        return
+    files: list[Path] = []
+    for label, _, _ in _distance_cases(config):
+        for state in ("baseline", "optimized"):
+            with h5py.File(_condition_path(evaluation, label, state), "r") as handle:
+                canvas = _stitch_canvas(handle["render_psf"][:], handle["field_xy_deg"][:])
+            numeric, image = (
+                output / f"{label}_{state}_psf_stitch.npz",
+                output / f"{label}_{state}_psf_stitch.png",
+            )
+            np.savez_compressed(numeric, image=canvas)
+            _save_psf_stitch_figure(image, canvas)
+            files.extend((numeric, image))
+    _write_stage_manifest(manifest_path, config=stage_config, files=files)
+
+
+def _chart_tile(chart: np.ndarray, render_psf: np.ndarray, blur_scale: float) -> np.ndarray:
+    psf = _normalize_physical_psf("chart render PSF", render_psf)
+    if blur_scale == 1.0:
+        simulated = fftconvolve(chart, psf, mode="same")
+    else:
+        scaled_shape = (
+            max(chart.shape[0], int(round(chart.shape[0] * blur_scale))),
+            max(chart.shape[1], int(round(chart.shape[1] * blur_scale))),
+        )
+        simulated = _resize_for_blur_control(
+            fftconvolve(_resize_for_blur_control(chart, scaled_shape),
+                        _zero_pad_center(psf, scaled_shape), mode="same"), chart.shape,
+        )
+    return _normalize_display(simulated)
+
+
+def _run_chart_stitches(
+    evaluation: Path, *, config: Any, identity_sha256: str, database_sha256: str,
+    target_path: Path, blur_scale: float,
+) -> None:
+    if not math.isfinite(blur_scale) or blur_scale < 1.0:
+        raise ValueError(f"blur_scale must be finite and >= 1, got {blur_scale!r}")
+    target = pd.read_excel(target_path, header=None, engine="openpyxl").to_numpy(dtype=np.float64)
+    if target.shape != (RENDER_SIZE_PX, RENDER_SIZE_PX):
+        raise ValueError(f"E1.xlsx must be {RENDER_SIZE_PX}x{RENDER_SIZE_PX}, got {target.shape}")
+    target = _normalize_display(target)
+    output = evaluation / "stitches" / "chart"
+    output.mkdir(parents=True, exist_ok=True)
+    stage_config = {
+        "identity_sha256": identity_sha256,
+        "psf_database_manifest_sha256": database_sha256,
+        "source_dataset": "render_psf", "target_path": target_path.name,
+        "target_sha256": _sha256(target_path), "blur_scale": float(blur_scale),
+        "algorithm": "linear chart upsample + centered PSF zero-pad + fftconvolve + linear downsample",
+        "tile_gap_px": TILE_GAP_PX, "origin": "upper", "dpi": FIGURE_DPI,
+    }
+    manifest_path = output / "chart_stitch_manifest.json"
+    if _stage_is_complete(manifest_path, stage_config):
+        return
+    files: list[Path] = []
+    for label, _, _ in _distance_cases(config):
+        for state in ("baseline", "optimized"):
+            with h5py.File(_condition_path(evaluation, label, state), "r") as handle:
+                render = np.asarray(handle["render_psf"][:])
+                fields = np.asarray(handle["field_xy_deg"][:])
+            tiles = np.stack([_chart_tile(target, render[index], blur_scale)
+                              for index in range(FIELD_COUNT)])
+            canvas = _stitch_canvas(tiles, fields)
+            numeric, image = (
+                output / f"{label}_{state}_chart_stitch.npz",
+                output / f"{label}_{state}_chart_stitch.png",
+            )
+            np.savez_compressed(numeric, image=canvas, blur_scale=float(blur_scale))
+            _save_chart_stitch_figure(image, canvas)
+            files.extend((numeric, image))
+    _write_stage_manifest(manifest_path, config=stage_config, files=files)
+
+
+def _write_evaluation_state(
+    evaluation: Path, *, identity_sha256: str, status: str, phase: str
+) -> None:
+    _write_json(
+        evaluation / "evaluation_state.json",
+        {"schema_version": EVAL_SCHEMA, "status": status, "phase": phase,
+         "identity_sha256": identity_sha256},
+    )
+
+
+def _write_evaluation_manifest(evaluation: Path, *, identity_sha256: str) -> None:
+    excluded = {"evaluation_manifest.json", "evaluation_state.json"}
+    files = [
+        {"path": path.relative_to(evaluation).as_posix(), "sha256": _sha256(path),
+         "size": path.stat().st_size}
+        for path in sorted(evaluation.rglob("*"))
+        if path.is_file() and path.name not in excluded and not path.name.endswith(".tmp")
+    ]
+    _write_json(
+        evaluation / "evaluation_manifest.json",
+        {"schema_version": EVAL_SCHEMA, "status": "complete",
+         "identity_sha256": identity_sha256, "files": files},
+    )
+
+
+def evaluate(
+    run: Path, *, device_name: str, resume: bool, blur_scale: float = 4.0
+) -> Path:
+    if not math.isfinite(float(blur_scale)) or float(blur_scale) < 1.0:
+        raise ValueError(f"blur_scale must be finite and >= 1, got {blur_scale!r}")
     run = run.resolve()
     if not run.is_dir():
         raise FileNotFoundError(run)
     summary = _json(run / "summary.json")
+    if _json(run / "run_state.json").get("status") != "complete":
+        raise ValueError("source PAL-NURBS run is not complete")
     source_identity = _json(run / "run_identity.json")
     source_identity_legacy = False
     if hasattr(pal, "_validate_identity_payload"):
         try:
             pal._validate_identity_payload(source_identity)
-        except ValueError as exc:
-            # A completed legacy main run has an older training schema.  It is
-            # still a valid read-only source if its own content hash verifies;
-            # it must not be treated as a current training identity.
+        except ValueError as error:
             claimed = str(source_identity.get("identity_sha256", ""))
             body = dict(source_identity)
             body.pop("identity_sha256", None)
             canonical = getattr(pal, "_canonical_json_sha256", None)
             if not claimed or not callable(canonical) or canonical(body) != claimed:
-                raise exc
+                raise error
             source_identity_legacy = True
     evaluation = run / "evaluation"
     identity_path = evaluation / "evaluation_identity.json"
     if identity_path.exists() and not resume:
-        raise FileExistsError(f"evaluation already exists: {evaluation}; use --resume only for the same identity")
+        raise FileExistsError(f"evaluation already exists: {evaluation}; use --resume")
     device = torch.device(device_name)
     config = _load_config(run, device_name)
     checkpoint_path, checkpoint = _load_checkpoint(run, summary, device)
+    checkpoint_sha256 = _sha256(checkpoint_path)
     state_dict = checkpoint["state_dict"]
     control_count = int(checkpoint.get("control_count", summary.get("final_control_count", 7)))
-    eval_identity_body = {
+    identity_body = {
         "schema_version": EVAL_SCHEMA,
         "source_run_identity_sha256": str(source_identity.get("identity_sha256", "")),
-        "source_training_distances": [_json_distance(config.near_object_distance_mm), _json_distance(config.intermediate_object_distance_mm), _json_distance(config.far_object_distance_mm)] if not hasattr(pal, "DISTANCE_SPECS") else [spec.serialized_distance for spec in pal.DISTANCE_SPECS],
+        "source_training_distances": [
+            _json_distance(config.near_object_distance_mm),
+            _json_distance(config.intermediate_object_distance_mm),
+            _json_distance(config.far_object_distance_mm),
+        ] if not hasattr(pal, "DISTANCE_SPECS") else
+        [spec.serialized_distance for spec in pal.DISTANCE_SPECS],
         "evaluation_distances": ["D500", "D1000", "Dinf"],
-        "checkpoint_sha256": _sha256(checkpoint_path),
+        "checkpoint_sha256": checkpoint_sha256,
         "checkpoint_path": str(checkpoint_path.relative_to(run)),
-        "source_identity_legacy_schema": bool(source_identity_legacy),
+        "source_identity_legacy_schema": source_identity_legacy,
         "aperture_contract": "Newton loose residual mapped to aperture boundary",
         "field_grid_deg": list(FIELD_VALUES),
-        "mtf": {"frequency_max_cycles_per_mm": 100.0, "samples": 1000, "csf": "Ahumada-1D", "interpolation": "cubic"},
-        "runtime": {"python": platform.python_version(), "torch": str(torch.__version__), "cuda": torch.version.cuda, "platform": sys.platform},
+        "psf_database": {
+            "schema_version": PSF_DATABASE_SCHEMA,
+            "raw_shape": [RAW_SIZE_PX, RAW_SIZE_PX],
+            "render_shape": [RENDER_SIZE_PX, RENDER_SIZE_PX],
+            "crop_physical_size_mm": CROP_PHYSICAL_SIZE_MM, "condition_files": 6,
+        },
+        "mtf": {"frequency_max_cycles_per_mm": 100.0, "samples": len(COMMON_FREQ),
+                "csf": "Ahumada-1D", "interpolation": "cubic", "published": "mean_only"},
+        "runtime": {"python": platform.python_version(), "torch": str(torch.__version__),
+                    "cuda": torch.version.cuda, "numpy": str(np.__version__),
+                    "scipy": str(scipy.__version__), "h5py": str(h5py.__version__),
+                    "platform": sys.platform},
     }
-    eval_identity = {**eval_identity_body, "identity_sha256": hashlib.sha256(json.dumps(eval_identity_body, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()}
-    if identity_path.exists() and _json(identity_path).get("identity_sha256") != eval_identity["identity_sha256"]:
+    identity = {**identity_body, "identity_sha256": _canonical_sha256(identity_body)}
+    if identity_path.exists() and _json(identity_path).get("identity_sha256") != identity["identity_sha256"]:
         raise ValueError("existing evaluation identity does not match current source/checkpoint")
-    _write_json(identity_path, eval_identity)
-    _write_json(evaluation / "evaluation_state.json", {
-        "status": "running",
-        "identity_sha256": eval_identity["identity_sha256"],
-        "completed_nodes": 0,
-        "total_nodes": 486,
-    })
-    base_sag, power_config, zones = pal.load_pal(config, device)
-    module_baseline = _make_module(config, device, None if hasattr(pal, "DISTANCE_SPECS") else control_count)
-    module_optimized = _make_module(config, device, None if hasattr(pal, "DISTANCE_SPECS") else control_count)
+    _write_json(identity_path, identity)
+    identity_sha256 = str(identity["identity_sha256"])
+    _write_evaluation_state(
+        evaluation, identity_sha256=identity_sha256, status="running", phase="psf_database"
+    )
+    base_sag, power_config, _ = pal.load_pal(config, device)
+    module_baseline = _make_module(
+        config, device, None if hasattr(pal, "DISTANCE_SPECS") else control_count
+    )
+    module_optimized = _make_module(
+        config, device, None if hasattr(pal, "DISTANCE_SPECS") else control_count
+    )
     _state_map(module_optimized, state_dict)
-    _save_sag_and_averfang(evaluation, base_sag, module_optimized, power_config, zones)
+    _save_sag_and_averfang(evaluation, base_sag, module_optimized, power_config)
+    database_manifest_path = _build_psf_database(
+        evaluation, config=config,
+        modules={"baseline": module_baseline, "optimized": module_optimized},
+        identity_sha256=identity_sha256, checkpoint_sha256=checkpoint_sha256, resume=resume,
+    )
+    if _validate_psf_database(
+        evaluation, config=config, identity_sha256=identity_sha256
+    ).get("status") != "complete":
+        raise ValueError("PSF database did not reach complete status")
+    database_sha256 = _sha256(database_manifest_path)
+    _write_evaluation_state(
+        evaluation, identity_sha256=identity_sha256, status="running", phase="weighted_mtf"
+    )
+    _validate_psf_database(evaluation, config=config, identity_sha256=identity_sha256)
+    _run_weighted_mtf(
+        evaluation, config=config, identity_sha256=identity_sha256,
+        database_sha256=database_sha256,
+    )
+    _write_evaluation_state(
+        evaluation, identity_sha256=identity_sha256, status="running", phase="psf_stitch"
+    )
+    _validate_psf_database(evaluation, config=config, identity_sha256=identity_sha256)
+    _run_psf_stitches(
+        evaluation, config=config, identity_sha256=identity_sha256,
+        database_sha256=database_sha256,
+    )
     target_path = Path(__file__).resolve().parent / "inputs" / "evaluation" / "E1.xlsx"
     if not target_path.is_file():
         raise FileNotFoundError(f"evaluation target is missing: {target_path}")
-    import pandas as pd
-    target = pd.read_excel(target_path, header=None, engine="openpyxl").to_numpy(dtype=np.float64)
-    if target.shape != (130, 130):
-        raise ValueError(f"E1.xlsx must be 130x130, got {target.shape}")
-    all_records: list[dict[str, Any]] = []
-    (evaluation / "psf").mkdir(parents=True, exist_ok=True)
-    (evaluation / "mtf").mkdir(parents=True, exist_ok=True)
-    mtf_scores: dict[str, dict[str, np.ndarray]] = {}
-    for label, distance, cases in _distance_cases(config):
-        mtf_scores[label] = {}
-        for state, module in (("baseline", module_baseline), ("optimized", module_optimized)):
-            model = pal.MinimalOpticalModel(config, module)
-            scores = []
-            try:
-                for case in cases:
-                    with torch.no_grad():
-                        result = model.field(case)
-                    psf = result.psf.detach().cpu().numpy().astype(np.float64)
-                    pitch = float(result.pixel_pitch_mm)
-                    health = {"valid_fraction": float(result.valid_fraction.detach().cpu()), "edge_fraction": float(result.edge_fraction.detach().cpu()), "pixel_pitch_mm": pitch}
-                    if not np.isfinite(psf).all() or np.any(psf < 0.0) or abs(float(psf.sum()) - 1.0) > 1e-8:
-                        raise ValueError(f"invalid physical PSF for {case['case_id']}")
-                    score, sag_curve, tan_curve = _weighted_mtf(psf, pitch)
-                    row = int(case["case_id"].split("_r")[1].split("_c")[0])
-                    col = int(case["case_id"].split("_c")[1])
-                    all_records.append({"state": state, "label": label, "row": row, "col": col, "psf": psf})
-                    scores.append(score)
-                    np.savez_compressed(evaluation / "psf" / f"{label}_{state}_r{row:02d}_c{col:02d}.npz", psf=psf, **health)
-                mtf_scores[label][state] = np.asarray(scores, dtype=np.float64).reshape(9, 9, 3)
-            finally:
-                model.close()
-        mtf_scores[label]["delta"] = mtf_scores[label]["optimized"] - mtf_scores[label]["baseline"]
-        for state in ("baseline", "optimized", "delta"):
-            np.savez_compressed(evaluation / "mtf" / f"{label}_{state}_mean_map.npz", mean=mtf_scores[label][state][..., 2])
-            _plot_map(evaluation / "mtf" / f"{label}_{state}_mean.png", mtf_scores[label][state][..., 2], title=f"{label} {state} weighted MTF mean", symmetric=state == "delta")
-        _save_stitches(evaluation, label, [r for r in all_records if r["label"] == label], target)
-    files = []
-    for path in sorted(evaluation.rglob("*")):
-        if path.is_file() and path.name not in {"evaluation_manifest.json", "evaluation_state.json"}:
-            files.append({"path": path.relative_to(evaluation).as_posix(), "sha256": _sha256(path), "size": path.stat().st_size})
-    _write_json(evaluation / "evaluation_manifest.json", {"schema_version": 1, "identity_sha256": eval_identity["identity_sha256"], "files": files})
-    _write_json(evaluation / "evaluation_summary.json", {"status": "complete", "identity_sha256": eval_identity["identity_sha256"], "psf_count": len(all_records), "distance_labels": [item[0] for item in _distance_cases(config)], "source_run_unchanged": True})
-    _write_json(evaluation / "evaluation_state.json", {"status": "complete", "identity_sha256": eval_identity["identity_sha256"], "completed_nodes": len(all_records), "total_nodes": 486})
+    _write_evaluation_state(
+        evaluation, identity_sha256=identity_sha256, status="running", phase="chart_stitch"
+    )
+    _validate_psf_database(evaluation, config=config, identity_sha256=identity_sha256)
+    _run_chart_stitches(
+        evaluation, config=config, identity_sha256=identity_sha256,
+        database_sha256=database_sha256, target_path=target_path,
+        blur_scale=float(blur_scale),
+    )
+    _write_json(
+        evaluation / "evaluation_summary.json",
+        {"status": "complete", "identity_sha256": identity_sha256,
+         "psf_database_status": "complete", "psf_condition_count": 6,
+         "psf_count": 6 * FIELD_COUNT,
+         "distance_labels": [item[0] for item in _distance_cases(config)],
+         "weighted_mtf_products": "mean_only", "chart_blur_scale": float(blur_scale),
+         "source_run_unchanged": True},
+    )
+    _write_evaluation_manifest(evaluation, identity_sha256=identity_sha256)
+    _write_evaluation_state(
+        evaluation, identity_sha256=identity_sha256, status="complete", phase="complete"
+    )
     return evaluation
 
 
@@ -357,8 +1080,16 @@ def main() -> int:
     parser.add_argument("--run", required=True, help="completed run directory")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--resume", action="store_true")
-    args = parser.parse_args()
-    evaluate(Path(args.run), device_name=args.device, resume=bool(args.resume))
+    parser.add_argument(
+        "--blur-scale", type=float, default=4.0,
+        help=("Display-only chart scale (finite and >=1). Larger values reduce apparent "
+              "chart blur; PSF databases, MTF, and PSF stitches are unchanged."),
+    )
+    arguments = parser.parse_args()
+    evaluate(
+        Path(arguments.run), device_name=arguments.device,
+        resume=bool(arguments.resume), blur_scale=float(arguments.blur_scale),
+    )
     return 0
 
 

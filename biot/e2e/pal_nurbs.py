@@ -362,6 +362,8 @@ class FieldResult:
     pixel_pitch_mm: float
     edge_fraction: torch.Tensor
     valid_mask: torch.Tensor | None = None
+    raw_psf: torch.Tensor | None = None
+    raw_pixel_pitch_mm: float | None = None
 
 
 @dataclass(frozen=True)
@@ -881,6 +883,8 @@ class MinimalOpticalModel:
             kernel=kernel, valid_fraction=trace.valid.to(torch.float64).mean(),
             pixel_pitch_mm=self.size_reference_mm[distance] / self.config.kernel_size_px,
             edge_fraction=_edge_fraction(kernel), valid_mask=trace.valid,
+            raw_psf=fft.psf,
+            raw_pixel_pitch_mm=float(system.physical_fft_pixel_pitch_mm),
         )
 
     def field_batch(self, cases: Sequence[Mapping[str, Any]]) -> BatchFieldResult:

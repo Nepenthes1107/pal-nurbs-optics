@@ -66,15 +66,24 @@ python -m biot.gui
 
 ## 完成优化后的评价
 
-评价不会改写训练 run，并在 run 内创建独立的 `evaluation/` 身份。它生成
-Sag、AverFang 光焦度/像散、三物距 PSF/视标拼接和 Ahumada 加权 MTF
-（baseline/optimized/delta）产物：
+评价不会改写训练 run，并在 run 内创建独立的 `evaluation/` 身份。它先生成并
+完整核验 D500/D1000/Dinf × baseline/optimized 六个条件级 HDF5 PSF 数据库，
+数据库状态为 `complete` 后才依次生成 Ahumada weighted-MTF Mean、PSF stitch
+和视标 stitch；同时输出 Sag 和 AverFang 光焦度/像散：
 
 ```powershell
-python evaluate_pal_nurbs.py --run results/optimization/run_001 --device cuda
+python evaluate_pal_nurbs.py --run results/optimization/run_001 --device cuda --blur-scale 4
 ```
 
-评价网格为 `[-40,40]` degree、步长 10 degree。旧 run 的训练物距会在评价身份中如实记录；评价物距固定为 D500/D1000/Dinf，不能据此改写旧训练结论。`inputs/evaluation/E1.xlsx` 是受控视标输入；`.venv` 和 `results/` 不上传到 Git。
+每个条件文件保存 81 个场点的原始 512×512 FFT PSF 和统一物理裁剪后的
+130×130 渲染 PSF；weighted MTF 只读取原始 PSF，拼接只读取渲染 PSF。
+评价网格为 `[-40,40]` degree、步长 10 degree。`--resume` 精确核验并跳过
+HDF5 中已完成节点；损坏或身份不符的节点失败关闭。`--blur-scale` 默认 4，
+只控制视标拼接的显示模糊，不改变 PSF 数据库、MTF 或 PSF stitch。
+
+旧 run 的训练物距会在评价身份中如实记录；评价物距固定为
+D500/D1000/Dinf，不能据此改写旧训练结论。`inputs/evaluation/E1.xlsx` 是受控
+视标输入；`.venv` 和 `results/` 不上传到 Git。
 
 ## 从零开始运行
 
