@@ -27,6 +27,10 @@
 - 默认 `case_batch_size=8`：每批执行 `[B,N,3]` 真实张量追迹、`[B,P,P]` FFT PSF、批 loss 聚合和一次 backward；下一批继续在 PAL 参数上累积梯度，完整 363-case sweep 后才执行一次 optimizer step。最后一批使用实际 case 数；OOM 直接失败，不自动缩批。
 - 优化预算为最多 50 个 accepted steps，默认 patience=7、相对改善阈值=1e-4；拒绝步同时恢复 PAL 参数与 Adam optimizer state。
 - `best_feasible` 只能来自完整 363-case sweep，并同时满足 PSF health、`P_far`、`ADD`、控制量和单步 sag 约束。
+- `evaluate_pal_nurbs.py` 在 `<run>/evaluation` 生成独立评价身份；三物距×双状态
+  分别保存为六个 HDF5，每个文件含 81 个场点的原始 FFT PSF、130×130 渲染
+  PSF及最小恢复信息。只有数据库整体 `complete` 后才运行 weighted-MTF Mean、
+  PSF stitch 和 chart stitch；chart 的 `blur-scale` 默认 4且仅影响显示。
 
 ## 历史 r12
 
