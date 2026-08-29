@@ -65,4 +65,6 @@ python run_pal_nurbs.py --output .tmp_prepare_multidistance --excel eye_image_gl
 
 2026-08-26 验证记录：本分支 `.venv\Scripts\python.exe -m pytest tests -q --basetemp .tmp_pytest_final_identity` 为 `131 passed`，无失败；当前代码身份下的 prepare-only smoke 为 `363` cases、状态 `prepared`，并通过同目录 `--resume` 的布局哈希校验。旧基线的 `150 passed` 仍是基线参考，不与本分支测试数量混用。PyTorch 2.0.1 在 Windows 中文路径下的 checkpoint 原子写入改用 Python 二进制文件句柄，仍采用原 torch 序列化、`fsync` 和原子替换。
 
+2026-08-29 验证记录：统一 HDF5 PSF 数据库与评价链的定向测试为 `7 passed`；`.venv\Scripts\python.exe -m pytest tests -q --basetemp .tmp_pytest_multi_full` 为 `151 passed`，无失败。本次未启动正式优化或完整 486-field PSF 数据库生成。
+
 缩小 CPU 物理 sweep smoke（requested pupil 8、FFT 32、steps 0）进入 `baseline_psf_sweep` 后因单 case 成本过高主动中断；中断前已写入 `.tmp_run_multidistance_zero/baseline_progress.pt` 的 17/363 行。该临时 run 未作为结果或科学结论使用。

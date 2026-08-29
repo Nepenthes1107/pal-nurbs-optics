@@ -81,11 +81,10 @@ def test_condition_hdf5_resumes_exact_nodes_and_fails_on_corruption(
                 raise RuntimeError("synthetic interruption")
             raw = torch.zeros((8, 8), dtype=torch.float64)
             raw[4, 4] = 1.0
-            return SimpleNamespace(
-                raw_psf=raw,
-                raw_pixel_pitch_mm=0.01,
-                valid_fraction=torch.tensor(0.75, dtype=torch.float64),
-            )
+            common = {"valid_fraction": torch.tensor(0.75, dtype=torch.float64)}
+            if hasattr(evaluator.pal, "DISTANCE_SPECS"):
+                return SimpleNamespace(psf=raw, pixel_pitch_mm=0.01, **common)
+            return SimpleNamespace(raw_psf=raw, raw_pixel_pitch_mm=0.01, **common)
 
     root = tmp_path / "psf_database"
     first = Model(fail_after=2)
