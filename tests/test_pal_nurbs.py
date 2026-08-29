@@ -19,6 +19,7 @@ from biot.e2e.pal_nurbs import (
     PALPowerConfig,
     _append_training_log,
     _accumulate_startup_case_gradients,
+    _early_stopping_observation,
     _load_stage_resume_state,
     _make_stage_resume_payload,
     _open_run_directory,
@@ -27,6 +28,7 @@ from biot.e2e.pal_nurbs import (
     _release_inactive_case_cuda_cache,
     _retain_training_cache,
     _restore_optimizer_state,
+    _stage_boundary_stop_reason,
     _torch_save_atomic,
     _evaluate,
     load_pal,
@@ -49,6 +51,101 @@ def test_main_training_phase_contract_is_nonlegacy_raw_psf() -> None:
         MinimalConfig(remove_tilt=True)
     with pytest.raises(ValueError, match="phase_reference"):
         MinimalConfig(phase_reference="image_plane_center")
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"max_steps_7": -1}, "max_steps_7"),
+        ({"max_steps_7": 1.5}, "max_steps_7"),
+        ({"max_steps_7": True}, "max_steps_7"),
+        ({"max_steps_11": -1}, "max_steps_11"),
+        ({"max_steps_19": -1}, "max_steps_19"),
+        ({"max_extra_19_steps": -1}, "max_extra_19_steps"),
+        ({"early_stopping_patience": 0}, "early_stopping_patience"),
+        ({"early_stopping_patience": -1}, "early_stopping_patience"),
+        ({"early_stopping_patience": 1.5}, "early_stopping_patience"),
+        ({"relative_improvement_threshold": 0.0}, "relative_improvement_threshold"),
+        ({"relative_improvement_threshold": -1.0}, "relative_improvement_threshold"),
+        ({"relative_improvement_threshold": math.inf}, "relative_improvement_threshold"),
+        ({"relative_improvement_threshold": math.nan}, "relative_improvement_threshold"),
+    ],
+)
+def test_training_budget_config_rejects_invalid_values(kwargs, message) -> None:
+    with pytest.raises(ValueError, match=message):
+        MinimalConfig(device="cpu", **kwargs)
+
+
+def test_19x19_patience_counts_every_attempt_and_resets_only_on_strict_improvement() -> None:
+    refreshed, relative, significant, counter = _early_stopping_observation(
+        best_before=1.0,
+        candidate=0.5,
+        accepted=False,
+        threshold=1.0e-4,
+        no_improvement_attempts=2,
+    )
+    assert (refreshed, relative, significant, counter) == (False, 0.0, False, 3)
+
+    refreshed, relative, significant, counter = _early_stopping_observation(
+        best_before=1.0,
+        candidate=0.99995,
+        accepted=True,
+        threshold=1.0e-4,
+        no_improvement_attempts=3,
+    )
+    assert refreshed
+    assert relative == pytest.approx(5.0e-5)
+    assert not significant
+    assert counter == 4
+
+    refreshed, relative, significant, counter = _early_stopping_observation(
+        best_before=1.0,
+        candidate=0.9998,
+        accepted=True,
+        threshold=1.0e-4,
+        no_improvement_attempts=4,
+    )
+    assert refreshed
+    assert relative == pytest.approx(2.0e-4)
+    assert significant
+    assert counter == 0
+
+    _, relative, significant, counter = _early_stopping_observation(
+        best_before=2.0,
+        candidate=1.0,
+        accepted=True,
+        threshold=0.5,
+        no_improvement_attempts=0,
+    )
+    assert relative == 0.5
+    assert not significant
+    assert counter == 1
+
+
+def test_19x19_stop_order_suppresses_early_stopping_until_minimum() -> None:
+    common = {
+        "control_count": 19,
+        "minimum_steps": 10,
+        "maximum_steps": 60,
+        "learning_rate": 2.0e-3,
+        "minimum_learning_rate": 1.0e-6,
+        "no_improvement_attempts": 9,
+        "early_stopping_patience": 7,
+    }
+    assert _stage_boundary_stop_reason(completed_step=9, **common) is None
+    assert _stage_boundary_stop_reason(completed_step=10, **common) == "early_stopping"
+    assert _stage_boundary_stop_reason(
+        completed_step=9,
+        **{**common, "learning_rate": 5.0e-7},
+    ) == "minimum_not_reached"
+    assert _stage_boundary_stop_reason(
+        completed_step=10,
+        **{**common, "learning_rate": 5.0e-7, "no_improvement_attempts": 0},
+    ) == "learning_rate_floor"
+    assert _stage_boundary_stop_reason(
+        completed_step=60,
+        **{**common, "no_improvement_attempts": 0},
+    ) == "max_extra_reached"
 
 
 def test_m2_is_finite_nonnegative_and_centroid_relative() -> None:
@@ -524,7 +621,13 @@ def test_stage_resume_roundtrip_preserves_model_adam_lr_history_and_best(tmp_pat
         identity_sha256="identity",
         status="active",
         control_count=7,
-        max_steps=10,
+        minimum_steps=10,
+        maximum_steps=10,
+        early_stopping_patience=7,
+        relative_improvement_threshold=1.0e-4,
+        max_extra_19_steps=50,
+        no_improvement_attempts=0,
+        stop_reason=None,
         module=module,
         optimizer=optimizer,
         learning_rate=1.1e-3,
@@ -542,7 +645,11 @@ def test_stage_resume_roundtrip_preserves_model_adam_lr_history_and_best(tmp_pat
         path,
         identity_sha256="identity",
         control_count=7,
-        max_steps=10,
+        minimum_steps=10,
+        maximum_steps=10,
+        early_stopping_patience=7,
+        relative_improvement_threshold=1.0e-4,
+        max_extra_19_steps=50,
         device="cpu",
     )
     restored_module = FixedWeightNURBSPerturbation(7, device="cpu", dtype=torch.float64)
@@ -572,6 +679,23 @@ def test_stage_resume_roundtrip_preserves_model_adam_lr_history_and_best(tmp_pat
         if torch.is_tensor(value)
     )
     assert not list(tmp_path.glob(".resume.pt.*.tmp"))
+
+    legacy = copy.deepcopy(payload)
+    legacy["schema_version"] = 1
+    legacy_path = tmp_path / "legacy_resume.pt"
+    _torch_save_atomic(legacy_path, legacy)
+    with pytest.raises(ValueError, match="state schema mismatch"):
+        _load_stage_resume_state(
+            legacy_path,
+            identity_sha256="identity",
+            control_count=7,
+            minimum_steps=10,
+            maximum_steps=10,
+            early_stopping_patience=7,
+            relative_improvement_threshold=1.0e-4,
+            max_extra_19_steps=50,
+            device="cpu",
+        )
 
 
 def test_case_layout_cache_cleanup_retains_only_training_cases() -> None:
@@ -1033,12 +1157,15 @@ def test_interrupted_training_resume_matches_uninterrupted_adam_state(
 
     monkeypatch.setattr(pal_nurbs, "prescription_metrics", fake_prescription)
     real_evaluate = pal_nurbs._evaluate
-    interruption = {"enabled": True, "gradient_calls": 0}
+    interruption = {"enabled": True, "gradient_calls": 0, "interrupt_at": 4}
 
     def interrupting_evaluate(*args, **kwargs):
         if kwargs.get("with_grad"):
             interruption["gradient_calls"] += 1
-            if interruption["enabled"] and interruption["gradient_calls"] == 2:
+            if (
+                interruption["enabled"]
+                and interruption["gradient_calls"] == interruption["interrupt_at"]
+            ):
                 raise RuntimeError("synthetic stage interruption")
         return real_evaluate(*args, **kwargs)
 
@@ -1047,17 +1174,21 @@ def test_interrupted_training_resume_matches_uninterrupted_adam_state(
         output=str(tmp_path / "interrupted"),
         device="cpu",
         intermediate_object_distance_mm=2000.0,
-        max_steps_7=2,
-        max_steps_11=0,
-        max_steps_19=0,
+        max_steps_7=1,
+        max_steps_11=1,
+        max_steps_19=2,
+        early_stopping_patience=1,
+        relative_improvement_threshold=1.0,
+        max_extra_19_steps=5,
     )
     with pytest.raises(RuntimeError, match="synthetic stage interruption"):
         run(interrupted_config)
     active = torch.load(
-        tmp_path / "interrupted" / "stage_7x7" / "resume.pt", map_location="cpu"
+        tmp_path / "interrupted" / "stage_19x19" / "resume.pt", map_location="cpu"
     )
     assert active["status"] == "active"
     assert active["completed_step"] == 1
+    assert active["no_improvement_attempts"] == 1
 
     interruption["enabled"] = False
     run(interrupted_config, resume=True)
@@ -1067,19 +1198,113 @@ def test_interrupted_training_resume_matches_uninterrupted_adam_state(
     run(uninterrupted_config)
 
     resumed_final = torch.load(
-        tmp_path / "interrupted" / "stage_7x7" / "final.pt", map_location="cpu"
+        tmp_path / "interrupted" / "stage_19x19" / "final.pt", map_location="cpu"
     )
     uninterrupted_final = torch.load(
-        tmp_path / "uninterrupted" / "stage_7x7" / "final.pt", map_location="cpu"
+        tmp_path / "uninterrupted" / "stage_19x19" / "final.pt", map_location="cpu"
     )
     assert resumed_final["step"] == uninterrupted_final["step"] == 2
     for name, value in resumed_final["state_dict"].items():
         assert torch.equal(value, uninterrupted_final["state_dict"][name])
     assert (
-        tmp_path / "interrupted" / "stage_7x7" / "history.csv"
+        tmp_path / "interrupted" / "stage_19x19" / "history.csv"
     ).read_bytes() == (
-        tmp_path / "uninterrupted" / "stage_7x7" / "history.csv"
+        tmp_path / "uninterrupted" / "stage_19x19" / "history.csv"
     ).read_bytes()
+    resumed_summary = json.loads(
+        (tmp_path / "interrupted" / "summary.json").read_text(encoding="utf-8")
+    )
+    assert [stage["actual_steps"] for stage in resumed_summary["stages"]] == [1, 1, 2]
+    assert resumed_summary["minimum_training_steps"] == 4
+    assert resumed_summary["actual_training_steps"] == 4
+    assert resumed_summary["extra_19_steps"] == 0
+    assert resumed_summary["training_stop_reason"] == "early_stopping"
+    assert resumed_summary["stages"][-1]["no_improvement_attempts"] == 2
+    resumed_log = (tmp_path / "interrupted" / "training.log").read_text(encoding="utf-8")
+    assert "stage=19x19 step=2/7 minimum=2" in resumed_log
+    assert "update=EARLY_STOPPING" in resumed_log
+    assert "rel=" in resumed_log and "patience=2/1" in resumed_log
+    best_checkpoint = torch.load(
+        tmp_path / "interrupted" / "stage_19x19" / "best.pt", map_location="cpu"
+    )
+    for name, value in resumed_final["state_dict"].items():
+        assert torch.equal(value, best_checkpoint["state_dict"][name])
+
+    interruption.update({"enabled": True, "gradient_calls": 0, "interrupt_at": 2})
+    extra_config = replace(
+        interrupted_config,
+        output=str(tmp_path / "extra_interrupted"),
+        max_steps_7=0,
+        max_steps_11=0,
+        max_steps_19=1,
+        early_stopping_patience=10,
+        max_extra_19_steps=2,
+    )
+    with pytest.raises(RuntimeError, match="synthetic stage interruption"):
+        run(extra_config)
+    extra_active = torch.load(
+        tmp_path / "extra_interrupted" / "stage_19x19" / "resume.pt",
+        map_location="cpu",
+    )
+    assert extra_active["completed_step"] == 1
+    assert extra_active["no_improvement_attempts"] == 1
+
+    interruption["enabled"] = False
+    run(extra_config, resume=True)
+    extra_uninterrupted = replace(
+        extra_config, output=str(tmp_path / "extra_uninterrupted")
+    )
+    run(extra_uninterrupted)
+    assert (
+        tmp_path / "extra_interrupted" / "stage_19x19" / "history.csv"
+    ).read_bytes() == (
+        tmp_path / "extra_uninterrupted" / "stage_19x19" / "history.csv"
+    ).read_bytes()
+    extra_summary = json.loads(
+        (tmp_path / "extra_interrupted" / "summary.json").read_text(encoding="utf-8")
+    )
+    assert extra_summary["stages"][-1]["actual_steps"] == 3
+    assert extra_summary["stages"][-1]["extra_steps"] == 2
+    assert extra_summary["training_stop_reason"] == "max_extra_reached"
+    assert "update=MAX_EXTRA_REACHED" in (
+        tmp_path / "extra_interrupted" / "training.log"
+    ).read_text(encoding="utf-8")
+
+    interruption["enabled"] = False
+    floor_config = replace(
+        extra_config,
+        output=str(tmp_path / "minimum_not_reached"),
+        max_steps_19=2,
+        max_extra_19_steps=0,
+        minimum_learning_rate=1.5e-3,
+        max_backtracks=0,
+        step_sag_limit_mm=0.0,
+    )
+    with pytest.raises(pal_nurbs.MinimumTrainingBudgetError):
+        run(floor_config)
+    floor_state = json.loads(
+        (tmp_path / "minimum_not_reached" / "run_state.json").read_text(encoding="utf-8")
+    )
+    assert floor_state["status"] == "failed"
+    assert floor_state["phase"] == "minimum_not_reached"
+    assert not (tmp_path / "minimum_not_reached" / "summary.json").exists()
+    assert "update=MINIMUM_NOT_REACHED" in (
+        tmp_path / "minimum_not_reached" / "training.log"
+    ).read_text(encoding="utf-8")
+
+    post_floor_config = replace(
+        floor_config,
+        output=str(tmp_path / "learning_rate_floor"),
+        max_steps_19=1,
+    )
+    run(post_floor_config)
+    post_floor_summary = json.loads(
+        (tmp_path / "learning_rate_floor" / "summary.json").read_text(encoding="utf-8")
+    )
+    assert post_floor_summary["training_stop_reason"] == "learning_rate_floor"
+    assert "update=LEARNING_RATE_FLOOR" in (
+        tmp_path / "learning_rate_floor" / "training.log"
+    ).read_text(encoding="utf-8")
 
 
 def test_joint_loss_fails_closed_when_a_case_is_detached_from_nurbs() -> None:

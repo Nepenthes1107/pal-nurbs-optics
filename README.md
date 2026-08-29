@@ -52,6 +52,11 @@ python -m biot.gui
 
 - 仅优化 PAL 后表面 cubic NURBS/B-spline 的 `zp`；`xp/yp/weight` 固定，边界控制环固定为零。
 - 控制网格为 `7x7 -> 11x11 -> 19x19`，通过精确 knot refinement 晋级。
+- `--steps S7 S11 S19` 中，7×7 和 11×11 恰好各运行 `S7`、`S11`
+  个完整 attempt，19×19 至少运行 `S19` 个；拒绝的候选也消耗 attempt。
+  达到最低总预算 `S7+S11+S19` 后只在 19×19 继续训练。默认连续 7 个
+  attempt 未使 best 相对改善严格超过 `1e-4` 时 early stop，最多额外运行
+  50 个 attempt。最低 19×19 配额前只累计 patience，不允许 early stop。
 - 80 个真实 case：Far 18、Intermediate 12、Near 18、Peripheral-left/right 各 16。
 - 三个物距统一为 `D500=500 mm`、`D1000=1000 mm`、`Dinf=Infinity`；Infinity 使用真实无穷远条件。
 - 使用真实可微追迹、GRIN3 固定步长 RK4、连续 OPL、去 pupil tilt FFT PSF；离线 PSF 不参与反传。
@@ -98,10 +103,23 @@ D500/D1000/Dinf，不能据此改写旧训练结论。`inputs/evaluation/E1.xlsx
 python run_pal_nurbs.py `
   --output results/optimization/run_001 `
   --excel eye_image_glass_grad3.xlsx --device cuda `
-  --requested-np 256 --fft-size-px 512 --case-batch-size 8 --steps 10 10 10
+  --requested-np 256 --fft-size-px 512 --case-batch-size 8 `
+  --steps 10 10 10 `
+  --early-stopping-patience 7 `
+  --relative-improvement-threshold 1e-4 `
+  --max-extra-19-steps 50
 ```
 
-普通 `--resume` 只允许恢复同一运行目录中 identity、配置、输入哈希和实现闭包完全一致的 checkpoint；本次 batch 接口变化后的旧串行 run 不可恢复，必须使用新输出目录。当前项目不再支持跨平台 training-state/parity 导入。
+该示例最低训练 30 个 attempt，最多训练 80 个 attempt。19×19 每个 attempt
+完成后先原子保存 resume/history，再按 early stopping、学习率下限和额外预算
+顺序判断；最低预算前若学习率跌破下限，则 run 失败且不写成功 `summary.json`。
+最终结果始终加载 19×19 best state 并完成 80-case 无梯度复核后才标记 complete。
+
+普通 `--resume` 只允许恢复同一运行目录中 identity、配置、输入哈希、实现闭包、
+最低/最大预算、patience 计数和终止规则完全一致的 checkpoint。本次 early
+stopping 改造提升了 run identity 与 stage-resume schema；旧 run/checkpoint
+保持只读，不可按新方法恢复，必须使用新输出目录。当前项目不再支持跨平台
+training-state/parity 导入。
 
 ## 验证
 
