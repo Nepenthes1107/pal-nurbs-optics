@@ -68,4 +68,6 @@ python run_pal_nurbs.py --output .tmp_prepare_multidistance --excel eye_image_gl
 
 2026-08-29 验证记录：统一 HDF5 PSF 数据库与评价链的定向测试为 `7 passed`；`.venv\Scripts\python.exe -m pytest tests -q --basetemp .tmp_pytest_multi_full` 为 `151 passed`，无失败。本次未启动正式优化或完整 486-field PSF 数据库生成。
 
+2026-08-29 CUDA 评价批量化验收：多物距分支定向测试与原生 `field_batch()` 适配为 `23 passed`；完整测试为 `154 passed`，无失败。评价批量仅复用该分支已验证的原生 PSF 批量追迹，不改变多物距的去 tilt 和隐式求交合同。本次未启动正式优化或完整 486-field 评价。
+
 缩小 CPU 物理 sweep smoke（requested pupil 8、FFT 32、steps 0）进入 `baseline_psf_sweep` 后因单 case 成本过高主动中断；中断前已写入 `.tmp_run_multidistance_zero/baseline_progress.pt` 的 17/363 行。该临时 run 未作为结果或科学结论使用。
