@@ -58,7 +58,9 @@ python -m biot.gui
 - 默认 pupil 采样为 `np=256`、FFT 为 `512`；80 个 case 按 `case_batch_size=8` 做 GPU tensor 追迹和 FFT，每批聚合一次 loss 并 backward，不因 OOM 自动缩小 batch。
 - 训练输出统一包含 `stage`、`step`、`batch`、`loss`、`update` 和 `lr`；每个 run 的 `training.log` 持久化同样的进度摘要，中断时追加异常信息，各阶段仍保留结构化 `history.csv`。
 - 追迹失败保持失败关闭，由当前 run 的资格筛选进度记录错误；底层追迹不在项目根目录自动导出 `wrong_result` Excel。
-- `J=(0.85*J_functional+0.15*J_peripheral)`，Original PAL 分母固定。
+- `J=(0.85*J_functional+0.15*J_peripheral)`：功能区使用逐 case 的
+  `M2_mm²/Original PAL M2_mm²`，左右周边区使用各自区域平均
+  `A_D/Original PAL A_D`；Original PAL 分母固定。
 - 仅使用 trace/PSF health、`P_far`、`ADD` 和单步 sag trust region 约束。
 - 不自动运行历史 192-case posthoc、PSF 数据库、渲染或 SSIM 链。
 

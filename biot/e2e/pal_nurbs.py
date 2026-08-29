@@ -28,6 +28,7 @@ from optics import GridSag
 
 from .pal_case_layout import (
     FUNCTIONAL_GROUPS,
+    GROUP_TO_ZONE,
     PERIPHERAL_BAND_COUNTS,
     PERIPHERAL_GROUPS,
     TOTAL_TRAINING_CASES,
@@ -107,10 +108,10 @@ class MinimalConfig:
             raise ValueError("case_batch_size must be a positive integer")
 
 
-RUN_IDENTITY_SCHEMA_VERSION = 3
+RUN_IDENTITY_SCHEMA_VERSION = 4
 CASE_LAYOUT_STATE_SCHEMA_VERSION = 4
-BASELINE_STATE_SCHEMA_VERSION = 3
-BASELINE_PROGRESS_SCHEMA_VERSION = 3
+BASELINE_STATE_SCHEMA_VERSION = 4
+BASELINE_PROGRESS_SCHEMA_VERSION = 4
 STAGE_RESUME_SCHEMA_VERSION = 1
 RUN_STATE_SCHEMA_VERSION = 1
 STAGE_LADDER = (7, 11, 19)
@@ -635,6 +636,44 @@ class MinimalOpticalModel:
         self._cache: dict[tuple[float, float, float], tuple[FittedE2ESystem, object]] = {}
         self._templates: dict[float, tuple[FittedE2ESystem, object]] = {}
         self._cache_frozen = False
+        self._pal_sag: torch.Tensor | None = None
+        self._pal_power_config: PALPowerConfig | None = None
+        self._pal_zones: Mapping[str, torch.Tensor] | None = None
+
+    def set_prescription_context(
+        self,
+        sag: torch.Tensor,
+        power_config: PALPowerConfig,
+        zones: Mapping[str, torch.Tensor],
+    ) -> None:
+        """Attach the differentiable PAL M/A context used by peripheral loss."""
+        self._pal_sag = sag
+        self._pal_power_config = power_config
+        self._pal_zones = zones
+
+    def astig_A_by_zone(self) -> dict[str, torch.Tensor]:
+        if self._pal_sag is None or self._pal_power_config is None or self._pal_zones is None:
+            raise RuntimeError("PAL prescription context is required for astigmatism loss")
+        coord = torch.linspace(
+            -self._pal_power_config.semi_diameter_mm,
+            self._pal_power_config.semi_diameter_mm,
+            int(self._pal_sag.shape[0]),
+            device=self._pal_sag.device,
+            dtype=self._pal_sag.dtype,
+        )
+        yy, xx = torch.meshgrid(coord, coord, indexing="ij")
+        sag = self._pal_sag + self.perturbation.delta_raw(xx, yy)
+        maps = torch_averfang_maps(sag, self._pal_power_config)
+        result: dict[str, torch.Tensor] = {}
+        for zone in ("astig_left", "astig_right"):
+            mask = self._pal_zones["peripheral_" + zone] & maps["valid"]
+            if not bool(mask.any()):
+                raise ValueError(f"M/A mask has no valid samples for {zone}")
+            value = maps["A_D"][mask].mean()
+            if not bool(torch.isfinite(value)) or bool(value <= 0.0):
+                raise ValueError(f"M/A astigmatism A is invalid for {zone}")
+            result[zone] = value
+        return result
 
     @staticmethod
     def _key(distance: float, x: float, y: float) -> tuple[float, float, float]:
@@ -934,7 +973,12 @@ def torch_averfang_maps(sag: torch.Tensor, config: PALPowerConfig) -> dict[str, 
     power = (nl - 1) * 1000 * (nl * (-rr - rq) + (nl - 1) * thickness) / denominator
     astig = (-(curvature_diff[start:stop, start:stop]) * (nl - 1) * 1000).abs()
     valid = (xx.square() + yy.square() <= (config.crib_diameter_mm / 2) ** 2 + 1e-9) & torch.isfinite(power) & torch.isfinite(astig)
-    return {"power_D": power, "astigmatism_D": astig, "valid": valid}
+    return {
+        "power_D": power,
+        "A_D": astig,
+        "astigmatism_D": astig,
+        "valid": valid,
+    }
 
 
 def load_pal(config: MinimalConfig, device: torch.device) -> tuple[torch.Tensor, PALPowerConfig, dict[str, torch.Tensor]]:
@@ -1463,7 +1507,10 @@ def _summarize_training_baseline(
     health: dict[str, Any] = {
         "minimum_valid_fraction_ratio": 1.0,
         "maximum_edge_fraction": maximum_edge,
-        "objective_name": "J=0.85*J_functional+0.15*J_peripheral",
+        "objective_name": (
+            "J=0.85*J_functional(M2/M2_original)+"
+            "0.15*J_peripheral(A_D/A_D_original)"
+        ),
     }
     for name in FUNCTIONAL_GROUPS + PERIPHERAL_GROUPS:
         health[f"J_{name}"] = 1.0
@@ -1521,7 +1568,8 @@ def _field_batch(model: Any, cases: Sequence[Mapping[str, Any]]) -> BatchFieldRe
 
 def _batch_rows(
     cases: Sequence[Mapping[str, Any]], result: BatchFieldResult,
-    moments: torch.Tensor, baseline_valid: Mapping[str, float] | None,
+    moments: torch.Tensor, loss_metrics: torch.Tensor,
+    loss_metric_names: Sequence[str], baseline_valid: Mapping[str, float] | None,
     scores: torch.Tensor,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
@@ -1531,12 +1579,37 @@ def _batch_rows(
         rows.append({
             **dict(case),
             "m2_mm2": float(moments[index].detach().cpu()),
+            "astig_A_D": float(loss_metrics[index].detach().cpu())
+            if loss_metric_names[index] == "astig_A_D"
+            else 0.0,
+            "loss_metric": float(loss_metrics[index].detach().cpu()),
+            "loss_metric_name": loss_metric_names[index],
             "score": float(scores[index].detach().cpu()),
             "valid_fraction": vf,
             "valid_fraction_ratio": ratio,
             "edge_fraction": float(result.edge_fraction[index].detach().cpu()),
         })
     return rows
+
+
+def _loss_metrics_for_batch(
+    model: MinimalOpticalModel,
+    cases: Sequence[Mapping[str, Any]],
+    moments: torch.Tensor,
+) -> tuple[torch.Tensor, list[str]]:
+    needs_astig = any(str(case["training_group"]) in PERIPHERAL_GROUPS for case in cases)
+    astig_by_zone = model.astig_A_by_zone() if needs_astig else {}
+    metrics: list[torch.Tensor] = []
+    names: list[str] = []
+    for index, case in enumerate(cases):
+        group = str(case["training_group"])
+        if group in PERIPHERAL_GROUPS:
+            metrics.append(astig_by_zone[GROUP_TO_ZONE[group]])
+            names.append("astig_A_D")
+        else:
+            metrics.append(moments[index])
+            names.append("m2_mm2")
+    return torch.stack(metrics), names
 
 
 def _evaluate_original_training_baseline_with_resume(
@@ -1624,8 +1697,11 @@ def _evaluate_original_training_baseline_with_resume(
             moments = psf_second_moment_mm2_batch(
                 result.kernels, pixel_pitch_mm=result.pixel_pitch_mm,
             )
-            scores = torch.ones_like(moments)
-        batch_rows = _batch_rows(batch, result, moments, None, scores)
+            loss_metrics, loss_metric_names = _loss_metrics_for_batch(model, batch, moments)
+            scores = torch.ones_like(loss_metrics)
+        batch_rows = _batch_rows(
+            batch, result, moments, loss_metrics, loss_metric_names, None, scores,
+        )
         for row in batch_rows:
             row["group_loss"] = 1.0
         training_rows.extend(batch_rows)
@@ -1636,7 +1712,7 @@ def _evaluate_original_training_baseline_with_resume(
             flush=True,
         )
         result_device = result.kernels.device
-        del result, energy, moments, scores
+        del result, energy, moments, loss_metrics, scores
         _release_inactive_case_cuda_cache(result_device)
     save_progress("complete")
     baseline_value, baseline_health = _summarize_training_baseline(training_rows)
@@ -1682,16 +1758,21 @@ def _evaluate(
             if bool((energy - 1.0).abs().max() > 1e-10):
                 raise ValueError("evaluation batch contains a non-unit PSF energy")
             moments = psf_second_moment_mm2_batch(result.kernels, pixel_pitch_mm=result.pixel_pitch_mm)
+            loss_metrics, loss_metric_names = _loss_metrics_for_batch(model, batch, moments)
             if baseline is None:
-                scores = torch.ones_like(moments)
+                scores = torch.ones_like(loss_metrics)
             else:
                 denominators = []
                 for case in batch:
-                    denominator = float(baseline[str(case["case_id"])]["m2_mm2"])
+                    denominator = float(baseline[str(case["case_id"])]["loss_metric"])
                     if not math.isfinite(denominator) or denominator <= 0.0:
-                        raise ValueError(f"invalid Original PAL M2 denominator for {case['case_id']}: {denominator}")
+                        raise ValueError(
+                            f"invalid Original PAL loss denominator for {case['case_id']}: {denominator}"
+                        )
                     denominators.append(denominator)
-                scores = moments / torch.as_tensor(denominators, device=moments.device, dtype=moments.dtype)
+                scores = loss_metrics / torch.as_tensor(
+                    denominators, device=loss_metrics.device, dtype=loss_metrics.dtype,
+                )
             coefficients = torch.as_tensor(
                 [
                     functional_weight / (3.0 * group_counts[str(case["training_group"])])
@@ -1714,7 +1795,17 @@ def _evaluate(
             ratio = 1.0 if baseline_valid is None else vf / float(baseline_valid[str(case["case_id"])])
             minimum_ratio = min(minimum_ratio, ratio)
             maximum_edge = max(maximum_edge, float(result.edge_fraction[index].detach().cpu()))
-        rows.extend(_batch_rows(batch, result, moments, baseline_valid, scores))
+        rows.extend(
+            _batch_rows(
+                batch,
+                result,
+                moments,
+                loss_metrics,
+                loss_metric_names,
+                baseline_valid,
+                scores,
+            )
+        )
         completed = min(batch_index * batch_size, len(cases))
         if print_progress and (batch_index % 8 == 0 or batch_index == len(batches)):
             batch_loss_value = float(batch_loss.detach().cpu())
@@ -1735,7 +1826,7 @@ def _evaluate(
                     flush=True,
                 )
         result_device = result.kernels.device
-        del result, energy, moments, scores, coefficients, batch_loss
+        del result, energy, moments, loss_metrics, scores, coefficients, batch_loss
         _release_inactive_case_cuda_cache(result_device)
     group_losses = {
         name: sum(group_values[name]) / len(group_values[name])
@@ -1753,7 +1844,10 @@ def _evaluate(
         "J_peripheral": float(peripheral),
         "J_total": float(objective_value),
     })
-    objective_name = "J=0.85*J_functional+0.15*J_peripheral"
+    objective_name = (
+        "J=0.85*J_functional(M2/M2_original)+"
+        "0.15*J_peripheral(A_D/A_D_original)"
+    )
     return float(objective_value), rows, {
         "minimum_valid_fraction_ratio": minimum_ratio,
         "maximum_edge_fraction": maximum_edge,
@@ -2023,6 +2117,7 @@ def _run_bound(
     base_sag, power_config, zones = load_pal(config, device)
     module = FixedWeightNURBSPerturbation(7, device=device, dtype=torch.float64)
     model = MinimalOpticalModel(config, module)
+    model.set_prescription_context(base_sag, power_config, zones)
     write_state("case_layout")
     training_cases = _prepare_or_load_case_layout(
         config, output, model, identity_sha256=identity_sha256,
@@ -2580,7 +2675,10 @@ def _run_bound(
     summary = {
         "identity_sha256": identity_sha256,
         "baseline_J": baseline_value,
-        "objective_name": "J=0.85*J_functional+0.15*J_peripheral",
+        "objective_name": (
+            "J=0.85*J_functional(M2/M2_original)+"
+            "0.15*J_peripheral(A_D/A_D_original)"
+        ),
         "training_case_count": len(training_cases),
         "training_groups": {
             name: sum(row["training_group"] == name for row in training_cases)

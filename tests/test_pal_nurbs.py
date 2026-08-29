@@ -174,6 +174,12 @@ def test_joint_loss_uses_region_means_then_085_015_weighting() -> None:
             kernel[1, 2] = edge
             return FieldResult(kernel, torch.tensor(1.0), 1.0, torch.tensor(0.0))
 
+        def astig_A_by_zone(self) -> dict[str, torch.Tensor]:
+            return {
+                "astig_left": torch.sigmoid(parameter * 2.5),
+                "astig_right": torch.sigmoid(parameter * 3.5),
+            }
+
     cases = [
         {"case_id": "f1", "training_group": "far", "scale": 1.0},
         {"case_id": "f2", "training_group": "far", "scale": 3.0},
@@ -182,8 +188,14 @@ def test_joint_loss_uses_region_means_then_085_015_weighting() -> None:
         {"case_id": "pl1", "training_group": "peripheral_left", "scale": 2.5},
         {"case_id": "pr1", "training_group": "peripheral_right", "scale": 3.5},
     ]
-    baseline = {case["case_id"]: {"m2_mm2": 0.25} for case in cases}
-    value, _, health = _evaluate(Model(), cases, baseline, with_grad=True)
+    baseline = {case["case_id"]: {"loss_metric": 0.25} for case in cases}
+    value, rows, health = _evaluate(Model(), cases, baseline, with_grad=True)
+    metrics = {str(row["training_group"]): str(row["loss_metric_name"]) for row in rows}
+    assert all(metrics[group] == "m2_mm2" for group in ("far", "intermediate", "near"))
+    assert all(
+        metrics[group] == "astig_A_D"
+        for group in ("peripheral_left", "peripheral_right")
+    )
     expected_functional = (health["J_far"] + health["J_intermediate"] + health["J_near"]) / 3
     expected = 0.85 * expected_functional + 0.15 * health["J_peripheral"]
     assert abs(health["J_functional"] - expected_functional) < 1e-15
@@ -206,7 +218,12 @@ def test_joint_loss_uses_region_means_then_085_015_weighting() -> None:
         torch.stack((score(1.0), score(3.0))).mean()
         + score(2.0)
         + score(4.0)
-    ) / 3.0 + 0.15 * torch.stack((score(2.5), score(3.5))).mean()
+    ) / 3.0 + 0.15 * torch.stack(
+        (
+            torch.sigmoid(reference_parameter * 2.5) / 0.25,
+            torch.sigmoid(reference_parameter * 3.5) / 0.25,
+        )
+    ).mean()
     expected_tensor.backward()
     assert reference_parameter.grad is not None
     assert torch.allclose(
@@ -248,6 +265,12 @@ def test_evaluate_uses_one_backward_per_partial_case_batch(
                 edge_fraction=torch.zeros_like(edge),
             )
 
+        def astig_A_by_zone(self) -> dict[str, torch.Tensor]:
+            return {
+                "astig_left": torch.sigmoid(parameter * 4.0),
+                "astig_right": torch.sigmoid(parameter * 5.0),
+            }
+
     cases = [
         {"case_id": "f", "training_group": "far", "scale": 1.0},
         {"case_id": "m", "training_group": "intermediate", "scale": 2.0},
@@ -255,7 +278,7 @@ def test_evaluate_uses_one_backward_per_partial_case_batch(
         {"case_id": "pl", "training_group": "peripheral_left", "scale": 4.0},
         {"case_id": "pr", "training_group": "peripheral_right", "scale": 5.0},
     ]
-    baseline = {case["case_id"]: {"m2_mm2": 1.0} for case in cases}
+    baseline = {case["case_id"]: {"loss_metric": 1.0} for case in cases}
     model = Model()
     value, rows, health = _evaluate(
         model,
@@ -756,6 +779,12 @@ def test_original_training_baseline_progress_resumes_at_the_exact_next_case(tmp_
             kernel[1, 2] = 0.25
             return FieldResult(kernel, torch.tensor(1.0), 1.0, torch.tensor(0.01))
 
+        def astig_A_by_zone(self) -> dict[str, torch.Tensor]:
+            return {
+                "astig_left": torch.tensor(0.2, dtype=torch.float64),
+                "astig_right": torch.tensor(0.3, dtype=torch.float64),
+            }
+
     path = tmp_path / "baseline_progress.pt"
     first = Model(fail_case="n")
     with pytest.raises(RuntimeError, match="synthetic interruption"):
@@ -857,6 +886,17 @@ def test_interrupted_training_resume_matches_uninterrupted_adam_state(
             self._cache = {}
             self._templates = {}
 
+        def set_prescription_context(self, sag, power_config, zones) -> None:
+            return None
+
+        def astig_A_by_zone(self) -> dict[str, torch.Tensor]:
+            zero = torch.zeros((), dtype=torch.float64)
+            delta = self.perturbation.delta_raw(zero, zero)
+            return {
+                "astig_left": torch.sigmoid(-0.5 + delta),
+                "astig_right": torch.sigmoid(-0.25 + delta),
+            }
+
         def field(self, case: dict[str, object]) -> FieldResult:
             zero = torch.zeros((), dtype=torch.float64)
             delta = self.perturbation.delta_raw(zero, zero)
@@ -950,6 +990,12 @@ def test_joint_loss_fails_closed_when_a_case_is_detached_from_nurbs() -> None:
             kernel[1, 2] = 0.5
             return FieldResult(kernel, torch.tensor(1.0), 1.0, torch.tensor(0.0))
 
+        def astig_A_by_zone(self) -> dict[str, torch.Tensor]:
+            return {
+                "astig_left": torch.tensor(0.2, dtype=torch.float64),
+                "astig_right": torch.tensor(0.3, dtype=torch.float64),
+            }
+
     cases = [
         {"case_id": "f", "training_group": "far"},
         {"case_id": "m", "training_group": "intermediate"},
@@ -957,6 +1003,6 @@ def test_joint_loss_fails_closed_when_a_case_is_detached_from_nurbs() -> None:
         {"case_id": "pl", "training_group": "peripheral_left"},
         {"case_id": "pr", "training_group": "peripheral_right"},
     ]
-    baseline = {case["case_id"]: {"m2_mm2": 0.25} for case in cases}
+    baseline = {case["case_id"]: {"loss_metric": 0.25} for case in cases}
     with pytest.raises(RuntimeError, match="detached from NURBS"):
         _evaluate(DetachedModel(), cases, baseline, with_grad=True)
