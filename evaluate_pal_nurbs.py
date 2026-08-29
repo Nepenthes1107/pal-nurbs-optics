@@ -8,7 +8,6 @@ the fixed multidistance 7x7 runner by inspecting the checkpoint/config shape.
 from __future__ import annotations
 
 import argparse
-import csv
 import hashlib
 import json
 import math
@@ -335,15 +334,12 @@ def evaluate(run: Path, *, device_name: str, resume: bool) -> Path:
                     all_records.append({"state": state, "label": label, "row": row, "col": col, "psf": psf})
                     scores.append(score)
                     np.savez_compressed(evaluation / "psf" / f"{label}_{state}_r{row:02d}_c{col:02d}.npz", psf=psf, **health)
-                    with (evaluation / "mtf" / f"{label}_{state}_r{row:02d}_c{col:02d}.csv").open("w", newline="", encoding="utf-8") as handle:
-                        writer = csv.writer(handle); writer.writerow(["frequency_cycles_per_mm", "MTF_Sagittal", "MTF_Tangential"])
-                        writer.writerows(zip(COMMON_FREQ.tolist(), sag_curve.tolist(), tan_curve.tolist()))
                 mtf_scores[label][state] = np.asarray(scores, dtype=np.float64).reshape(9, 9, 3)
             finally:
                 model.close()
         mtf_scores[label]["delta"] = mtf_scores[label]["optimized"] - mtf_scores[label]["baseline"]
         for state in ("baseline", "optimized", "delta"):
-            np.savez_compressed(evaluation / "mtf" / f"{label}_{state}_map.npz", **{"sag": mtf_scores[label][state][..., 0], "tan": mtf_scores[label][state][..., 1], "mean": mtf_scores[label][state][..., 2]})
+            np.savez_compressed(evaluation / "mtf" / f"{label}_{state}_mean_map.npz", mean=mtf_scores[label][state][..., 2])
             _plot_map(evaluation / "mtf" / f"{label}_{state}_mean.png", mtf_scores[label][state][..., 2], title=f"{label} {state} weighted MTF mean", symmetric=state == "delta")
         _save_stitches(evaluation, label, [r for r in all_records if r["label"] == label], target)
     files = []
