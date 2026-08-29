@@ -82,16 +82,16 @@ def _selected_cases(*, far_distance: float = 100000.0) -> list[dict[str, object]
     )
 
 
-def _sampling_contract() -> dict[str, object]:
+def _sampling_contract(*, far_distance: float = 100000.0) -> dict[str, object]:
     return {
         "method": "test dense-field FPS",
         "zone_boundary_safety_mm": {"default": 1.5, "corridor": 1.0},
         "aperture_edge_safety_mm": 1.5,
         "object_distance_mm": {
-            "far": 100000.0, "intermediate": 2000.0, "near": 500.0,
+            "far": far_distance, "intermediate": 2000.0, "near": 500.0,
         },
         "peripheral_band_distance_mm": {
-            "upper": 100000.0, "middle": 2000.0, "lower": 500.0,
+            "upper": far_distance, "middle": 2000.0, "lower": 500.0,
         },
     }
 
@@ -214,6 +214,35 @@ def test_preoptimization_artifacts_record_candidates_and_five_groups(tmp_path) -
             band["coverage_gate"]["passed"]
             for band in coverage["zones"][side]["peripheral_band_coverage"].values()
         )
+
+
+def test_preoptimization_artifacts_accept_physical_infinity_for_far_distance(
+    tmp_path,
+) -> None:
+    zones_path = tmp_path / "zones.json"
+    zones_path.write_text(json.dumps(_zones_payload()), encoding="utf-8")
+    excel_path = tmp_path / "lens.xlsx"
+    excel_path.write_bytes(b"test lens identity")
+    cases = _selected_cases(far_distance=float("inf"))
+    for case in cases:
+        case["case_lens_x_mm"] = case["reference_lens_x_mm"]
+        case["case_lens_physical_y_mm"] = case["reference_lens_physical_y_mm"]
+        case["case_position_partition_zone"] = case["reference_partition_zone"]
+
+    output = write_preoptimization_artifacts(
+        output_dir=tmp_path / "preoptimization_infinity",
+        excel_path=excel_path,
+        zones_json=zones_path,
+        candidates=_traced_candidates(),
+        cases=cases,
+        reference_distance_mm=float("inf"),
+        sampling_contract=_sampling_contract(far_distance=float("inf")),
+    )
+
+    manifest = json.loads((output / "case_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["case_geometry_audit"]["passed"] is True
+    assert manifest["sampling_contract"]["object_distance_mm"]["far"] == float("inf")
+    assert manifest["sampling_contract"]["peripheral_band_distance_mm"]["upper"] == float("inf")
 
 
 def test_preoptimization_contract_rejects_task_distance_zone_crossing(tmp_path) -> None:

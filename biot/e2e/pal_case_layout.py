@@ -919,11 +919,24 @@ def _validate_selected_case_geometry(
         name: float(band_distances[name])
         for name in ("upper", "middle", "lower")
     }
-    if any(
-        not math.isfinite(value) or value <= 0.0
-        for value in (*resolved_distances.values(), *resolved_band_distances.values())
-    ):
-        raise ValueError("all training object distances must be finite and positive")
+
+    def valid_object_distance(value: float, *, allow_infinity: bool) -> bool:
+        return value > 0.0 and (
+            math.isfinite(value) or (allow_infinity and math.isinf(value))
+        )
+
+    for name, value in resolved_distances.items():
+        if not valid_object_distance(value, allow_infinity=name == "far"):
+            raise ValueError(
+                f"training {name} object distance must be positive"
+                + (" or Infinity" if name == "far" else " and finite")
+            )
+    for name, value in resolved_band_distances.items():
+        if not valid_object_distance(value, allow_infinity=name == "upper"):
+            raise ValueError(
+                f"peripheral {name} object distance must be positive"
+                + (" or Infinity" if name == "upper" else " and finite")
+            )
     required_band_mapping = {
         "upper": resolved_distances["far"],
         "middle": resolved_distances["intermediate"],
