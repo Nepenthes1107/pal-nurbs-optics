@@ -20,7 +20,7 @@
 ## 当前 PAL 多物距方法合同
 
 - 参数化后表面为固定权重 cubic B-spline `7×7` 控制网格，外圈控制环为零，仅内部 `5×5=25` 个控制量训练；不再存在 7×7→11×11→19×19 阶梯或 refinement audit。
-- 物距块严格为 `D500=500 mm`、`D1000=1000 mm`、`Dinf=Infinity`，每块复用 `(-55:11:55)` 的 `11×11` FOV 网格，总 case 数为 363。
+- 物距块严格为 `D500=500 mm`、`D1000=1000 mm`、`Dinf=Infinity`，每块复用由 `fov_min_deg`、`fov_max_deg`、`fov_step_deg` 决定的相同方形 FOV 网格；默认 `(-55:11:55)` 为 `11×11`，总 case 数为 363。范围不能被采样间隔整除时直接失败。
 - case 使用真实可微光线追迹、`legacy_pupil_phase=False` 的 `biot_reference_sphere` 参考和 `remove_tilt=False` 的 raw 物理 FFT PSF；far/corridor/near 的 loss 为 baseline-normalized PSF 二阶矩，astig-left/right 的 loss 为 baseline-normalized M/A 像散量 A。禁止训练路径使用 PSF crop、resize、插值或滤波。
 - 分区分类以 `zones.json` 的存储 mask 为主；monitored 内未标注单元使用记录在 case metadata 中的最近分区规则，任何固定点都不能静默丢弃。
 - 权重定义在 `inputs/pal/multidistance_weights.json`，联合权重总和严格为 1；far-D500 和 near-Dinf 为严格零权重，case 保留用于 baseline/validation 但不反传。
@@ -43,7 +43,7 @@
 
 ## 有效合同与限制
 
-- 当前训练 case 数量固定为 `3×121=363`，不是历史 80-case 合同。
+- 默认训练 case 数量为 `3×121=363`，实际数量由 FOV 范围和采样间隔计算，不是历史 80-case 合同。
 - `best_feasible` 必须来自完整覆盖周期且所有工程与健康约束通过。
 - 当前为去 tilt、单波长结果，不能外推为色差、棱镜、真实视物位置或几何畸变合格。
 - 普通 `--resume` 仅在同一目录 identity、配置、输入哈希和实现闭包完全一致时有效。当前批处理 method identity 及 run/evaluation/training schema 已更新，旧逐 case run 不兼容。

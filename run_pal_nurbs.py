@@ -27,6 +27,12 @@ def main() -> int:
     parser.add_argument("--fov-min-deg", type=float, default=MinimalConfig.fov_min_deg)
     parser.add_argument("--fov-max-deg", type=float, default=MinimalConfig.fov_max_deg)
     parser.add_argument(
+        "--fov-step-deg",
+        type=float,
+        default=MinimalConfig.fov_step_deg,
+        help="FOV 采样间隔（degree）；范围必须能被该间隔整除",
+    )
+    parser.add_argument(
         "--case-batch-size",
         type=int,
         default=MinimalConfig.case_batch_size,
@@ -69,6 +75,7 @@ def main() -> int:
         fft_size_px=args.fft_size_px,
         fov_min_deg=args.fov_min_deg,
         fov_max_deg=args.fov_max_deg,
+        fov_step_deg=args.fov_step_deg,
         case_batch_size=args.case_batch_size,
         max_accepted_steps=args.accepted_steps,
         early_stopping_patience=args.early_stopping_patience,

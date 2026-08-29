@@ -116,11 +116,11 @@ def test_fixed_distance_contract_is_exact() -> None:
     assert math.isinf(DISTANCE_SPECS[2].object_distance_mm)
 
 
-def test_config_requires_fixed_11_by_11_fov_grid() -> None:
-    with pytest.raises(ValueError, match="fov_count=11"):
-        MinimalConfig(fov_count=9)
+def test_config_derives_fov_grid_from_bounds_and_step() -> None:
+    with pytest.raises(ValueError, match="integer multiple"):
+        MinimalConfig(fov_min_deg=-50.0, fov_max_deg=55.0, fov_step_deg=11.0)
     config = MinimalConfig(device="cpu", requested_np=32, fft_size_px=64)
-    assert config.fov_count == 11
+    assert config.fov_step_deg == 11.0
     assert config.weights_json.endswith("multidistance_weights.json")
     assert config.max_accepted_steps == 50
     assert config.early_stopping_patience == 7
@@ -134,7 +134,7 @@ def test_config_requires_fixed_11_by_11_fov_grid() -> None:
         MinimalConfig(legacy_pupil_phase=True)
     with pytest.raises(ValueError, match="remove_tilt"):
         MinimalConfig(remove_tilt=True)
-    with pytest.raises(ValueError, match="FOV bounds"):
+    with pytest.raises(ValueError, match="integer multiple"):
         MinimalConfig(fov_min_deg=-32.0)
     with pytest.raises(ValueError, match="case_batch_size"):
         MinimalConfig(case_batch_size=0)

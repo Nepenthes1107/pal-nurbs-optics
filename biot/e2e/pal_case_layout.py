@@ -1,9 +1,9 @@
-"""固定多物距 11×11 FOV 网格及 PAL 分区权重。
+"""固定多物距规则 FOV 网格及 PAL 分区权重。
 
 本模块只负责非可微的实验布局：
 
 * 三个固定物距 ``500 mm``、``1000 mm`` 和无穷远；
-* 三个物距共用同一个 11×11 视场角网格；
+* 三个物距共用同一个由范围和采样间隔确定的方形视场角网格；
 * 用基线 PAL 后表面的 chief/reference ray 落点确定分区；
 * 将显式权重矩阵展开为每个 case 的归一化 loss 权重。
 
@@ -235,17 +235,31 @@ def classify_partition_point(
 
 
 def generate_fov_grid(
-    *, field_min_deg: float, field_max_deg: float, count: int = 11
+    *, field_min_deg: float, field_max_deg: float, field_step_deg: float
 ) -> list[dict[str, Any]]:
-    """Return one deterministic square 11×11 field-angle grid in degree."""
-    count = int(count)
-    if count != 11:
-        raise ValueError("the multidistance method requires an 11x11 FOV grid")
+    """Return a deterministic square FOV grid from bounds and angular spacing."""
     field_min = float(field_min_deg)
     field_max = float(field_max_deg)
+    field_step = float(field_step_deg)
     if not math.isfinite(field_min) or not math.isfinite(field_max) or field_max <= field_min:
         raise ValueError("FOV bounds must be finite with max > min")
-    values = np.linspace(field_min, field_max, count, dtype=np.float64)
+    if not math.isfinite(field_step) or field_step <= 0.0:
+        raise ValueError("FOV sampling interval must be finite and positive")
+    span = field_max - field_min
+    intervals = span / field_step
+    interval_count = int(round(intervals))
+    if interval_count < 1 or not math.isclose(
+        intervals, float(interval_count), rel_tol=0.0, abs_tol=1.0e-10
+    ):
+        raise ValueError(
+            "FOV range must be an integer multiple of the sampling interval"
+        )
+    values = field_min + field_step * np.arange(interval_count + 1, dtype=np.float64)
+    values[-1] = field_max
+    if not np.allclose(
+        np.diff(values), field_step, rtol=0.0, atol=1.0e-10
+    ) or not math.isclose(float(values[-1]), field_max, rel_tol=0.0, abs_tol=1.0e-10):
+        raise ValueError("generated FOV grid does not match the requested sampling interval")
     result: list[dict[str, Any]] = []
     for row, field_y in enumerate(values):
         for column, field_x in enumerate(values):
@@ -370,17 +384,19 @@ def build_multidistance_layout(
     partition_map: PartitionMap,
     weight_spec: Mapping[str, Any],
     trace_reference: Callable[[float, float, float], tuple[float, float]],
-    field_count: int = 11,
+    field_step_deg: float,
     distance_specs: Sequence[DistanceSpec] = DISTANCE_SPECS,
     prefix_cases: Sequence[Mapping[str, Any]] = (),
     progress_callback: Callable[[Sequence[Mapping[str, Any]]], None] | None = None,
 ) -> list[dict[str, Any]]:
-    """Build all ``3 × 11 × 11`` cases without selection or dropping."""
+    """Build all distance × FOV cases without selection or dropping."""
     specs = tuple(distance_specs)
     if tuple(spec.label for spec in specs) != DISTANCE_LABELS:
         raise ValueError("distance specs must be exactly D500, D1000, Dinf")
     field_grid = generate_fov_grid(
-        field_min_deg=field_min_deg, field_max_deg=field_max_deg, count=field_count
+        field_min_deg=field_min_deg,
+        field_max_deg=field_max_deg,
+        field_step_deg=field_step_deg,
     )
     expected_count = len(specs) * len(field_grid)
     prefix = [dict(row) for row in prefix_cases]

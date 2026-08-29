@@ -55,7 +55,7 @@ def _synthetic_partition() -> PartitionMap:
 
 
 def test_fov_grid_is_exactly_11_by_11_and_deterministic() -> None:
-    grid = generate_fov_grid(field_min_deg=-10.0, field_max_deg=10.0, count=11)
+    grid = generate_fov_grid(field_min_deg=-10.0, field_max_deg=10.0, field_step_deg=2.0)
     assert len(grid) == 121
     assert grid[0] == {
         "grid_row": 0,
@@ -67,12 +67,12 @@ def test_fov_grid_is_exactly_11_by_11_and_deterministic() -> None:
     assert grid[-1]["field_y_deg"] == 10.0
     assert grid[60]["field_x_deg"] == 0.0
     assert grid[60]["field_y_deg"] == 0.0
-    with pytest.raises(ValueError, match="11x11"):
-        generate_fov_grid(field_min_deg=-1.0, field_max_deg=1.0, count=9)
+    with pytest.raises(ValueError, match="integer multiple"):
+        generate_fov_grid(field_min_deg=-1.0, field_max_deg=1.0, field_step_deg=0.3)
 
 
 def test_multidistance_training_fov_contract_is_minus55_to_plus55_step11() -> None:
-    grid = generate_fov_grid(field_min_deg=-55.0, field_max_deg=55.0, count=11)
+    grid = generate_fov_grid(field_min_deg=-55.0, field_max_deg=55.0, field_step_deg=11.0)
     expected = [-55.0, -44.0, -33.0, -22.0, -11.0, 0.0, 11.0, 22.0, 33.0, 44.0, 55.0]
     assert [row["field_x_deg"] for row in grid[:11]] == expected
     assert [row["field_y_deg"] for row in grid[::11]] == expected
@@ -143,6 +143,7 @@ def test_build_multidistance_layout_has_three_complete_shared_grids() -> None:
     cases = build_multidistance_layout(
         field_min_deg=-10.0,
         field_max_deg=10.0,
+        field_step_deg=2.0,
         partition_map=partition,
         weight_spec=_weight_spec(),
         trace_reference=trace_reference,

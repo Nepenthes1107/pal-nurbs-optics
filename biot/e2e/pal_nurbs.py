@@ -84,7 +84,7 @@ class MinimalConfig:
     pupil_radius_mm: float | None = None
     fov_min_deg: float = -55.0
     fov_max_deg: float = 55.0
-    fov_count: int = 11
+    fov_step_deg: float = 11.0
     legacy_pupil_phase: bool = False
     phase_reference: str = "biot_reference_sphere"
     remove_tilt: bool = False
@@ -109,19 +109,19 @@ class MinimalConfig:
             raise ValueError("PAL requires phase_reference='biot_reference_sphere'")
         if bool(self.remove_tilt):
             raise ValueError("PAL requires remove_tilt=False with the BIOT reference sphere")
-        if int(self.fov_count) != 11:
-            raise ValueError("the multidistance PAL method requires fov_count=11")
-        expected_step = (55.0 - (-55.0)) / 10.0
-        if float(self.fov_min_deg) != -55.0 or float(self.fov_max_deg) != 55.0:
-            raise ValueError("the multidistance PAL method requires FOV bounds -55..55 degrees")
-        if not math.isclose(expected_step, 11.0, rel_tol=0.0, abs_tol=1.0e-12):
-            raise ValueError("the multidistance PAL method requires an 11 degree FOV step")
         if int(self.case_batch_size) <= 0:
             raise ValueError("case_batch_size must be positive")
         if not math.isfinite(float(self.fov_min_deg)) or not math.isfinite(float(self.fov_max_deg)):
             raise ValueError("FOV bounds must be finite")
         if float(self.fov_max_deg) <= float(self.fov_min_deg):
             raise ValueError("fov_max_deg must be greater than fov_min_deg")
+        if not math.isfinite(float(self.fov_step_deg)) or float(self.fov_step_deg) <= 0.0:
+            raise ValueError("fov_step_deg must be finite and positive")
+        interval_count = (float(self.fov_max_deg) - float(self.fov_min_deg)) / float(self.fov_step_deg)
+        if interval_count < 1.0 or not math.isclose(
+            interval_count, round(interval_count), rel_tol=0.0, abs_tol=1.0e-10
+        ):
+            raise ValueError("FOV range must be an integer multiple of fov_step_deg")
         if int(self.requested_np) <= 1 or int(self.fft_size_px) <= 0:
             raise ValueError("requested_np must be >1 and fft_size_px must be positive")
         if self.pupil_radius_mm is not None and (
@@ -996,9 +996,9 @@ def _layout_identity(config: MinimalConfig) -> dict[str, Any]:
         "schema_version": CASE_LAYOUT_SCHEMA_VERSION,
         "method": METHOD_NAME,
         "field_grid": {
-            "count": int(config.fov_count),
             "min_deg": float(config.fov_min_deg),
             "max_deg": float(config.fov_max_deg),
+            "step_deg": float(config.fov_step_deg),
         },
         "distance_specs": [
             {
@@ -1016,7 +1016,10 @@ def _layout_identity(config: MinimalConfig) -> dict[str, Any]:
 
 
 def _validate_layout_cases(cases: Sequence[Mapping[str, Any]], config: MinimalConfig) -> None:
-    block_size = int(config.fov_count) * int(config.fov_count)
+    fov_axis_count = int(round(
+        (float(config.fov_max_deg) - float(config.fov_min_deg)) / float(config.fov_step_deg)
+    )) + 1
+    block_size = fov_axis_count * fov_axis_count
     expected = len(DISTANCE_SPECS) * block_size
     if len(cases) != expected:
         raise ValueError(f"case layout has {len(cases)} cases, expected {expected}")
@@ -1035,7 +1038,7 @@ def _validate_layout_cases(cases: Sequence[Mapping[str, Any]], config: MinimalCo
     field_grid = generate_fov_grid(
         field_min_deg=config.fov_min_deg,
         field_max_deg=config.fov_max_deg,
-        count=config.fov_count,
+        field_step_deg=config.fov_step_deg,
     )
     expected_grid = [
         (
@@ -1186,7 +1189,7 @@ def _prepare_or_load_case_layout(
     cases = build_multidistance_layout(
         field_min_deg=config.fov_min_deg,
         field_max_deg=config.fov_max_deg,
-        field_count=config.fov_count,
+        field_step_deg=config.fov_step_deg,
         partition_map=partition_map,
         weight_spec=weight_spec,
         trace_reference=model.reference_rear_intersection,
@@ -2223,9 +2226,9 @@ def _run_bound(
                 for spec in DISTANCE_SPECS
             ],
             "fov_grid": {
-                "count": config.fov_count,
                 "min_deg": config.fov_min_deg,
                 "max_deg": config.fov_max_deg,
+                "step_deg": config.fov_step_deg,
             },
             "case_batch_size": config.case_batch_size,
             "case_batch_count": (len(cases) + config.case_batch_size - 1)
