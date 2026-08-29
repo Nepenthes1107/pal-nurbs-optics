@@ -56,8 +56,8 @@ from .system import (
 )
 
 
-METHOD_NAME = "pal_multidistance_batched_baseline_normalized_m2_astig_a_bspline7"
-RUN_IDENTITY_SCHEMA_VERSION = 4
+METHOD_NAME = "pal_multidistance_raw_psf_nonlegacy_m2_astig_a_bspline7"
+RUN_IDENTITY_SCHEMA_VERSION = 5
 CASE_LAYOUT_SCHEMA_VERSION = 1
 EVALUATION_PROGRESS_SCHEMA_VERSION = 2
 TRAINING_RESUME_SCHEMA_VERSION = 2
@@ -82,9 +82,12 @@ class MinimalConfig:
     requested_np: int = 256
     fft_size_px: int = 512
     pupil_radius_mm: float | None = None
-    fov_min_deg: float = -32.0
-    fov_max_deg: float = 32.0
+    fov_min_deg: float = -55.0
+    fov_max_deg: float = 55.0
     fov_count: int = 11
+    legacy_pupil_phase: bool = False
+    phase_reference: str = "biot_reference_sphere"
+    remove_tilt: bool = False
     case_batch_size: int = 8
     max_accepted_steps: int = 50
     early_stopping_patience: int = 7
@@ -100,8 +103,19 @@ class MinimalConfig:
     seed: int = 42
 
     def __post_init__(self) -> None:
+        if bool(self.legacy_pupil_phase):
+            raise ValueError("legacy_pupil_phase=True is not supported by the PAL contract")
+        if self.phase_reference != "biot_reference_sphere":
+            raise ValueError("PAL requires phase_reference='biot_reference_sphere'")
+        if bool(self.remove_tilt):
+            raise ValueError("PAL requires remove_tilt=False with the BIOT reference sphere")
         if int(self.fov_count) != 11:
             raise ValueError("the multidistance PAL method requires fov_count=11")
+        expected_step = (55.0 - (-55.0)) / 10.0
+        if float(self.fov_min_deg) != -55.0 or float(self.fov_max_deg) != 55.0:
+            raise ValueError("the multidistance PAL method requires FOV bounds -55..55 degrees")
+        if not math.isclose(expected_step, 11.0, rel_tol=0.0, abs_tol=1.0e-12):
+            raise ValueError("the multidistance PAL method requires an 11 degree FOV step")
         if int(self.case_batch_size) <= 0:
             raise ValueError("case_batch_size must be positive")
         if not math.isfinite(float(self.fov_min_deg)) or not math.isfinite(float(self.fov_max_deg)):
@@ -755,9 +769,7 @@ class MinimalOpticalModel:
         field_x = float(case["field_x_deg"])
         field_y = float(case["field_y_deg"])
         system, rays = self._system_and_rays(spec.object_distance_mm, field_x, field_y)
-        trace = trace_system_to_image_with_phase(
-            system, rays, phase_reference="biot_reference_sphere"
-        )
+        trace = trace_system_to_image_with_phase(system, rays, phase_reference=self.config.phase_reference)
         if not bool(trace.valid.any()):
             raise RuntimeError(f"no valid rays for {case['case_id']}")
         fft = torch_fft_psf_from_phase(
@@ -769,7 +781,7 @@ class MinimalOpticalModel:
             # The non-legacy BIOT reference sphere already defines the
             # de-tilted physical pupil.  A second fitted linear-phase removal
             # shifts the authoritative FFT PSF and must not be applied here.
-            remove_tilt=False,
+            remove_tilt=self.config.remove_tilt,
         )
         pitch = system.physical_fft_pixel_pitch_mm
         if pitch is None:
@@ -814,7 +826,7 @@ class MinimalOpticalModel:
             trace = trace_system_batch_to_image_with_phase(
                 systems,
                 rays_by_case,
-                phase_reference="biot_reference_sphere",
+                phase_reference=self.config.phase_reference,
             )
         if not bool(trace.valid.any(dim=1).all()):
             failed = [
@@ -829,7 +841,7 @@ class MinimalOpticalModel:
             sample_count=self.sample_count,
             psf_size_px=self.config.fft_size_px,
             remove_piston=True,
-            remove_tilt=False,
+            remove_tilt=self.config.remove_tilt,
         )
         pitch = torch.as_tensor(pitches, device=self.device, dtype=self.dtype)
         return FieldResult(

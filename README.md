@@ -51,8 +51,9 @@ python -m biot.gui
 ## PAL-NURBS 合同
 
 - 仅优化 PAL 后表面的固定权重 cubic B-spline `zp` 控制量；`xp/yp/weight` 固定，外圈控制环固定为零。参数网格为单一 `7×7`，实际可训练的内层为 `5×5=25` 个控制量。
-- 三个物距分别为 `D500=500 mm`、`D1000=1000 mm` 和 `Dinf=Infinity`。每个物距使用完全相同的 `11×11` FOV 角度网格，总计 `3×121=363` 个真实 case；无有限距离近似 Infinity。
+- 三个物距分别为 `D500=500 mm`、`D1000=1000 mm` 和 `Dinf=Infinity`。每个物距使用 `(-55:11:55)` 的 `11×11` FOV 角度网格，总计 `3×121=363` 个真实 case；无有限距离近似 Infinity。
 - case 布局使用基线 PAL 后表面的 chief/reference ray 落点映射到 `inputs/pal/zones.json`。固定网格点不因稀疏、FPS、WFNO 资格或覆盖率筛选而删除；落在 monitored 安全带但未标注分区的点按显式最近分区规则分类，并记录分类模式和距离。
+- 训练和评价固定使用 `legacy_pupil_phase=False` 的 `biot_reference_sphere` 参考与 `remove_tilt=False`；训练 loss 直接使用 raw 物理 FFT PSF，不使用 130×130 crop/render kernel。
 - 默认每批 8 个 case 以真实 `[B,N,3]` 张量共同执行可微追迹、连续 OPL 和 `[B,P,P]` 去 pupil tilt raw 物理 FFT PSF；聚合该批 loss 后只调用一次 `backward()`，完整 363-case sweep 结束后才执行一次 optimizer step。最后不足 8 个的批按实际数量运行，不填充、不丢弃；`--case-batch-size` 必须是正整数，CUDA OOM 直接失败，不自动缩批。
 - far/corridor/near 使用能量归一化 PSF 二阶矩（`mm²`），astig-left/right 使用 M/A 中的像散量 A（`D`）；每个 zone×distance 组合除以其 PAL 零残差 baseline 指标。PSF 不做 crop、resize、插值、滤波或显示增强，离线 PSF 也不参与反传。
 - 固定联合权重为 far `(0, 0.050, 0.200)`、corridor `(0.025, 0.200, 0.025)`、near `(0.200, 0.050, 0)`、两个 astig 侧各 `(0.125/3, 0.125/3, 0.125/3)`，距离顺序均为 `D500/D1000/Dinf`；总和严格为 1。零权重 case 仍进入 baseline/validation sweep，但不进入优化梯度。

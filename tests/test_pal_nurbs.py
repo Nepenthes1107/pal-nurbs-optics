@@ -125,6 +125,17 @@ def test_config_requires_fixed_11_by_11_fov_grid() -> None:
     assert config.max_accepted_steps == 50
     assert config.early_stopping_patience == 7
     assert config.case_batch_size == 8
+    assert config.fov_min_deg == -55.0
+    assert config.fov_max_deg == 55.0
+    assert config.legacy_pupil_phase is False
+    assert config.phase_reference == "biot_reference_sphere"
+    assert config.remove_tilt is False
+    with pytest.raises(ValueError, match="legacy_pupil_phase"):
+        MinimalConfig(legacy_pupil_phase=True)
+    with pytest.raises(ValueError, match="remove_tilt"):
+        MinimalConfig(remove_tilt=True)
+    with pytest.raises(ValueError, match="FOV bounds"):
+        MinimalConfig(fov_min_deg=-32.0)
     with pytest.raises(ValueError, match="case_batch_size"):
         MinimalConfig(case_batch_size=0)
 

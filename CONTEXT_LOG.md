@@ -20,8 +20,8 @@
 ## 当前 PAL 多物距方法合同
 
 - 参数化后表面为固定权重 cubic B-spline `7×7` 控制网格，外圈控制环为零，仅内部 `5×5=25` 个控制量训练；不再存在 7×7→11×11→19×19 阶梯或 refinement audit。
-- 物距块严格为 `D500=500 mm`、`D1000=1000 mm`、`Dinf=Infinity`，每块复用同一个 `11×11` FOV 网格，总 case 数为 363。
-- case 使用真实可微光线追迹和去 pupil tilt 的 raw 物理 FFT PSF；far/corridor/near 的 loss 为 baseline-normalized PSF 二阶矩，astig-left/right 的 loss 为 baseline-normalized M/A 像散量 A。禁止 PSF crop、resize、插值、滤波和离线 PSF 反传。
+- 物距块严格为 `D500=500 mm`、`D1000=1000 mm`、`Dinf=Infinity`，每块复用 `(-55:11:55)` 的 `11×11` FOV 网格，总 case 数为 363。
+- case 使用真实可微光线追迹、`legacy_pupil_phase=False` 的 `biot_reference_sphere` 参考和 `remove_tilt=False` 的 raw 物理 FFT PSF；far/corridor/near 的 loss 为 baseline-normalized PSF 二阶矩，astig-left/right 的 loss 为 baseline-normalized M/A 像散量 A。禁止训练路径使用 PSF crop、resize、插值或滤波。
 - 分区分类以 `zones.json` 的存储 mask 为主；monitored 内未标注单元使用记录在 case metadata 中的最近分区规则，任何固定点都不能静默丢弃。
 - 权重定义在 `inputs/pal/multidistance_weights.json`，联合权重总和严格为 1；far-D500 和 near-Dinf 为严格零权重，case 保留用于 baseline/validation 但不反传。
 - 默认 `case_batch_size=8`：每批执行 `[B,N,3]` 真实张量追迹、`[B,P,P]` FFT PSF、批 loss 聚合和一次 backward；下一批继续在 PAL 参数上累积梯度，完整 363-case sweep 后才执行一次 optimizer step。最后一批使用实际 case 数；OOM 直接失败，不自动缩批。

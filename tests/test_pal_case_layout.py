@@ -71,6 +71,15 @@ def test_fov_grid_is_exactly_11_by_11_and_deterministic() -> None:
         generate_fov_grid(field_min_deg=-1.0, field_max_deg=1.0, count=9)
 
 
+def test_multidistance_training_fov_contract_is_minus55_to_plus55_step11() -> None:
+    grid = generate_fov_grid(field_min_deg=-55.0, field_max_deg=55.0, count=11)
+    expected = [-55.0, -44.0, -33.0, -22.0, -11.0, 0.0, 11.0, 22.0, 33.0, 44.0, 55.0]
+    assert [row["field_x_deg"] for row in grid[:11]] == expected
+    assert [row["field_y_deg"] for row in grid[::11]] == expected
+    assert len(grid) == 121
+    assert [(row["grid_row"], row["grid_column"]) for row in grid[:3]] == [(0, 0), (0, 1), (0, 2)]
+
+
 def test_partition_map_uses_stored_masks_and_explicit_nearest_extension() -> None:
     partition = _synthetic_partition()
     stored = partition.classify(x_mm=0.0, physical_y_mm=2.0)
