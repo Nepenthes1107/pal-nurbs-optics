@@ -129,6 +129,30 @@ def test_config_requires_fixed_11_by_11_fov_grid() -> None:
         MinimalConfig(case_batch_size=0)
 
 
+def test_raw_psf_batch_reuses_verified_multidistance_field_batch() -> None:
+    model = object.__new__(MinimalOpticalModel)
+    calls: list[list[str]] = []
+    expected = FieldResult(
+        psf=torch.zeros((3, 8, 8), dtype=torch.float64),
+        valid_fraction=torch.tensor([1.0, 0.75, 0.5], dtype=torch.float64),
+        pixel_pitch_mm=torch.tensor([0.01, 0.011, 0.012], dtype=torch.float64),
+        edge_fraction=torch.zeros(3, dtype=torch.float64),
+        valid_mask=torch.ones((3, 4), dtype=torch.bool),
+    )
+
+    def field_batch(cases):
+        calls.append([str(case["case_id"]) for case in cases])
+        return expected
+
+    model.field_batch = field_batch
+    cases = [{"case_id": f"c{index}"} for index in range(3)]
+    result = model.raw_psf_batch(cases)
+    assert calls == [["c0", "c1", "c2"]]
+    assert result.psf is expected.psf
+    assert result.valid_fraction is expected.valid_fraction
+    assert result.pixel_pitch_mm is expected.pixel_pitch_mm
+
+
 def test_training_log_appends_durable_human_readable_records(tmp_path) -> None:
     path = tmp_path / "training.log"
     _append_training_log(path, "[pal-train] attempt=3 accepted=2/50 update=ACCEPT loss=0.8")

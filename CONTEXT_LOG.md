@@ -31,6 +31,7 @@
   分别保存为六个 HDF5，每个文件含 81 个场点的原始 FFT PSF、130×130 渲染
   PSF及最小恢复信息。只有数据库整体 `complete` 后才运行 weighted-MTF Mean、
   PSF stitch 和 chart stitch；chart 的 `blur-scale` 默认 4且仅影响显示。
+- PSF 数据库默认通过 `raw_psf_batch()` 以 `psf_batch_size=8` 做原生 FFT PSF case 批量追迹；批大小纳入评价 identity。已完成 HDF5 节点仍逐个核验，未完成节点按小批量恢复；不自动缩批或串行回退。
 
 ## 历史 r12
 

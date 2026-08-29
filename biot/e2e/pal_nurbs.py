@@ -378,6 +378,15 @@ def _open_run_directory(config: MinimalConfig, *, resume: bool) -> tuple[Path, d
     return output, current
 
 
+@dataclass(frozen=True)
+class RawPSFBatchResult:
+    """评价用原生 FFT PSF 批量结果；首维严格对应输入 case 顺序。"""
+
+    psf: torch.Tensor
+    valid_fraction: torch.Tensor
+    pixel_pitch_mm: torch.Tensor
+
+
 def _elapsed_seconds(output: Path) -> float:
     path = output / "run_state.json"
     if not path.is_file():
@@ -831,6 +840,17 @@ class MinimalOpticalModel:
             valid_mask=trace.valid,
         )
 
+    def raw_psf_batch(self, cases: Sequence[Mapping[str, Any]]) -> RawPSFBatchResult:
+        """发布评价所需的原生 PSF 批量，不重写已验证的批量追迹。"""
+        result = self.field_batch(cases)
+        if not isinstance(result.pixel_pitch_mm, torch.Tensor):
+            raise TypeError("field_batch pixel_pitch_mm must be a tensor for raw PSF evaluation")
+        return RawPSFBatchResult(
+            psf=result.psf,
+            valid_fraction=result.valid_fraction,
+            pixel_pitch_mm=result.pixel_pitch_mm,
+        )
+
     def close(self) -> None:
         for system, _ in self._cache.values():
             system.release_biot_lens()
@@ -838,7 +858,6 @@ class MinimalOpticalModel:
             system.release_biot_lens()
         self._cache.clear()
         self._templates.clear()
-
 
 def _finite_difference(values: torch.Tensor, pitch: float) -> tuple[torch.Tensor, torch.Tensor]:
     dy = torch.empty_like(values)

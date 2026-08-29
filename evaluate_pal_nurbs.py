@@ -33,7 +33,7 @@ from optics import compute_dc_normalized_mtf
 from biot.e2e import pal_nurbs as pal
 
 
-EVAL_SCHEMA = 2
+EVAL_SCHEMA = 3
 PSF_DATABASE_SCHEMA = 1
 STAGE_MANIFEST_SCHEMA = 1
 FIELD_VALUES = tuple(float(value) for value in np.arange(-40.0, 40.0 + 0.1, 10.0))
@@ -290,18 +290,34 @@ def _render_psf(raw_psf: np.ndarray, raw_pixel_pitch_mm: float) -> tuple[np.ndar
     return render, float(crop_size_px * pitch / RENDER_SIZE_PX)
 
 
-def _native_psf(result: Any) -> tuple[np.ndarray, float, float]:
-    """Use the explicit branch contract; never guess or fall back between fields."""
-    if hasattr(pal, "DISTANCE_SPECS"):
-        tensor, pitch = result.psf, result.pixel_pitch_mm
-    else:
-        tensor, pitch = result.raw_psf, result.raw_pixel_pitch_mm
-        if tensor is None or pitch is None:
-            raise RuntimeError("main FieldResult lacks its required raw FFT PSF contract")
+def _native_psf_batch(
+    model: Any, cases: Sequence[Mapping[str, Any]],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Read the mandatory raw-PSF batch contract; no scalar or field-name fallback."""
+    method = getattr(model, "raw_psf_batch", None)
+    if not callable(method):
+        raise TypeError("PAL evaluation model must implement raw_psf_batch(cases)")
+    result = method(cases)
+    if not isinstance(result.psf, torch.Tensor):
+        raise TypeError("raw_psf_batch.psf must be a torch.Tensor")
+    if not isinstance(result.pixel_pitch_mm, torch.Tensor):
+        raise TypeError("raw_psf_batch.pixel_pitch_mm must be a torch.Tensor")
+    if not isinstance(result.valid_fraction, torch.Tensor):
+        raise TypeError("raw_psf_batch.valid_fraction must be a torch.Tensor")
+    batch_size = len(cases)
+    expected_psf_shape = (batch_size, RAW_SIZE_PX, RAW_SIZE_PX)
+    if tuple(result.psf.shape) != expected_psf_shape:
+        raise ValueError(
+            f"raw PSF batch has shape {tuple(result.psf.shape)}, expected {expected_psf_shape}"
+        )
+    if tuple(result.pixel_pitch_mm.shape) != (batch_size,):
+        raise ValueError("raw PSF batch pixel pitches must have shape [B]")
+    if tuple(result.valid_fraction.shape) != (batch_size,):
+        raise ValueError("raw PSF batch valid fractions must have shape [B]")
     return (
-        tensor.detach().cpu().numpy().astype(np.float64),
-        float(torch.as_tensor(pitch).detach().cpu()),
-        float(result.valid_fraction.detach().cpu()),
+        result.psf.detach().cpu().numpy().astype(np.float64),
+        result.pixel_pitch_mm.detach().cpu().numpy().astype(np.float64),
+        result.valid_fraction.detach().cpu().numpy().astype(np.float64),
     )
 
 
@@ -457,7 +473,10 @@ def _build_condition_database(
     root: Path, *, label: str, distance: float, state: str,
     cases: Sequence[Mapping[str, Any]], model: Any, identity_sha256: str,
     checkpoint_sha256: str, resume: bool, completed_conditions: int,
+    psf_batch_size: int,
 ) -> Path:
+    if int(psf_batch_size) <= 0:
+        raise ValueError("psf_batch_size must be a positive integer")
     final_path = root / f"{label}_{state}.h5"
     partial_path = root / f"{label}_{state}.partial.h5"
     contract = _condition_contract(
@@ -477,39 +496,51 @@ def _build_condition_database(
         _validate_contract(handle, contract)
         if str(handle.attrs.get("status", "")) != "running":
             raise ValueError(f"partial PSF database has invalid status: {partial_path}")
+        pending_indices: list[int] = []
         for index, case in enumerate(cases):
             if int(handle["completed"][index]) == 1:
                 _validate_database_node(handle, index, verify_render_contract=True)
                 continue
+            pending_indices.append(index)
+        for start in range(0, len(pending_indices), int(psf_batch_size)):
+            batch_indices = pending_indices[start : start + int(psf_batch_size)]
+            batch_cases = [cases[index] for index in batch_indices]
             with torch.no_grad():
-                field_result = model.field(case)
-            raw, raw_pitch, valid_fraction = _native_psf(field_result)
-            raw = _normalize_physical_psf("native raw PSF", raw)
-            if raw.shape != (RAW_SIZE_PX, RAW_SIZE_PX):
-                raise ValueError(
-                    f"native raw PSF for {case['case_id']} has shape {raw.shape}, "
-                    f"expected {(RAW_SIZE_PX, RAW_SIZE_PX)}"
+                raw_batch, pitch_batch, valid_batch = _native_psf_batch(model, batch_cases)
+            for offset, index in enumerate(batch_indices):
+                case = cases[index]
+                raw = _normalize_physical_psf("native raw PSF", raw_batch[offset])
+                raw_pitch = float(pitch_batch[offset])
+                valid_fraction = float(valid_batch[offset])
+                if not math.isfinite(valid_fraction) or not 0.0 <= valid_fraction <= 1.0:
+                    raise ValueError(
+                        f"invalid valid fraction for {case['case_id']}: {valid_fraction!r}"
+                    )
+                render, render_pitch = _render_psf(raw, raw_pitch)
+                field_xy = np.asarray(
+                    [float(case["field_x_deg"]), float(case["field_y_deg"])], dtype=np.float64
                 )
-            render, render_pitch = _render_psf(raw, raw_pitch)
-            field_xy = np.asarray(
-                [float(case["field_x_deg"]), float(case["field_y_deg"])], dtype=np.float64
-            )
-            digest = _node_sha256(field_xy, raw, render, raw_pitch, render_pitch, valid_fraction)
-            handle["raw_psf"][index] = raw
-            handle["render_psf"][index] = render
-            handle["raw_pixel_pitch_mm"][index] = raw_pitch
-            handle["render_pixel_pitch_mm"][index] = render_pitch
-            handle["valid_fraction"][index] = valid_fraction
-            handle["node_sha256"][index] = digest.encode("ascii")
-            handle.flush()
-            handle["completed"][index] = 1
-            handle.flush()
-            _write_database_state(
-                root, identity_sha256=identity_sha256, status="running",
-                completed_conditions=completed_conditions,
-                completed_nodes=completed_conditions * FIELD_COUNT + int(handle["completed"][:].sum()),
-                current_condition=f"{label}_{state}",
-            )
+                digest = _node_sha256(
+                    field_xy, raw, render, raw_pitch, render_pitch, valid_fraction
+                )
+                handle["raw_psf"][index] = raw
+                handle["render_psf"][index] = render
+                handle["raw_pixel_pitch_mm"][index] = raw_pitch
+                handle["render_pixel_pitch_mm"][index] = render_pitch
+                handle["valid_fraction"][index] = valid_fraction
+                handle["node_sha256"][index] = digest.encode("ascii")
+                handle.flush()
+                handle["completed"][index] = 1
+                handle.flush()
+                _write_database_state(
+                    root, identity_sha256=identity_sha256, status="running",
+                    completed_conditions=completed_conditions,
+                    completed_nodes=(
+                        completed_conditions * FIELD_COUNT
+                        + int(handle["completed"][:].sum())
+                    ),
+                    current_condition=f"{label}_{state}",
+                )
         for index in range(FIELD_COUNT):
             _validate_database_node(handle, index, verify_render_contract=True)
         handle.attrs["status"] = "complete"
@@ -530,6 +561,7 @@ def _database_conditions(config: Any) -> list[tuple[str, float, str, list[dict[s
 def _build_psf_database(
     evaluation: Path, *, config: Any, modules: Mapping[str, torch.nn.Module],
     identity_sha256: str, checkpoint_sha256: str, resume: bool,
+    psf_batch_size: int,
 ) -> Path:
     root = evaluation / "psf_database"
     root.mkdir(parents=True, exist_ok=True)
@@ -553,6 +585,7 @@ def _build_psf_database(
                 model=model, identity_sha256=identity_sha256,
                 checkpoint_sha256=checkpoint_sha256, resume=resume,
                 completed_conditions=index,
+                psf_batch_size=psf_batch_size,
             )
         finally:
             model.close()
@@ -943,10 +976,13 @@ def _write_evaluation_manifest(evaluation: Path, *, identity_sha256: str) -> Non
 
 
 def evaluate(
-    run: Path, *, device_name: str, resume: bool, blur_scale: float = 4.0
+    run: Path, *, device_name: str, resume: bool, blur_scale: float = 4.0,
+    psf_batch_size: int = 8,
 ) -> Path:
     if not math.isfinite(float(blur_scale)) or float(blur_scale) < 1.0:
         raise ValueError(f"blur_scale must be finite and >= 1, got {blur_scale!r}")
+    if int(psf_batch_size) <= 0:
+        raise ValueError("psf_batch_size must be a positive integer")
     run = run.resolve()
     if not run.is_dir():
         raise FileNotFoundError(run)
@@ -996,6 +1032,7 @@ def evaluate(
             "raw_shape": [RAW_SIZE_PX, RAW_SIZE_PX],
             "render_shape": [RENDER_SIZE_PX, RENDER_SIZE_PX],
             "crop_physical_size_mm": CROP_PHYSICAL_SIZE_MM, "condition_files": 6,
+            "batch_size": int(psf_batch_size),
         },
         "mtf": {"frequency_max_cycles_per_mm": 100.0, "samples": len(COMMON_FREQ),
                 "csf": "Ahumada-1D", "interpolation": "cubic", "published": "mean_only"},
@@ -1025,6 +1062,7 @@ def evaluate(
         evaluation, config=config,
         modules={"baseline": module_baseline, "optimized": module_optimized},
         identity_sha256=identity_sha256, checkpoint_sha256=checkpoint_sha256, resume=resume,
+        psf_batch_size=int(psf_batch_size),
     )
     if _validate_psf_database(
         evaluation, config=config, identity_sha256=identity_sha256
@@ -1064,6 +1102,7 @@ def evaluate(
         {"status": "complete", "identity_sha256": identity_sha256,
          "psf_database_status": "complete", "psf_condition_count": 6,
          "psf_count": 6 * FIELD_COUNT,
+         "psf_batch_size": int(psf_batch_size),
          "distance_labels": [item[0] for item in _distance_cases(config)],
          "weighted_mtf_products": "mean_only", "chart_blur_scale": float(blur_scale),
          "source_run_unchanged": True},
@@ -1081,6 +1120,10 @@ def main() -> int:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
+        "--psf-batch-size", type=int, default=8,
+        help="Number of field cases traced together for each raw PSF CUDA batch.",
+    )
+    parser.add_argument(
         "--blur-scale", type=float, default=4.0,
         help=("Display-only chart scale (finite and >=1). Larger values reduce apparent "
               "chart blur; PSF databases, MTF, and PSF stitches are unchanged."),
@@ -1089,6 +1132,7 @@ def main() -> int:
     evaluate(
         Path(arguments.run), device_name=arguments.device,
         resume=bool(arguments.resume), blur_scale=float(arguments.blur_scale),
+        psf_batch_size=int(arguments.psf_batch_size),
     )
     return 0
 
