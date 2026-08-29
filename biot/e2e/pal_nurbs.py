@@ -667,6 +667,18 @@ class MinimalOpticalModel:
         self._pal_power_config: PALPowerConfig | None = None
         self._pal_zones: Mapping[str, torch.Tensor] | None = None
 
+    def close(self) -> None:
+        """Release all systems and heavyweight BIOT lenses owned by this model."""
+        for system, _ in self._cache.values():
+            system.release_biot_lens()
+        for template, _ in self._templates.values():
+            template.release_biot_lens()
+        self._cache.clear()
+        self._templates.clear()
+        self._pal_sag = None
+        self._pal_power_config = None
+        self._pal_zones = None
+
     def set_prescription_context(
         self,
         sag: torch.Tensor,

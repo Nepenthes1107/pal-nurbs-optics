@@ -68,3 +68,5 @@ python run_pal_nurbs.py --output .tmp_prepare --excel eye_image_glass_grad3.xlsx
 2026-08-29 main 云端启动修复：Infinity 物距的训练 case ID 不再将 `inf` 转换为整数，统一序列化为 `Dinf`；case-layout state schema 提升为 6，旧布局进度不复用。针对性布局测试通过；未执行完整物理计算。
 
 2026-08-29 main 云端启动二次修复：case-layout 几何审计现在仅允许 far/upper 使用真实正 Infinity，intermediate/near 与 middle/lower 仍必须为有限正物距；不使用大有限距离近似。PAL 定向回归 `37 passed`，完整测试 `171 passed`，无失败；未启动正式训练。
+
+2026-08-29 main 评价清理修复：`MinimalOpticalModel.close()` 现在显式释放缓存系统、模板持有的 BIOT lens 引用和处方上下文，修复六条件 PSF 数据库在单条件完成后的清理阶段报错；PAL 定向测试 `25 passed`、评价器测试 `9 passed`、完整测试 `172 passed`，无失败；未启动正式评价。

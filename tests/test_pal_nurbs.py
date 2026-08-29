@@ -152,6 +152,38 @@ def test_raw_psf_batch_uses_one_true_batch_and_preserves_case_axis(
     )
 
 
+def test_minimal_optical_model_close_releases_owned_systems_and_context() -> None:
+    class System:
+        def __init__(self) -> None:
+            self.release_count = 0
+
+        def release_biot_lens(self) -> None:
+            self.release_count += 1
+
+    cached = System()
+    template = System()
+    model = object.__new__(MinimalOpticalModel)
+    model._cache = {(500.0, 0.0, 0.0): (cached, object())}
+    model._templates = {500.0: (template, object())}
+    model._pal_sag = torch.ones(1)
+    model._pal_power_config = object()
+    model._pal_zones = {"far": torch.ones(1, dtype=torch.bool)}
+
+    model.close()
+
+    assert cached.release_count == 1
+    assert template.release_count == 1
+    assert model._cache == {}
+    assert model._templates == {}
+    assert model._pal_sag is None
+    assert model._pal_power_config is None
+    assert model._pal_zones is None
+
+    model.close()
+    assert cached.release_count == 1
+    assert template.release_count == 1
+
+
 def test_startup_cases_backward_immediately_and_match_summed_loss_gradient() -> None:
     events: list[str] = []
     cases = [
