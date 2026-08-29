@@ -74,9 +74,9 @@ def _traced_candidates() -> list[dict[str, object]]:
     return rows
 
 
-def _selected_cases() -> list[dict[str, object]]:
+def _selected_cases(*, far_distance: float = 100000.0) -> list[dict[str, object]]:
     return select_training_cases(
-        _traced_candidates(), far_object_distance_mm=100000.0,
+        _traced_candidates(), far_object_distance_mm=far_distance,
         intermediate_object_distance_mm=2000.0, near_object_distance_mm=500.0,
         corridor_y_min_mm=-9.0, corridor_y_max_mm=-3.0,
     )
@@ -159,6 +159,13 @@ def test_selects_fixed_80_cases_with_layered_corridor_and_mirrored_peripheral() 
         band: sum(case["peripheral_band"] == band for case in left.values())
         for band in ("upper", "middle", "lower")
     } == PERIPHERAL_BAND_COUNTS
+
+
+def test_select_training_cases_serializes_infinite_distance_without_overflow() -> None:
+    cases = _selected_cases(far_distance=float("inf"))
+    far_cases = [case for case in cases if case["training_group"] == "far"]
+    assert far_cases
+    assert all(case["case_id"].endswith("_Dinf") for case in far_cases)
 
 
 def test_partition_classification_respects_physical_y_order() -> None:

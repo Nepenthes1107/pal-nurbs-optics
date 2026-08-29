@@ -510,6 +510,17 @@ def select_training_cases(
                 "peripheral_band": pair["peripheral_band"], "distance_mm": float(band_distance[pair["peripheral_band"]]),
             })
     group_distance = {"far": far_object_distance_mm, "intermediate": intermediate_object_distance_mm, "near": near_object_distance_mm}
+
+    def distance_id(distance: float) -> str:
+        """Serialize the physical object distance for a stable case ID."""
+        if math.isinf(distance):
+            if distance > 0.0:
+                return "Dinf"
+            raise ValueError("object distance must be positive or Infinity")
+        if not math.isfinite(distance) or distance <= 0.0:
+            raise ValueError(f"object distance must be positive and finite, got {distance!r}")
+        return f"D{int(round(distance))}"
+
     cases: list[dict[str, Any]] = []
     for group, expected in resolved_counts.items():
         if len(groups[group]) != expected:
@@ -518,7 +529,7 @@ def select_training_cases(
             distance = float(row.get("distance_mm", group_distance.get(group, math.nan)))
             cases.append({
                 **row, "sample_id": f"{group}_{index:02d}",
-                "case_id": f"{group}_{index:02d}_D{int(round(distance))}",
+                "case_id": f"{group}_{index:02d}_{distance_id(distance)}",
                 "training_group": group, "zone": GROUP_TO_ZONE[group], "distance_mm": distance,
             })
     expected_total = sum(resolved_counts.values())

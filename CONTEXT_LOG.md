@@ -64,3 +64,5 @@ python run_pal_nurbs.py --output .tmp_prepare --excel eye_image_glass_grad3.xlsx
 2026-08-29 验收：周边 A 目标及统一 HDF5 PSF 数据库/评价链的 `.venv\Scripts\python.exe -m pytest tests -q --basetemp .tmp_pytest_main_full` 为 `165 passed`，无失败；其中评价器定向测试为 `7 passed`。本次未启动正式优化或完整 486-field PSF 数据库生成。
 
 2026-08-29 CUDA 评价批量化验收：评价器与 PAL 定向测试 `32 passed`；此前批量接口基线为 `168 passed`。本次统一 raw PSF/非 legacy 相位合同后，`.venv\Scripts\python.exe -m pytest tests -q --basetemp .tmp_main_raw_final` 为 `169 passed`，无失败；新增测试覆盖固定相位配置、raw 512×512 训练 PSF 和 identity/schema 边界。本次未启动正式优化或完整 486-field 评价。
+
+2026-08-29 main 云端启动修复：Infinity 物距的训练 case ID 不再将 `inf` 转换为整数，统一序列化为 `Dinf`；case-layout state schema 提升为 6，旧布局进度不复用。针对性布局测试通过；未执行完整物理计算。
