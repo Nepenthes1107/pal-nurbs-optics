@@ -14,9 +14,10 @@
 - 新实验输出：`results/optimization/run_001`、`run_002`，依次递增。
 - 历史证据：`results/archive/`，不进入 Git，也不参与新实验身份。
 - 当前入口：`run_pal_nurbs.py`；PAL 实现位于 `biot/e2e/pal_nurbs.py` 和 `biot/e2e/pal_case_layout.py`。
-- `main` 的 80-case/分阶段架构已接入真实 GPU tensor case batch：默认 `case_batch_size=8`、`requested_np=256`、FFT `512`；每批完成追迹和 FFT 后聚合一次 loss/backward，最后一批按实际数量运行，不做 OOM 自动降级。
+- `main` 的 80-case/分阶段架构已接入真实 GPU tensor case batch：默认 `case_batch_size=8`、`requested_np=256`、FFT `512`；每批完成追迹和 FFT 后聚合一次 loss/backward，最后一批按实际数量运行，不做 OOM 自动降级。训练前向直接使用 raw 物理 FFT PSF，不再把 130×130 crop kernel 送入 loss。
 - `main` 的分阶段训练输出统一显示 `stage/step/batch/loss/update/lr`，并写入 run 根目录 `training.log`；各阶段 `history.csv` 和 resume checkpoint 继续作为结构化恢复依据。
 - 新训练合同统一使用 `D500/D1000/Dinf`；已完成的旧 `run_001` 保持历史训练身份，不原位改写。
+- `main` 与多物距分支均显式固定 `legacy_pupil_phase=False`、`phase_reference="biot_reference_sphere"`、`remove_tilt=False`；相位/PSF 表示变化已提升 run、case-layout 和 baseline schema，旧 checkpoint 不可按新合同恢复。
 - `evaluate_pal_nurbs.py` 在 `<run>/evaluation` 生成独立评价身份；三物距×双状态
   分别保存为六个 HDF5，每个文件含 81 个场点的原始 FFT PSF、130×130 渲染
   PSF及最小恢复信息。只有数据库整体 `complete` 后才运行 weighted-MTF Mean、
@@ -36,6 +37,7 @@
 - 训练 case 数量固定为 18/12/18/16/16，目标权重固定为 0.85/0.15；
   功能区 loss 为逐 case 的归一化 PSF M2，左右周边区 loss 为对应
   M/A 区域平均 A 的 Original PAL 归一化值。
+- `main` 训练的 M2、valid-fraction ratio、edge health 和 NURBS gradient 均从 raw 物理 PSF 计算；评价阶段才生成 130×130 render PSF。
 - `best_feasible` 必须来自完整覆盖周期且所有工程与健康约束通过。
 - 当前为去 tilt、单波长结果，不能外推为色差、棱镜、真实视物位置或几何畸变合格。
 - 普通 `--resume` 仅在同一目录 identity、配置、输入哈希和实现闭包完全一致时有效。

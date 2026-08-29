@@ -38,6 +38,19 @@ from biot.e2e.pal_nurbs import (
 from biot.e2e.regional_nurbs import FixedWeightNURBSPerturbation
 
 
+def test_main_training_phase_contract_is_nonlegacy_raw_psf() -> None:
+    config = MinimalConfig(device="cpu")
+    assert config.legacy_pupil_phase is False
+    assert config.phase_reference == "biot_reference_sphere"
+    assert config.remove_tilt is False
+    with pytest.raises(ValueError, match="legacy_pupil_phase"):
+        MinimalConfig(legacy_pupil_phase=True)
+    with pytest.raises(ValueError, match="remove_tilt"):
+        MinimalConfig(remove_tilt=True)
+    with pytest.raises(ValueError, match="phase_reference"):
+        MinimalConfig(phase_reference="image_plane_center")
+
+
 def test_m2_is_finite_nonnegative_and_centroid_relative() -> None:
     psf = torch.zeros((9, 9), dtype=torch.float64)
     psf[3, 5] = 1.0
@@ -75,6 +88,9 @@ def test_real_trace_psf_m2_has_nurbs_gradient() -> None:
     module = FixedWeightNURBSPerturbation(7, device="cpu")
     model = MinimalOpticalModel(config, module)
     result = model.field({"case_id": "center", "distance_mm": 2000.0, "field_x_deg": 0.0, "field_y_deg": 0.0})
+    assert result.kernel.shape == (512, 512)
+    assert result.raw_psf is not None
+    assert result.raw_pixel_pitch_mm == pytest.approx(result.pixel_pitch_mm)
     m2 = psf_second_moment_mm2(result.kernel, pixel_pitch_mm=result.pixel_pitch_mm)
     m2.backward()
     assert torch.isfinite(result.kernel).all()

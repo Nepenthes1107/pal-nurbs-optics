@@ -55,6 +55,7 @@ python -m biot.gui
 - 80 个真实 case：Far 18、Intermediate 12、Near 18、Peripheral-left/right 各 16。
 - 三个物距统一为 `D500=500 mm`、`D1000=1000 mm`、`Dinf=Infinity`；Infinity 使用真实无穷远条件。
 - 使用真实可微追迹、GRIN3 固定步长 RK4、连续 OPL、去 pupil tilt FFT PSF；离线 PSF 不参与反传。
+- 两个分支统一使用 `legacy_pupil_phase=False`、`phase_reference="biot_reference_sphere"` 和 `remove_tilt=False`；训练 loss、健康检查和梯度均直接基于原始 `512×512` 物理 FFT PSF 及其物理像素间距。`130×130` crop/render 仅用于评价数据库与拼接显示。
 - 默认 pupil 采样为 `np=256`、FFT 为 `512`；80 个 case 按 `case_batch_size=8` 做 GPU tensor 追迹和 FFT，每批聚合一次 loss 并 backward，不因 OOM 自动缩小 batch。
 - 训练输出统一包含 `stage`、`step`、`batch`、`loss`、`update` 和 `lr`；每个 run 的 `training.log` 持久化同样的进度摘要，中断时追加异常信息，各阶段仍保留结构化 `history.csv`。
 - 追迹失败保持失败关闭，由当前 run 的资格筛选进度记录错误；底层追迹不在项目根目录自动导出 `wrong_result` Excel。
@@ -62,7 +63,7 @@ python -m biot.gui
   `M2_mm²/Original PAL M2_mm²`，左右周边区使用各自区域平均
   `A_D/Original PAL A_D`；Original PAL 分母固定。
 - 仅使用 trace/PSF health、`P_far`、`ADD` 和单步 sag trust region 约束。
-- 不自动运行历史 192-case posthoc、PSF 数据库、渲染或 SSIM 链。
+- 不自动运行历史 192-case posthoc 或 SSIM 链；PSF 数据库、weighted MTF、PSF stitch 和 chart stitch 仅在正式评价入口中运行。
 
 ## 完成优化后的评价
 

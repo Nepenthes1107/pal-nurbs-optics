@@ -56,6 +56,9 @@ from .system import (
 )
 
 
+METHOD_NAME = "pal_80case_raw_psf_nonlegacy_m2_astig_a_bspline7_ladder"
+
+
 @dataclass(frozen=True)
 class MinimalConfig:
     # PAL-NURBS 后续实验统一使用已验证在 D500、(-40°, -40°) 可完成追迹的 grad3 系统。
@@ -69,6 +72,10 @@ class MinimalConfig:
     requested_np: int = 256
     fft_size_px: int = 512
     case_batch_size: int = 8
+    # PAL 训练固定采用 BIOT 已验证的非 legacy 参考球合同。
+    legacy_pupil_phase: bool = False
+    phase_reference: str = "biot_reference_sphere"
+    remove_tilt: bool = False
     kernel_size_px: int = 130
     pupil_radius_mm: float | None = None
     learning_rate: float = 2.0e-3
@@ -100,6 +107,12 @@ class MinimalConfig:
     baseline_state_import: str | None = None
 
     def __post_init__(self) -> None:
+        if bool(self.legacy_pupil_phase):
+            raise ValueError("legacy_pupil_phase=True is not supported by the PAL contract")
+        if self.phase_reference != "biot_reference_sphere":
+            raise ValueError("PAL requires phase_reference='biot_reference_sphere'")
+        if bool(self.remove_tilt):
+            raise ValueError("PAL requires remove_tilt=False with the BIOT reference sphere")
         if int(self.requested_np) <= 0:
             raise ValueError("requested_np must be positive")
         if int(self.fft_size_px) <= 0:
@@ -108,10 +121,10 @@ class MinimalConfig:
             raise ValueError("case_batch_size must be a positive integer")
 
 
-RUN_IDENTITY_SCHEMA_VERSION = 4
-CASE_LAYOUT_STATE_SCHEMA_VERSION = 4
-BASELINE_STATE_SCHEMA_VERSION = 4
-BASELINE_PROGRESS_SCHEMA_VERSION = 4
+RUN_IDENTITY_SCHEMA_VERSION = 5
+CASE_LAYOUT_STATE_SCHEMA_VERSION = 5
+BASELINE_STATE_SCHEMA_VERSION = 5
+BASELINE_PROGRESS_SCHEMA_VERSION = 5
 STAGE_RESUME_SCHEMA_VERSION = 1
 RUN_STATE_SCHEMA_VERSION = 1
 STAGE_LADDER = (7, 11, 19)
@@ -291,6 +304,7 @@ def _build_run_identity(config: MinimalConfig) -> dict[str, Any]:
         implementation[name] = _sha256_file(resolved)
     body: dict[str, Any] = {
         "schema_version": RUN_IDENTITY_SCHEMA_VERSION,
+        "method": METHOD_NAME,
         "config": asdict(config),
         "config_sha256": _canonical_json_sha256(asdict(config)),
         "inputs": inputs,
@@ -314,6 +328,8 @@ def _validate_identity_payload(payload: Mapping[str, Any]) -> str:
         raise ValueError("run_identity.json is malformed or has been modified")
     if int(saved.get("schema_version", -1)) != RUN_IDENTITY_SCHEMA_VERSION:
         raise ValueError("unsupported run identity schema")
+    if saved.get("method") != METHOD_NAME:
+        raise ValueError("unsupported PAL method identity")
     return claimed
 
 
@@ -368,7 +384,7 @@ class FieldResult:
 
 @dataclass(frozen=True)
 class BatchFieldResult:
-    """批量前向结果；首维是 case，后两维是训练用 PSF kernel。"""
+    """批量前向结果；首维是 case，后两维是 raw 物理 FFT PSF。"""
 
     kernels: torch.Tensor
     valid_fraction: torch.Tensor
@@ -829,7 +845,7 @@ class MinimalOpticalModel:
             if not bool(torch.isfinite(rays.directions).all()):
                 raise RuntimeError(f"non-finite aimed pupil directions for {case['case_id']}")
             trace = trace_system_to_image_with_phase(
-                system, rays, phase_reference="biot_reference_sphere"
+                system, rays, phase_reference=self.config.phase_reference
             )
             valid_count = int(trace.valid.sum().detach().cpu())
             ray_count = int(trace.valid.numel())
@@ -875,25 +891,31 @@ class MinimalOpticalModel:
         distance = float(case["distance_mm"])
         x, y = float(case["field_x_deg"]), float(case["field_y_deg"])
         system, rays = self._system_and_rays(distance, x, y)
-        trace = trace_system_to_image_with_phase(system, rays, phase_reference="biot_reference_sphere")
+        trace = trace_system_to_image_with_phase(
+            system, rays, phase_reference=self.config.phase_reference
+        )
         if not bool(trace.valid.any()):
             raise RuntimeError(f"no valid rays for {case['case_id']}")
         fft = torch_fft_psf_from_phase(
             trace.phase_rad, trace.valid, sample_count=self.sample_count,
-            psf_size_px=self.config.fft_size_px, remove_piston=True, remove_tilt=True,
+            psf_size_px=self.config.fft_size_px,
+            remove_piston=True,
+            remove_tilt=self.config.remove_tilt,
         )
         if system.physical_fft_pixel_pitch_mm is None:
             raise RuntimeError("missing physical FFT pixel pitch")
-        kernel = crop_resize_fft_psf(
-            fft.psf, pixel_pitch_mm=float(system.physical_fft_pixel_pitch_mm),
-            size_reference_mm=self.size_reference_mm[distance], output_size_px=self.config.kernel_size_px,
-        )
+        psf = _normalize_psf(fft.psf)
+        pitch = float(system.physical_fft_pixel_pitch_mm)
         return FieldResult(
-            kernel=kernel, valid_fraction=trace.valid.to(torch.float64).mean(),
-            pixel_pitch_mm=self.size_reference_mm[distance] / self.config.kernel_size_px,
-            edge_fraction=_edge_fraction(kernel), valid_mask=trace.valid,
-            raw_psf=fft.psf,
-            raw_pixel_pitch_mm=float(system.physical_fft_pixel_pitch_mm),
+            # ``kernel`` is retained as the historical field name, but now
+            # carries the authoritative raw physical FFT PSF used by training.
+            kernel=psf,
+            valid_fraction=trace.valid.to(torch.float64).mean(),
+            pixel_pitch_mm=pitch,
+            edge_fraction=_edge_fraction(psf),
+            valid_mask=trace.valid,
+            raw_psf=psf,
+            raw_pixel_pitch_mm=pitch,
         )
 
     def field_batch(self, cases: Sequence[Mapping[str, Any]]) -> BatchFieldResult:
@@ -902,44 +924,33 @@ class MinimalOpticalModel:
             raise ValueError("cannot evaluate an empty case batch")
         systems: list[FittedE2ESystem] = []
         rays: list[object] = []
-        distances: list[float] = []
         for case in cases:
             distance = float(case["distance_mm"])
             x, y = float(case["field_x_deg"]), float(case["field_y_deg"])
             system, pupil_rays = self._system_and_rays(distance, x, y)
             systems.append(system)
             rays.append(pupil_rays)
-            distances.append(distance)
         trace = trace_system_batch_to_image_with_phase(
-            systems, rays, phase_reference="biot_reference_sphere"
+            systems, rays, phase_reference=self.config.phase_reference
         )
         if not bool(trace.valid.any(dim=1).all()):
             invalid = [str(case["case_id"]) for index, case in enumerate(cases) if not bool(trace.valid[index].any())]
             raise RuntimeError("no valid rays for case batch: " + ", ".join(invalid))
         fft = torch_fft_psf_from_phase(
             trace.phase_rad, trace.valid, sample_count=self.sample_count,
-            psf_size_px=self.config.fft_size_px, remove_piston=True, remove_tilt=True,
+            psf_size_px=self.config.fft_size_px,
+            remove_piston=True,
+            remove_tilt=self.config.remove_tilt,
         )
         physical_pitch = torch.as_tensor(
             [float(system.physical_fft_pixel_pitch_mm) for system in systems],
             device=fft.psf.device, dtype=fft.psf.dtype,
         )
-        kernels = torch.stack([
-            crop_resize_fft_psf(
-                fft.psf[index], pixel_pitch_mm=float(physical_pitch[index].detach().cpu()),
-                size_reference_mm=self.size_reference_mm[distance],
-                output_size_px=self.config.kernel_size_px,
-            )
-            for index, distance in enumerate(distances)
-        ])
-        pixel_pitch = torch.as_tensor(
-            [self.size_reference_mm[distance] / self.config.kernel_size_px for distance in distances],
-            device=kernels.device, dtype=kernels.dtype,
-        )
+        kernels = _normalize_psf_batch(fft.psf)
         return BatchFieldResult(
             kernels=kernels,
             valid_fraction=trace.valid.to(kernels.dtype).mean(dim=1),
-            pixel_pitch_mm=pixel_pitch,
+            pixel_pitch_mm=physical_pitch,
             edge_fraction=_edge_fraction_batch(kernels),
             valid_mask=trace.valid,
         )
@@ -964,7 +975,7 @@ class MinimalOpticalModel:
             rays.append(pupil_rays)
             pitches.append(float(pitch))
         trace = trace_system_batch_to_image_with_phase(
-            systems, rays, phase_reference="biot_reference_sphere"
+            systems, rays, phase_reference=self.config.phase_reference
         )
         if not bool(trace.valid.any(dim=1).all()):
             invalid = [
@@ -979,7 +990,7 @@ class MinimalOpticalModel:
             sample_count=self.sample_count,
             psf_size_px=self.config.fft_size_px,
             remove_piston=True,
-            remove_tilt=True,
+            remove_tilt=self.config.remove_tilt,
         )
         return RawPSFBatchResult(
             psf=fft.psf,
@@ -1958,9 +1969,8 @@ def _accumulate_startup_case_gradients(
             raise RuntimeError("startup gradient check failed: fewer than two finite non-zero zp gradients")
         return grad.detach().clone()
     result = _field_batch(model, cases)
-    pixel_pitch_mm = model.size_reference_mm[config.intermediate_object_distance_mm] / config.kernel_size_px
     moments = psf_second_moment_mm2_batch(
-        result.kernels, pixel_pitch_mm=pixel_pitch_mm,
+        result.kernels, pixel_pitch_mm=result.pixel_pitch_mm,
     )
     moments.sum().backward()
     result_device = result.kernels.device
