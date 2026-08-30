@@ -1,6 +1,6 @@
 # 当前工程状态
 
-更新时间：2026-08-29。
+更新时间：2026-08-30。
 
 ## 当前主线
 
@@ -14,7 +14,9 @@
 - 新实验输出：`results/optimization/run_001`、`run_002`，依次递增。
 - 历史证据：`results/archive/`，不进入 Git，也不参与新实验身份。
 - 当前入口：`run_pal_nurbs.py`；PAL 实现位于 `biot/e2e/pal_nurbs.py` 和 `biot/e2e/pal_case_layout.py`。
-- `main` 的 80-case/分阶段架构已接入真实 GPU tensor case batch：默认 `case_batch_size=8`、`requested_np=256`、FFT `512`；每批完成追迹和 FFT 后聚合一次 loss/backward，最后一批按实际数量运行，不做 OOM 自动降级。训练前向直接使用 raw 物理 FFT PSF，不再把 130×130 crop kernel 送入 loss。
+- 当前分支将训练布局提升为 10 组 109 case；其中 79 个功能 case 使用
+  GPU tensor 真实追迹，30 个周边 case 仅用可微面形 A_D，不进入光线追迹。
+  默认 `case_batch_size=8`、`requested_np=256`、FFT `512`，不做 OOM 自动降级。
 - `main` 的分阶段训练输出统一显示 `stage/step/batch/loss/update/lr`，并写入 run 根目录 `training.log`；各阶段 `history.csv` 和 resume checkpoint 继续作为结构化恢复依据。
 - `--steps S7 S11 S19` 现定义最低训练预算：7×7/11×11 严格完成各自
   attempt 数，19×19 至少完成 `S19`，随后按默认 patience 7、严格相对改善
@@ -22,7 +24,7 @@
   但最低配额前不允许 early stop；旧的 11×11 整阶段改善门槛已删除。
 - 19×19 每次 attempt 后先原子保存 resume/history，再依次判断 early stopping、
   学习率下限和额外预算。最低预算前学习率跌破下限会将 run 标为 failed 且不写
-  成功 summary；完成后始终加载 19×19 best state，再做完整 80-case 无梯度复核。
+  成功 summary；完成后始终加载 19×19 best state，再做完整 109-case 无梯度复核。
 - 新训练合同统一使用 `D500/D1000/Dinf`；已完成的旧 `run_001` 保持历史训练身份，不原位改写。
 - `main` 与多物距分支均显式固定 `legacy_pupil_phase=False`、`phase_reference="biot_reference_sphere"`、`remove_tilt=False`；相位/PSF 表示变化已提升 run、case-layout 和 baseline schema，旧 checkpoint 不可按新合同恢复。
 - `evaluate_pal_nurbs.py` 在 `<run>/evaluation` 生成独立评价身份；三物距×双状态
@@ -41,10 +43,13 @@
 
 ## 有效合同与限制
 
-- 训练 case 数量固定为 18/12/18/16/16，目标权重固定为 0.85/0.15；
-  功能区 loss 为逐 case 的归一化 PSF M2，左右周边区 loss 为对应
-  M/A 区域平均 A 的 Original PAL 归一化值。
-- `main` 训练的 M2、valid-fraction ratio、edge health 和 NURBS gradient 均从 raw 物理 PSF 计算；评价阶段才生成 130×130 render PSF。
+- 训练 case 数量固定为 20/8/5/5/5/20/8/8/15/15，显式分组权重和为 1。
+  Far 使用 CSF-MTF，corridor/near 使用连续 OPD 拟合的 OSA/ANSI Z4²，
+  near-edge 小权重合入 near A_D，周边使用面形 A_D。
+- Z4 执行层使用 Torch reduced-QR/三角求解保持 autograd；BIOT NumPy 拟合仅用于
+  detached 对比验证，不从 PSF 逆变换恢复相位，也不保留 M2 训练回退。
+- 处方门禁除 `P_far`/`ADD` 外，对 lower-edge guard 检查 candidate 相对
+  Original PAL 的最大光焦度/像散变化；19×19 阶段使用归一化二阶差分正则。
 - `best_feasible` 必须来自完整覆盖周期且所有工程与健康约束通过。
 - 当前为去 tilt、单波长结果，不能外推为色差、棱镜、真实视物位置或几何畸变合格。
 - 普通 `--resume` 仅在同一目录 identity、配置、输入哈希、实现闭包及训练预算/
@@ -85,3 +90,11 @@ python run_pal_nurbs.py --output .tmp_prepare --excel eye_image_glass_grad3.xlsx
 attempt 上限；run identity schema 提升为 6、stage-resume schema 提升为 2。
 PAL 定向测试 `40 passed`，完整测试 `187 passed`，无失败；`py_compile` 与
 `git diff --check` 通过。本次未启动正式训练，不形成实验收益结论。
+
+2026-08-30 V3 链路改造验收：109-case 分层布局、CSF-MTF/Z4/A_D 指标路由、
+连续 OPD Torch Zernike 拟合、周边免追迹、19×19 二阶差分正则和 lower-edge
+baseline-relative 处方门禁已接入。合成六模 Zernike、Z4² AD/FD 与真实
+corridor/near PAL 连续 OPD 对 BIOT NumPy 拟合的直接验证通过；完整测试
+`.venv\Scripts\python.exe -m pytest -q tests --basetemp=.pytest_tmp_v3_full` 为
+`189 passed`，py_compile 与 `git diff --check` 通过。本次未启动 V3 完整训练，
+不形成优化收益或运行时长结论。

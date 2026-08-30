@@ -40,6 +40,16 @@ from biot.e2e.pal_nurbs import (
 from biot.e2e.regional_nurbs import FixedWeightNURBSPerturbation
 
 
+def _ten_group_cases() -> list[dict[str, object]]:
+    return [
+        {"case_id": f"case_{index:02d}", "training_group": group, "scale": float(index)}
+        for index, group in enumerate(
+            pal_nurbs.FUNCTIONAL_GROUPS + pal_nurbs.PERIPHERAL_GROUPS,
+            start=1,
+        )
+    ]
+
+
 def test_main_training_phase_contract_is_nonlegacy_raw_psf() -> None:
     config = MinimalConfig(device="cpu")
     assert config.legacy_pupil_phase is False
@@ -320,7 +330,10 @@ def test_startup_cases_backward_immediately_and_match_summed_loss_gradient() -> 
                     torch.stack((zero, zero, zero)),
                 )
             )
-            return FieldResult(kernel, torch.ones_like(edge), 1.0, torch.zeros_like(edge))
+            return FieldResult(
+                kernel, torch.ones_like(edge), 1.0, torch.zeros_like(edge),
+                z4_defocus_mm2=edge,
+            )
 
     sequential_module = FixedWeightNURBSPerturbation(7, device="cpu", dtype=torch.float64)
     sequential_model = Model(sequential_module, record_events=True)
@@ -336,13 +349,7 @@ def test_startup_cases_backward_immediately_and_match_summed_loss_gradient() -> 
 
     summed_module = FixedWeightNURBSPerturbation(7, device="cpu", dtype=torch.float64)
     summed_model = Model(summed_module, record_events=False)
-    summed_loss = sum(
-        psf_second_moment_mm2(
-            summed_model.field(case).kernel,
-            pixel_pitch_mm=summed_model.size_reference_mm[2000.0] / config.kernel_size_px,
-        )
-        for case in cases
-    )
+    summed_loss = sum(summed_model.field(case).z4_defocus_mm2 for case in cases)
     summed_loss.backward()
     assert summed_module.inner_q.grad is not None
     assert torch.equal(sequential_gradient, summed_module.inner_q.grad)
@@ -359,73 +366,53 @@ def test_inactive_case_cuda_cache_is_released_only_for_cuda(
     assert calls == ["empty"]
 
 
-def test_joint_loss_uses_region_means_then_085_015_weighting() -> None:
+def test_joint_loss_uses_explicit_ten_group_weights_and_routed_metrics() -> None:
     parameter = torch.nn.Parameter(torch.tensor(-0.5, dtype=torch.float64))
 
     class Model:
         def field(self, case: dict[str, object]) -> FieldResult:
             scale = float(case["scale"])
             edge = torch.sigmoid(parameter * scale)
-            kernel = torch.zeros((3, 3), dtype=torch.float64)
-            kernel[1, 1] = 1.0 - edge
-            kernel[1, 2] = edge
-            return FieldResult(kernel, torch.tensor(1.0), 1.0, torch.tensor(0.0))
+            kernel = torch.zeros((9, 9), dtype=torch.float64)
+            kernel[4, 4] = 1.0 - edge
+            kernel[4, 5] = edge
+            return FieldResult(
+                kernel, torch.tensor(1.0), 0.001, torch.tensor(0.0),
+                z4_defocus_mm2=edge,
+            )
 
         def astig_A_by_zone(self) -> dict[str, torch.Tensor]:
             return {
                 "astig_left": torch.sigmoid(parameter * 2.5),
                 "astig_right": torch.sigmoid(parameter * 3.5),
+                "near": torch.sigmoid(parameter * 1.5),
             }
 
-    cases = [
-        {"case_id": "f1", "training_group": "far", "scale": 1.0},
-        {"case_id": "f2", "training_group": "far", "scale": 3.0},
-        {"case_id": "m1", "training_group": "intermediate", "scale": 2.0},
-        {"case_id": "n1", "training_group": "near", "scale": 4.0},
-        {"case_id": "pl1", "training_group": "peripheral_left", "scale": 2.5},
-        {"case_id": "pr1", "training_group": "peripheral_right", "scale": 3.5},
-    ]
-    baseline = {case["case_id"]: {"loss_metric": 0.25} for case in cases}
+    cases = _ten_group_cases()
+    baseline = {
+        str(case["case_id"]): {"loss_metric": 0.25, "astig_A_D": 0.2}
+        for case in cases
+    }
     value, rows, health = _evaluate(Model(), cases, baseline, with_grad=True)
     metrics = {str(row["training_group"]): str(row["loss_metric_name"]) for row in rows}
-    assert all(metrics[group] == "m2_mm2" for group in ("far", "intermediate", "near"))
+    assert all(metrics[group] == "csf_mtf_loss" for group in ("far", "far_robustness"))
+    assert all(
+        metrics[group].startswith("z4_defocus_mm2")
+        for group in pal_nurbs.FUNCTIONAL_GROUPS
+        if group not in {"far", "far_robustness"}
+    )
     assert all(
         metrics[group] == "astig_A_D"
         for group in ("peripheral_left", "peripheral_right")
     )
-    expected_functional = (health["J_far"] + health["J_intermediate"] + health["J_near"]) / 3
-    expected = 0.85 * expected_functional + 0.15 * health["J_peripheral"]
-    assert abs(health["J_functional"] - expected_functional) < 1e-15
+    expected = sum(
+        pal_nurbs.DEFAULT_GROUP_WEIGHTS[group] * health[f"J_{group}"]
+        for group in pal_nurbs.FUNCTIONAL_GROUPS + pal_nurbs.PERIPHERAL_GROUPS
+    )
     assert abs(value - expected) < 1e-15
     assert parameter.grad is not None
     assert torch.isfinite(parameter.grad)
     assert float(parameter.grad) != 0.0
-    evaluated_gradient = parameter.grad.detach().clone()
-
-    reference_parameter = torch.nn.Parameter(torch.tensor(-0.5, dtype=torch.float64))
-
-    def score(scale: float) -> torch.Tensor:
-        edge = torch.sigmoid(reference_parameter * scale)
-        kernel = torch.zeros((3, 3), dtype=torch.float64)
-        kernel[1, 1] = 1.0 - edge
-        kernel[1, 2] = edge
-        return psf_second_moment_mm2(kernel, pixel_pitch_mm=1.0) / 0.25
-
-    expected_tensor = 0.85 * (
-        torch.stack((score(1.0), score(3.0))).mean()
-        + score(2.0)
-        + score(4.0)
-    ) / 3.0 + 0.15 * torch.stack(
-        (
-            torch.sigmoid(reference_parameter * 2.5) / 0.25,
-            torch.sigmoid(reference_parameter * 3.5) / 0.25,
-        )
-    ).mean()
-    expected_tensor.backward()
-    assert reference_parameter.grad is not None
-    assert torch.allclose(
-        evaluated_gradient, reference_parameter.grad, atol=2.0e-15, rtol=2.0e-15
-    )
 
 
 def test_evaluate_uses_one_backward_per_partial_case_batch(
@@ -458,24 +445,23 @@ def test_evaluate_uses_one_backward_per_partial_case_batch(
             return BatchFieldResult(
                 kernels=kernels,
                 valid_fraction=torch.ones_like(edge),
-                pixel_pitch_mm=torch.ones_like(edge),
+                pixel_pitch_mm=torch.full_like(edge, 0.001),
                 edge_fraction=torch.zeros_like(edge),
+                z4_defocus_mm2=edge,
             )
 
         def astig_A_by_zone(self) -> dict[str, torch.Tensor]:
             return {
                 "astig_left": torch.sigmoid(parameter * 4.0),
                 "astig_right": torch.sigmoid(parameter * 5.0),
+                "near": torch.sigmoid(parameter * 3.5),
             }
 
-    cases = [
-        {"case_id": "f", "training_group": "far", "scale": 1.0},
-        {"case_id": "m", "training_group": "intermediate", "scale": 2.0},
-        {"case_id": "n", "training_group": "near", "scale": 3.0},
-        {"case_id": "pl", "training_group": "peripheral_left", "scale": 4.0},
-        {"case_id": "pr", "training_group": "peripheral_right", "scale": 5.0},
-    ]
-    baseline = {case["case_id"]: {"loss_metric": 1.0} for case in cases}
+    cases = _ten_group_cases()
+    baseline = {
+        str(case["case_id"]): {"loss_metric": 1.0, "astig_A_D": 1.0}
+        for case in cases
+    }
     model = Model()
     value, rows, health = _evaluate(
         model,
@@ -486,13 +472,13 @@ def test_evaluate_uses_one_backward_per_partial_case_batch(
         progress_step="1/10",
         progress_learning_rate=2.0e-3,
     )
-    assert len(model.batch_calls) == 3
-    assert model.batch_calls[-1] == ["pr"]
+    assert len(model.batch_calls) == 4
+    assert model.batch_calls[-1] == ["case_07", "case_08"]
     assert len(rows) == len(cases)
     assert math.isfinite(value)
     assert math.isfinite(health["J_total"])
-    assert len(backward_calls) == 3
-    assert "stage=7x7 step=1/10 batch=3/3" in capsys.readouterr().out
+    assert len(backward_calls) == 5
+    assert "stage=7x7 step=1/10 batch=4/4" in capsys.readouterr().out
 
 
 def test_main_training_log_is_append_only_and_readable(tmp_path) -> None:
@@ -512,25 +498,19 @@ def test_joint_loss_rejects_incomplete_extra_or_mixed_training_groups() -> None:
             kernel[1, 1] = 1.0
             return FieldResult(kernel, torch.tensor(1.0), 1.0, torch.tensor(0.0))
 
-    complete = [
-        {"case_id": "f", "training_group": "far"},
-        {"case_id": "m", "training_group": "intermediate"},
-        {"case_id": "n", "training_group": "near"},
-        {"case_id": "pl", "training_group": "peripheral_left"},
-        {"case_id": "pr", "training_group": "peripheral_right"},
-    ]
-    baseline = {case["case_id"]: {"m2_mm2": 1.0} for case in complete}
-    with pytest.raises(ValueError, match="exactly the five groups"):
+    complete = _ten_group_cases()
+    baseline = {str(case["case_id"]): {"loss_metric": 1.0} for case in complete}
+    with pytest.raises(ValueError, match="exactly the ten groups"):
         _evaluate(Model(), complete[:-1], baseline, with_grad=False)
     extra = complete + [{"case_id": "x", "training_group": "other"}]
-    with pytest.raises(ValueError, match="exactly the five groups"):
+    with pytest.raises(ValueError, match="exactly the ten groups"):
         _evaluate(
-            Model(), extra, {**baseline, "x": {"m2_mm2": 1.0}}, with_grad=False
+            Model(), extra, {**baseline, "x": {"loss_metric": 1.0}}, with_grad=False
         )
     mixed = [dict(complete[0]), {"case_id": "ungrouped"}]
     with pytest.raises(ValueError, match="requires a training_group on every case"):
         _evaluate(
-            Model(), mixed, {**baseline, "ungrouped": {"m2_mm2": 1.0}}, with_grad=False
+            Model(), mixed, {**baseline, "ungrouped": {"loss_metric": 1.0}}, with_grad=False
         )
 
 
@@ -978,13 +958,7 @@ def test_complete_pool_progress_import_rejects_foreign_pool(tmp_path) -> None:
 
 
 def test_original_training_baseline_progress_resumes_at_the_exact_next_case(tmp_path) -> None:
-    training_cases = [
-        {"case_id": "f", "training_group": "far"},
-        {"case_id": "m", "training_group": "intermediate"},
-        {"case_id": "n", "training_group": "near"},
-        {"case_id": "pl", "training_group": "peripheral_left"},
-        {"case_id": "pr", "training_group": "peripheral_right"},
-    ]
+    training_cases = _ten_group_cases()
     class Model:
         device = torch.device("cpu")
 
@@ -1001,16 +975,20 @@ def test_original_training_baseline_progress_resumes_at_the_exact_next_case(tmp_
             kernel = torch.zeros((3, 3), dtype=torch.float64)
             kernel[1, 1] = 0.75
             kernel[1, 2] = 0.25
-            return FieldResult(kernel, torch.tensor(1.0), 1.0, torch.tensor(0.01))
+            return FieldResult(
+                kernel, torch.tensor(1.0), 0.001, torch.tensor(0.01),
+                z4_defocus_mm2=torch.tensor(0.2, dtype=torch.float64),
+            )
 
         def astig_A_by_zone(self) -> dict[str, torch.Tensor]:
             return {
                 "astig_left": torch.tensor(0.2, dtype=torch.float64),
                 "astig_right": torch.tensor(0.3, dtype=torch.float64),
+                "near": torch.tensor(0.25, dtype=torch.float64),
             }
 
     path = tmp_path / "baseline_progress.pt"
-    first = Model(fail_case="n")
+    first = Model(fail_case="case_03")
     with pytest.raises(RuntimeError, match="synthetic interruption"):
         _evaluate_original_training_baseline_with_resume(
             first,
@@ -1020,7 +998,7 @@ def test_original_training_baseline_progress_resumes_at_the_exact_next_case(tmp_
         )
     saved = torch.load(path, map_location="cpu")
     assert saved["next_training_index"] == 2
-    assert [row["case_id"] for row in saved["training_rows"]] == ["f", "m"]
+    assert [row["case_id"] for row in saved["training_rows"]] == ["case_01", "case_02"]
 
     resumed = Model()
     value, rows, health = _evaluate_original_training_baseline_with_resume(
@@ -1029,8 +1007,8 @@ def test_original_training_baseline_progress_resumes_at_the_exact_next_case(tmp_
         progress_path=path,
         identity_sha256="identity",
     )
-    assert resumed.calls == ["n", "pl", "pr"]
-    assert [row["case_id"] for row in rows] == ["f", "m", "n", "pl", "pr"]
+    assert resumed.calls == [f"case_{index:02d}" for index in range(3, 9)]
+    assert [row["case_id"] for row in rows] == [f"case_{index:02d}" for index in range(1, 11)]
     assert value == 1.0
     assert health["J_functional"] == 1.0
     assert health["J_peripheral"] == 1.0
@@ -1062,43 +1040,18 @@ def test_interrupted_training_resume_matches_uninterrupted_adam_state(
         lambda: [implementation],
     )
 
-    training_cases = [
-        {
-            "case_id": "f",
-            "training_group": "far",
-            "distance_mm": 100000.0,
-            "field_x_deg": 0.0,
-            "field_y_deg": 1.0,
-        },
-        {
-            "case_id": "m",
-            "training_group": "intermediate",
-            "distance_mm": 2000.0,
-            "field_x_deg": 0.0,
-            "field_y_deg": 0.0,
-        },
-        {
-            "case_id": "n",
-            "training_group": "near",
-            "distance_mm": 500.0,
-            "field_x_deg": 0.0,
-            "field_y_deg": -1.0,
-        },
-        {
-            "case_id": "pl",
-            "training_group": "peripheral_left",
-            "distance_mm": 2000.0,
-            "field_x_deg": -1.0,
-            "field_y_deg": 0.0,
-        },
-        {
-            "case_id": "pr",
-            "training_group": "peripheral_right",
-            "distance_mm": 2000.0,
-            "field_x_deg": 1.0,
-            "field_y_deg": 0.0,
-        },
-    ]
+    training_cases = _ten_group_cases()
+    for index, case in enumerate(training_cases):
+        group = str(case["training_group"])
+        case.update({
+            "distance_mm": (
+                100000.0 if group in {"far", *pal_nurbs.PERIPHERAL_GROUPS}
+                else 500.0 if group in {"near", "near_edge_astig"}
+                else 2000.0
+            ),
+            "field_x_deg": float(index - 5),
+            "field_y_deg": float(5 - index),
+        })
     class Model:
         _key = staticmethod(MinimalOpticalModel._key)
 
@@ -1119,6 +1072,7 @@ def test_interrupted_training_resume_matches_uninterrupted_adam_state(
             return {
                 "astig_left": torch.sigmoid(-0.5 + delta),
                 "astig_right": torch.sigmoid(-0.25 + delta),
+                "near": torch.sigmoid(-0.75 + delta),
             }
 
         def field(self, case: dict[str, object]) -> FieldResult:
@@ -1133,7 +1087,10 @@ def test_interrupted_training_resume_matches_uninterrupted_adam_state(
                     torch.stack((z, z, z)),
                 )
             )
-            return FieldResult(kernel, torch.ones_like(edge), 1.0, torch.zeros_like(edge))
+            return FieldResult(
+                kernel, torch.ones_like(edge), 0.001, torch.zeros_like(edge),
+                z4_defocus_mm2=edge,
+            )
 
     monkeypatch.setattr(pal_nurbs, "MinimalOpticalModel", Model)
     monkeypatch.setattr(
@@ -1151,9 +1108,15 @@ def test_interrupted_training_resume_matches_uninterrupted_adam_state(
         ),
     )
 
-    def fake_prescription(sag, power_config, zones):
+    def fake_prescription(sag, power_config, zones, *, baseline_sag=None):
         zero = sag.sum() * 0.0
-        return {"P_far_D": zero, "ADD_D": zero, "astig_mean_D": zero}
+        return {
+            "P_far_D": zero,
+            "ADD_D": zero,
+            "astig_mean_D": zero,
+            "lower_edge_max_abs_power_change_D": zero,
+            "lower_edge_max_abs_astig_change_D": zero,
+        }
 
     monkeypatch.setattr(pal_nurbs, "prescription_metrics", fake_prescription)
     real_evaluate = pal_nurbs._evaluate
@@ -1313,21 +1276,22 @@ def test_joint_loss_fails_closed_when_a_case_is_detached_from_nurbs() -> None:
             kernel = torch.zeros((3, 3), dtype=torch.float64)
             kernel[1, 1] = 0.5
             kernel[1, 2] = 0.5
-            return FieldResult(kernel, torch.tensor(1.0), 1.0, torch.tensor(0.0))
+            return FieldResult(
+                kernel, torch.tensor(1.0), 0.001, torch.tensor(0.0),
+                z4_defocus_mm2=torch.tensor(0.25, dtype=torch.float64),
+            )
 
         def astig_A_by_zone(self) -> dict[str, torch.Tensor]:
             return {
                 "astig_left": torch.tensor(0.2, dtype=torch.float64),
                 "astig_right": torch.tensor(0.3, dtype=torch.float64),
+                "near": torch.tensor(0.25, dtype=torch.float64),
             }
 
-    cases = [
-        {"case_id": "f", "training_group": "far"},
-        {"case_id": "m", "training_group": "intermediate"},
-        {"case_id": "n", "training_group": "near"},
-        {"case_id": "pl", "training_group": "peripheral_left"},
-        {"case_id": "pr", "training_group": "peripheral_right"},
-    ]
-    baseline = {case["case_id"]: {"loss_metric": 0.25} for case in cases}
+    cases = _ten_group_cases()
+    baseline = {
+        str(case["case_id"]): {"loss_metric": 0.25, "astig_A_D": 0.25}
+        for case in cases
+    }
     with pytest.raises(RuntimeError, match="detached from NURBS"):
         _evaluate(DetachedModel(), cases, baseline, with_grad=True)

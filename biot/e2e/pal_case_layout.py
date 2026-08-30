@@ -15,26 +15,48 @@ import numpy as np
 
 
 TRAINING_GROUP_COUNTS = {
-    "far": 18, "intermediate": 12, "near": 18,
-    "peripheral_left": 16, "peripheral_right": 16,
+    "far": 20,
+    "far_robustness": 8,
+    "corridor_upper": 5,
+    "corridor_middle": 5,
+    "corridor_lower": 5,
+    "near": 20,
+    "near_robustness": 8,
+    "near_edge_astig": 8,
+    "peripheral_left": 15,
+    "peripheral_right": 15,
 }
 TOTAL_TRAINING_CASES = sum(TRAINING_GROUP_COUNTS.values())
-CORRIDOR_LAYER_COUNT = 4
-CORRIDOR_POINTS_PER_LAYER = TRAINING_GROUP_COUNTS["intermediate"] // CORRIDOR_LAYER_COUNT
-PERIPHERAL_BAND_COUNTS = {"upper": 5, "middle": 5, "lower": 6}
+PERIPHERAL_BAND_COUNTS = {"upper": 4, "middle": 5, "lower": 6}
 PERIPHERAL_REAR_MIRROR_TOLERANCE_MM = 1.0e-4
 REFERENCE_RETRACE_TOLERANCE_MM = 1.0e-8
-FUNCTIONAL_GROUPS = ("far", "intermediate", "near")
+FUNCTIONAL_GROUPS = (
+    "far",
+    "far_robustness",
+    "corridor_upper",
+    "corridor_middle",
+    "corridor_lower",
+    "near",
+    "near_robustness",
+    "near_edge_astig",
+)
 PERIPHERAL_GROUPS = ("peripheral_left", "peripheral_right")
 PARTITION_ORDER = (
-    "far", "corridor", "near",
+    "far", "corridor", "corridor_flank", "near",
     "peripheral_astig_left", "peripheral_astig_right",
 )
-ZONE_TO_GROUP = {
-    "far": "far", "corridor": "intermediate", "near": "near",
-    "astig_left": "peripheral_left", "astig_right": "peripheral_right",
+GROUP_TO_ZONE = {
+    "far": "far",
+    "far_robustness": "far",
+    "corridor_upper": "corridor",
+    "corridor_middle": "corridor",
+    "corridor_lower": "corridor",
+    "near": "near",
+    "near_robustness": "near",
+    "near_edge_astig": "near",
+    "peripheral_left": "astig_left",
+    "peripheral_right": "astig_right",
 }
-GROUP_TO_ZONE = {value: key for key, value in ZONE_TO_GROUP.items()}
 
 
 def _read_json(path: str | Path) -> dict[str, Any]:
@@ -89,10 +111,24 @@ def classify_partition_point(
     xp, yp = float(np.median(abs(np.diff(x)))), float(np.median(abs(np.diff(y))))
     if abs(float(x[ix]) - x_mm) > 0.5 * xp + 1e-9 or abs(float(y[iy]) - physical_y_mm) > 0.5 * yp + 1e-9:
         return None
+    if "transition" in masks and bool(masks["transition"][iy, ix]):
+        normalized_add = np.asarray(zones_payload.get("normalized_add_t"), dtype=np.float64)
+        if normalized_add.shape != masks["transition"].shape:
+            raise ValueError("zones transition mask requires same-shape normalized_add_t")
+        value = float(normalized_add[iy, ix])
+        if not math.isfinite(value):
+            raise ValueError("zones normalized_add_t contains a non-finite transition value")
+        return "far" if value < 0.5 else "near"
     active = [name for name in PARTITION_ORDER if name in masks and bool(masks[name][iy, ix])]
+    if set(active) == {"corridor", "corridor_flank"}:
+        return "corridor"
     if len(active) != 1:
         return None
-    return {"peripheral_astig_left": "astig_left", "peripheral_astig_right": "astig_right"}.get(active[0], active[0])
+    return {
+        "peripheral_astig_left": "astig_left",
+        "peripheral_astig_right": "astig_right",
+        "corridor_flank": "corridor",
+    }.get(active[0], active[0])
 
 
 def _mask_name(zone: str) -> str:
@@ -114,18 +150,48 @@ def _inside_clearance_mm(payload: Mapping[str, Any], mask_name: str, x_mm: float
     return max(0.0, float(distance) - half_diagonal)
 
 
-def generate_dense_candidate_fields(
-    *, field_min_deg: float, field_max_deg: float, field_step_deg: float
-) -> list[dict[str, Any]]:
-    if field_step_deg <= 0 or field_max_deg <= field_min_deg:
+def _linspace_exact(minimum: float, maximum: float, step: float) -> np.ndarray:
+    if step <= 0 or maximum <= minimum:
         raise ValueError("invalid dense candidate field grid")
-    intervals = int(round((field_max_deg - field_min_deg) / field_step_deg))
-    values = field_min_deg + field_step_deg * np.arange(intervals + 1, dtype=np.float64)
-    if abs(float(values[-1]) - field_max_deg) > 1e-9:
+    intervals = int(round((maximum - minimum) / step))
+    values = minimum + step * np.arange(intervals + 1, dtype=np.float64)
+    if abs(float(values[-1]) - maximum) > 1e-9:
         raise ValueError("candidate range must be exactly divisible by step")
+    return values
+
+
+def generate_dense_candidate_fields(
+    *,
+    field_x_min_deg: float | None = None,
+    field_x_max_deg: float | None = None,
+    field_y_min_deg: float | None = None,
+    field_y_max_deg: float | None = None,
+    field_step_deg: float,
+    field_min_deg: float | None = None,
+    field_max_deg: float | None = None,
+) -> list[dict[str, Any]]:
+    """Generate a deterministic row-major asymmetric field grid.
+
+    ``field_min_deg``/``field_max_deg`` are compatibility aliases.  Supplying
+    an alias together with the corresponding explicit XY bound is rejected so
+    the run identity cannot depend on an ambiguous precedence rule.
+    """
+    if field_min_deg is not None:
+        if field_x_min_deg is not None or field_y_min_deg is not None:
+            raise ValueError("field_min_deg cannot be mixed with explicit XY minima")
+        field_x_min_deg = field_y_min_deg = float(field_min_deg)
+    if field_max_deg is not None:
+        if field_x_max_deg is not None or field_y_max_deg is not None:
+            raise ValueError("field_max_deg cannot be mixed with explicit XY maxima")
+        field_x_max_deg = field_y_max_deg = float(field_max_deg)
+    bounds = (field_x_min_deg, field_x_max_deg, field_y_min_deg, field_y_max_deg)
+    if any(value is None for value in bounds):
+        raise ValueError("candidate grid requires explicit X/Y bounds")
+    x_values = _linspace_exact(float(field_x_min_deg), float(field_x_max_deg), float(field_step_deg))
+    y_values = _linspace_exact(float(field_y_min_deg), float(field_y_max_deg), float(field_step_deg))
     return [
-        {"candidate_id": f"cand_{index + 1:04d}", "field_x_deg": float(fx), "field_y_deg": float(fy)}
-        for index, (fy, fx) in enumerate((fy, fx) for fy in values for fx in values)
+        {"candidate_id": f"cand_{index + 1:05d}", "field_x_deg": float(fx), "field_y_deg": float(fy)}
+        for index, (fy, fx) in enumerate((fy, fx) for fy in y_values for fx in x_values)
     ]
 
 
@@ -336,74 +402,78 @@ def _nearest_neighbour_p95_mm(rows: Sequence[Mapping[str, Any]]) -> float:
     return float(np.percentile(nearest, 95.0))
 
 
-def _select_corridor(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    y = np.asarray([row["reference_lens_physical_y_mm"] for row in rows], dtype=np.float64)
-    expected = TRAINING_GROUP_COUNTS["intermediate"]
-    if expected % CORRIDOR_LAYER_COUNT != 0:
-        raise ValueError("intermediate case count must divide exactly into corridor layers")
-    if len(rows) < expected:
-        raise ValueError(f"insufficient eligible corridor candidates: {len(rows)} < {expected}")
-    edges = np.linspace(
-        float(y.min()) - 1e-9,
-        float(y.max()) + 1e-9,
-        CORRIDOR_LAYER_COUNT + 1,
+def corridor_object_distance_mm(
+    power_map: np.ndarray,
+    pfar: float,
+    case_lens_y_mm: float,
+    zones_payload: Mapping[str, Any],
+) -> float:
+    """Interpolate the corridor design distance from the Original PAL power map."""
+    power = np.asarray(power_map, dtype=np.float64)
+    x_mm = np.asarray(zones_payload["x_mm"], dtype=np.float64)
+    y_mm = np.asarray(zones_payload["physical_y_mm"], dtype=np.float64)
+    if power.shape != (y_mm.size, x_mm.size) or not np.isfinite(power).all():
+        raise ValueError("corridor power map must be finite and match zones coordinates")
+    centre = np.abs(x_mm) <= 2.0
+    if not bool(centre.any()):
+        raise ValueError("corridor power map has no x=0 +/-2 mm centre samples")
+    row = int(np.argmin(np.abs(y_mm - float(case_lens_y_mm))))
+    local_power = float(np.mean(power[row, centre]))
+    local_add = max(local_power - float(pfar), 0.05)
+    distance = 1000.0 / local_add
+    if not math.isfinite(distance) or distance <= 0.0:
+        raise ValueError("corridor object distance is not finite and positive")
+    return distance
+
+
+def _corridor_add_and_distance(
+    row: Mapping[str, Any],
+    *,
+    power_map: np.ndarray,
+    pfar: float,
+    zones_payload: Mapping[str, Any],
+) -> tuple[float, float]:
+    distance = corridor_object_distance_mm(
+        power_map,
+        pfar,
+        float(row["reference_lens_physical_y_mm"]),
+        zones_payload,
     )
-    selected: list[dict[str, Any]] = []
-    for layer in range(CORRIDOR_LAYER_COUNT):
-        members = [row for row in rows if edges[layer] <= float(row["reference_lens_physical_y_mm"]) < edges[layer + 1]]
-        picked = _fps_rows(
-            members,
-            CORRIDOR_POINTS_PER_LAYER,
-            (0.0, 0.5 * (edges[layer] + edges[layer + 1])),
+    return 1000.0 / distance, distance
+
+
+def _select_corridor_stratum(
+    rows: Sequence[Mapping[str, Any]],
+    count: int,
+    *,
+    add_min_D: float,
+    add_max_D: float,
+    include_upper: bool,
+    power_map: np.ndarray,
+    pfar: float,
+    zones_payload: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    members: list[dict[str, Any]] = []
+    for source in rows:
+        local_add, distance = _corridor_add_and_distance(
+            source, power_map=power_map, pfar=pfar, zones_payload=zones_payload
         )
-        eligible_x = np.asarray(
-            [float(row["reference_lens_x_mm"]) for row in members], dtype=np.float64
+        in_band = add_min_D <= local_add <= add_max_D if include_upper else add_min_D <= local_add < add_max_D
+        if in_band:
+            members.append({
+                **dict(source),
+                "corridor_local_add_D": local_add,
+                "distance_mm": distance,
+            })
+    if len(members) < int(count):
+        raise ValueError(
+            f"insufficient eligible corridor candidates in ADD [{add_min_D:g},{add_max_D:g}] D: "
+            f"{len(members)} < {count}"
         )
-        picked_x = np.asarray(
-            [float(row["reference_lens_x_mm"]) for row in picked], dtype=np.float64
-        )
-        span = float(eligible_x.max() - eligible_x.min())
-        if span <= 0.0:
-            raise ValueError(f"corridor layer {layer + 1} has zero eligible x span")
-        candidate_scale = _nearest_neighbour_p95_mm(members)
-        edge_tolerance = min(
-            0.25 * span, max(candidate_scale, 0.10 * span)
-        )
-        centre_target = float(np.clip(0.0, eligible_x.min(), eligible_x.max()))
-        centre_tolerance = min(
-            0.20 * span, max(0.5 * candidate_scale, 0.08 * span)
-        )
-        ordered_x = np.sort(picked_x)
-        checks = {
-            "three_distinct_x": bool(np.all(np.diff(ordered_x) > 1.0e-9)),
-            "left": float(ordered_x[0] - eligible_x.min()) <= edge_tolerance,
-            "centre": abs(float(ordered_x[1] - centre_target)) <= centre_tolerance,
-            "right": float(eligible_x.max() - ordered_x[2]) <= edge_tolerance,
-        }
-        if not all(checks.values()):
-            raise ValueError(
-                f"corridor layer {layer + 1} misses eligible left/centre/right anchors: "
-                f"eligible=[{eligible_x.min():.6g},{eligible_x.max():.6g}], "
-                f"selected={picked_x.tolist()}, checks={checks}"
-            )
-        ordered = sorted(picked, key=lambda row: float(row["reference_lens_x_mm"]))
-        roles = ("left_boundary", "centre", "right_boundary")
-        if len(ordered) != len(roles):
-            raise ValueError("corridor layer contract requires exactly three anchor roles")
-        for row, role in zip(ordered, roles):
-            row["corridor_horizontal_role"] = role
-        for row in picked:
-            row["corridor_vertical_layer"] = layer + 1
-            row["corridor_eligible_x_bounds_mm"] = [
-                float(eligible_x.min()), float(eligible_x.max())
-            ]
-            row["corridor_anchor_tolerance_mm"] = {
-                "candidate_nearest_neighbour_p95": candidate_scale,
-                "edge": edge_tolerance,
-                "centre": centre_tolerance,
-            }
-        selected.extend(picked)
-    return selected
+    seed_y = float(np.median([
+        float(row["reference_lens_physical_y_mm"]) for row in members
+    ]))
+    return _fps_rows(members, int(count), (0.0, seed_y))
 
 
 def _peripheral_pairs(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -473,6 +543,9 @@ def select_training_cases(
     traced_candidates: Sequence[Mapping[str, Any]], *,
     far_object_distance_mm: float, intermediate_object_distance_mm: float,
     near_object_distance_mm: float, corridor_y_min_mm: float, corridor_y_max_mm: float,
+    power_map: np.ndarray,
+    pfar: float,
+    zones_payload: Mapping[str, Any],
     group_counts: Mapping[str, int] = TRAINING_GROUP_COUNTS,
     peripheral_band_counts: Mapping[str, int] = PERIPHERAL_BAND_COUNTS,
 ) -> list[dict[str, Any]]:
@@ -483,18 +556,44 @@ def select_training_cases(
     }
     if any(value <= 0 for value in resolved_counts.values()):
         raise ValueError("all training group counts must be positive")
-    if resolved_counts["intermediate"] != TRAINING_GROUP_COUNTS["intermediate"]:
-        raise ValueError("intermediate selection remains fixed at 4 layers x 3 points")
     if resolved_counts["peripheral_left"] != resolved_counts["peripheral_right"]:
         raise ValueError("peripheral groups must contain equal mirror-pair counts")
     if sum(resolved_band_counts.values()) != resolved_counts["peripheral_left"]:
         raise ValueError("peripheral band counts do not match the group count")
     eligible = [dict(row) for row in traced_candidates if bool(row.get("eligible"))]
     zone_rows = lambda zone: [row for row in eligible if row.get("reference_partition_zone") == zone]
+    far_rows = zone_rows("far")
+    corridor_rows = zone_rows("corridor")
+    near_rows = zone_rows("near")
     groups: dict[str, list[dict[str, Any]]] = {
-        "far": _fps_rows(zone_rows("far"), resolved_counts["far"]),
-        "intermediate": _select_corridor(zone_rows("corridor")),
-        "near": _fps_rows(zone_rows("near"), resolved_counts["near"]),
+        "far": _fps_rows(far_rows, resolved_counts["far"]),
+        "far_robustness": _fps_rows(
+            far_rows, resolved_counts["far_robustness"], (0.0, 15.0)
+        ),
+        "corridor_upper": _select_corridor_stratum(
+            corridor_rows, resolved_counts["corridor_upper"],
+            add_min_D=0.2, add_max_D=0.5, include_upper=False,
+            power_map=power_map, pfar=pfar, zones_payload=zones_payload,
+        ),
+        "corridor_middle": _select_corridor_stratum(
+            corridor_rows, resolved_counts["corridor_middle"],
+            add_min_D=0.5, add_max_D=1.3, include_upper=False,
+            power_map=power_map, pfar=pfar, zones_payload=zones_payload,
+        ),
+        "corridor_lower": _select_corridor_stratum(
+            corridor_rows, resolved_counts["corridor_lower"],
+            add_min_D=1.3, add_max_D=2.0, include_upper=True,
+            power_map=power_map, pfar=pfar, zones_payload=zones_payload,
+        ),
+        "near": _fps_rows(near_rows, resolved_counts["near"]),
+        "near_robustness": _fps_rows(
+            near_rows, resolved_counts["near_robustness"]
+        ),
+        "near_edge_astig": _fps_rows(
+            [row for row in near_rows if abs(float(row["reference_lens_x_mm"])) > 10.0],
+            resolved_counts["near_edge_astig"],
+            (12.0, -28.0),
+        ),
         "peripheral_left": [], "peripheral_right": [],
     }
     peripheral = zone_rows("astig_left") + zone_rows("astig_right")
@@ -502,14 +601,22 @@ def select_training_cases(
         peripheral, corridor_y_min_mm, corridor_y_max_mm,
         band_counts=resolved_band_counts,
     )
-    band_distance = {"upper": far_object_distance_mm, "middle": intermediate_object_distance_mm, "lower": near_object_distance_mm}
+    band_distance = {name: far_object_distance_mm for name in PERIPHERAL_BAND_COUNTS}
     for pair_index, pair in enumerate(pairs, 1):
         for side, group in (("left", "peripheral_left"), ("right", "peripheral_right")):
             groups[group].append({
                 **pair[side], "peripheral_pair_id": f"peripheral_pair_{pair_index:02d}",
                 "peripheral_band": pair["peripheral_band"], "distance_mm": float(band_distance[pair["peripheral_band"]]),
             })
-    group_distance = {"far": far_object_distance_mm, "intermediate": intermediate_object_distance_mm, "near": near_object_distance_mm}
+    group_distance = {
+        "far": far_object_distance_mm,
+        "far_robustness": intermediate_object_distance_mm,
+        "near": near_object_distance_mm,
+        "near_robustness": intermediate_object_distance_mm,
+        "near_edge_astig": near_object_distance_mm,
+        "peripheral_left": far_object_distance_mm,
+        "peripheral_right": far_object_distance_mm,
+    }
 
     def distance_id(distance: float) -> str:
         """Serialize the physical object distance for a stable case ID."""
@@ -544,9 +651,13 @@ def partition_audit(payload: Mapping[str, Any], cases: Sequence[Mapping[str, Any
     _, _, masks = _zone_arrays(payload)
     topology = dict(dict(payload.get("rules", {})).get("topology", {}))
     stats = dict(payload.get("statistics", {}))
-    zone_group = {
-        "far": "far", "corridor": "intermediate", "near": "near",
-        "peripheral_astig_left": "peripheral_left", "peripheral_astig_right": "peripheral_right",
+    zone_groups = {
+        "far": ("far", "far_robustness"),
+        "corridor": ("corridor_upper", "corridor_middle", "corridor_lower"),
+        "corridor_flank": ("corridor_upper", "corridor_middle", "corridor_lower"),
+        "near": ("near", "near_robustness", "near_edge_astig"),
+        "peripheral_astig_left": ("peripheral_left",),
+        "peripheral_astig_right": ("peripheral_right",),
     }
     zones: dict[str, Any] = {}
     for zone in PARTITION_ORDER:
@@ -557,7 +668,7 @@ def partition_audit(payload: Mapping[str, Any], cases: Sequence[Mapping[str, Any
             "topology_removed_pixel_count": source - final,
             "topology_retained_fraction": final / source if source else None,
             "statistics": stats.get(zone),
-            "training_case_count": sum(case.get("training_group") == zone_group[zone] for case in cases),
+            "training_case_count": sum(case.get("training_group") in zone_groups[zone] for case in cases),
         }
     return {"interpretation": "topology retention and physical zone extent are reported separately", "zones": zones}
 
@@ -725,11 +836,13 @@ def coverage_audit(
     pitch_y = float(np.median(abs(np.diff(y))))
     cell_area = pitch_x * pitch_y
     zone_specs = {
-        "far": ("far", "far"),
-        "corridor": ("corridor", "intermediate"),
-        "near": ("near", "near"),
-        "peripheral_astig_left": ("astig_left", "peripheral_left"),
-        "peripheral_astig_right": ("astig_right", "peripheral_right"),
+        "far": ("far", ("far", "far_robustness")),
+        "corridor": (
+            "corridor", ("corridor_upper", "corridor_middle", "corridor_lower")
+        ),
+        "near": ("near", ("near", "near_robustness", "near_edge_astig")),
+        "peripheral_astig_left": ("astig_left", ("peripheral_left",)),
+        "peripheral_astig_right": ("astig_right", ("peripheral_right",)),
     }
     corridor_range = dict(dict(payload.get("statistics", {})).get("corridor", {})).get(
         "physical_y_range_mm"
@@ -751,14 +864,14 @@ def coverage_audit(
     }
 
     zones: dict[str, Any] = {}
-    for mask_name, (zone_name, group_name) in zone_specs.items():
+    for mask_name, (zone_name, group_names) in zone_specs.items():
         traceable = [
             row for row in candidates
             if row.get("trace_status") == "ok" and row.get("reference_partition_zone") == zone_name
         ]
         eligible = [row for row in traceable if bool(row.get("eligible"))]
         coverage_eligible = pairable_by_zone.get(zone_name, eligible)
-        selected = [row for row in cases if row.get("training_group") == group_name]
+        selected = [row for row in cases if row.get("training_group") in group_names]
         max_nearest = p95_nearest = median_nearest = None
         if coverage_eligible and selected:
             ep = np.asarray(
@@ -932,19 +1045,19 @@ def _validate_selected_case_geometry(
                 + (" or Infinity" if name == "far" else " and finite")
             )
     for name, value in resolved_band_distances.items():
-        if not valid_object_distance(value, allow_infinity=name == "upper"):
+        if not valid_object_distance(value, allow_infinity=True):
             raise ValueError(
                 f"peripheral {name} object distance must be positive"
-                + (" or Infinity" if name == "upper" else " and finite")
+                + " or Infinity"
             )
     required_band_mapping = {
         "upper": resolved_distances["far"],
-        "middle": resolved_distances["intermediate"],
-        "lower": resolved_distances["near"],
+        "middle": resolved_distances["far"],
+        "lower": resolved_distances["far"],
     }
     if resolved_band_distances != required_band_mapping:
         raise ValueError(
-            "peripheral distances must map upper=far, middle=intermediate, lower=near"
+            "surface-only peripheral cases must all retain the far reference distance"
         )
     aperture_margin = float(sampling_contract["aperture_edge_safety_mm"])
     resolved_zone_margins = {
@@ -1013,95 +1126,46 @@ def _validate_selected_case_geometry(
                     f"{expected_band}, not {case.get('peripheral_band')}"
                 )
             expected_distance = resolved_band_distances[expected_band]
+        elif group == "far":
+            expected_distance = resolved_distances["far"]
+        elif group in {"far_robustness", "near_robustness"}:
+            expected_distance = resolved_distances["intermediate"]
+        elif group in {"near", "near_edge_astig"}:
+            expected_distance = resolved_distances["near"]
+        elif group.startswith("corridor_"):
+            local_add = float(case.get("corridor_local_add_D", math.nan))
+            if not math.isfinite(local_add) or local_add <= 0.0:
+                raise ValueError(f"{case['case_id']} has invalid corridor_local_add_D")
+            expected_distance = 1000.0 / local_add
         else:
-            expected_distance = resolved_distances[group]
-        if float(case["distance_mm"]) != expected_distance:
+            raise ValueError(f"unknown training group: {group}")
+        if not math.isclose(float(case["distance_mm"]), expected_distance, rel_tol=0.0, abs_tol=1.0e-9):
             raise ValueError(
                 f"{case['case_id']} distance is {case['distance_mm']}, "
                 f"expected {expected_distance} mm"
             )
 
-    intermediate = [
-        case for case in cases if case.get("training_group") == "intermediate"
-    ]
-    eligible_corridor = [
-        row for row in candidates
-        if row.get("trace_status") == "ok"
-        and bool(row.get("eligible"))
-        and row.get("reference_partition_zone") == "corridor"
-    ]
-    if len(eligible_corridor) < TRAINING_GROUP_COUNTS["intermediate"]:
-        raise ValueError("insufficient real eligible corridor candidates for audit")
-    eligible_y = np.asarray(
-        [float(row["reference_lens_physical_y_mm"]) for row in eligible_corridor],
-        dtype=np.float64,
-    )
-    layer_edges = np.linspace(
-        float(eligible_y.min()) - 1.0e-9,
-        float(eligible_y.max()) + 1.0e-9,
-        CORRIDOR_LAYER_COUNT + 1,
-    )
-    for layer in range(1, CORRIDOR_LAYER_COUNT + 1):
-        members = [
-            case for case in intermediate
-            if int(case.get("corridor_vertical_layer", -1)) == layer
-        ]
-        roles = {case.get("corridor_horizontal_role") for case in members}
-        if len(members) != CORRIDOR_POINTS_PER_LAYER or roles != {
-            "left_boundary", "centre", "right_boundary"
-        }:
-            raise ValueError(
-                f"corridor layer {layer} does not contain the three required anchors"
-            )
-        lower, upper = layer_edges[layer - 1], layer_edges[layer]
-        if any(
-            not lower <= float(case["reference_lens_physical_y_mm"]) < upper
-            for case in members
-        ):
-            raise ValueError(f"corridor layer {layer} label does not match physical y")
-        eligible_members = [
-            row for row in eligible_corridor
-            if lower <= float(row["reference_lens_physical_y_mm"]) < upper
-        ]
-        eligible_x = np.asarray(
-            [float(row["reference_lens_x_mm"]) for row in eligible_members],
-            dtype=np.float64,
-        )
-        if eligible_x.size < CORRIDOR_POINTS_PER_LAYER:
-            raise ValueError(f"corridor layer {layer} has too few eligible candidates")
-        x_min, x_max = float(eligible_x.min()), float(eligible_x.max())
-        span = x_max - x_min
-        candidate_scale = _nearest_neighbour_p95_mm(eligible_members)
-        edge_tolerance = min(0.25 * span, max(candidate_scale, 0.10 * span))
-        centre_tolerance = min(0.20 * span, max(0.5 * candidate_scale, 0.08 * span))
-        expected_bounds = (x_min, x_max)
-        expected_tolerances = (edge_tolerance, centre_tolerance)
+    corridor_bands = {
+        "corridor_upper": (0.2, 0.5, False),
+        "corridor_middle": (0.5, 1.3, False),
+        "corridor_lower": (1.3, 2.0, True),
+    }
+    for group, (lower, upper, include_upper) in corridor_bands.items():
+        members = [case for case in cases if case.get("training_group") == group]
+        if len(members) != TRAINING_GROUP_COUNTS[group]:
+            raise ValueError(f"{group} count does not match the training contract")
         for case in members:
-            recorded_bounds = tuple(
-                float(value) for value in case.get("corridor_eligible_x_bounds_mm", ())
-            )
-            recorded_tolerances = dict(case.get("corridor_anchor_tolerance_mm", {}))
-            recorded_pair = (
-                float(recorded_tolerances.get("edge", math.nan)),
-                float(recorded_tolerances.get("centre", math.nan)),
-            )
-            if recorded_bounds != expected_bounds or recorded_pair != expected_tolerances:
+            value = float(case["corridor_local_add_D"])
+            in_band = lower <= value <= upper if include_upper else lower <= value < upper
+            if not in_band:
                 raise ValueError(
-                    f"corridor layer {layer} anchor metadata does not match eligible candidates"
+                    f"{case['case_id']} ADD {value:.6g} D is outside {group} band"
                 )
-        ordered = sorted(members, key=lambda case: float(case["reference_lens_x_mm"]))
-        if [case.get("corridor_horizontal_role") for case in ordered] != [
-            "left_boundary", "centre", "right_boundary"
-        ]:
-            raise ValueError(f"corridor layer {layer} anchor roles do not match x order")
-        selected_x = [float(case["reference_lens_x_mm"]) for case in ordered]
-        centre_target = min(max(0.0, x_min), x_max)
-        if (
-            selected_x[0] - x_min > edge_tolerance
-            or abs(selected_x[1] - centre_target) > centre_tolerance
-            or x_max - selected_x[2] > edge_tolerance
-        ):
-            raise ValueError(f"corridor layer {layer} misses a physical x anchor")
+    for case in cases:
+        if case.get("training_group") == "near_edge_astig" and abs(
+            float(case["reference_lens_x_mm"])
+        ) <= 10.0:
+            raise ValueError(f"{case['case_id']} violates near-edge |x| > 10 mm")
     for group in PERIPHERAL_GROUPS:
         for band, expected_count in PERIPHERAL_BAND_COUNTS.items():
             actual_count = sum(
@@ -1175,8 +1239,8 @@ def _validate_selected_candidate_membership(
     selected_candidate_ids = [str(case.get("candidate_id", "")) for case in cases]
     if not all(case_ids) or len(set(case_ids)) != len(case_ids):
         raise ValueError("training cases must contain unique non-empty case ids")
-    if not all(selected_candidate_ids) or len(set(selected_candidate_ids)) != len(selected_candidate_ids):
-        raise ValueError("training cases must select unique candidate ids")
+    if not all(selected_candidate_ids):
+        raise ValueError("training cases must select non-empty candidate ids")
     lookup = {str(row["candidate_id"]): row for row in candidates}
     maximum_reference_retrace_error = 0.0
     for case in cases:
@@ -1212,6 +1276,7 @@ def _validate_selected_candidate_membership(
         "selected_candidate_count": len(selected_candidate_ids),
         "unique_case_id_count": len(set(case_ids)),
         "unique_candidate_id_count": len(set(selected_candidate_ids)),
+        "candidate_reuse_count": len(selected_candidate_ids) - len(set(selected_candidate_ids)),
         "maximum_reference_retrace_error_mm": maximum_reference_retrace_error,
         "reference_retrace_tolerance_mm": REFERENCE_RETRACE_TOLERANCE_MM,
     }
@@ -1278,7 +1343,7 @@ def write_preoptimization_artifacts(
         )
 
     manifest = {
-        "schema_version": 5,
+        "schema_version": 6,
         "purpose": f"pal_nurbs_dense_field_fps_{TOTAL_TRAINING_CASES}_case_contract",
         "source": {
             "excel": {"path": str(excel_path), "sha256": _sha256_file(excel_path)},
@@ -1286,7 +1351,12 @@ def write_preoptimization_artifacts(
         },
         "reference_geometry": {"object_distance_mm": reference_distance_mm, "ray": "aimed centre-pupil ray", "surface": "Original PAL rear surface", "coordinates": "physical local-surface x/y in mm"},
         "sampling_contract": dict(sampling_contract),
-        "objective_contract": {"denominator": "per-case Original PAL baseline M2", "J_functional": "(J_far + J_mid + J_near) / 3", "J": "0.85 * J_functional + 0.15 * J_peripheral", "aggregation_order": "mean within region before region weighting"},
+        "objective_contract": {
+            "denominator": "per-case Original PAL baseline for the routed physical metric",
+            "metrics": "far=CSF-MTF loss; corridor/near=Z4 OPD mm^2; peripheral=surface A_D",
+            "J": "sum(group_weight * mean(per-case normalized score))",
+            "aggregation_order": "mean within each of ten groups before explicit group weighting",
+        },
         "coverage_audit": {
             "path": str(coverage_json.resolve()),
             "sha256": _sha256_file(coverage_json),

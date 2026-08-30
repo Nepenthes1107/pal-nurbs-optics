@@ -1,4 +1,4 @@
-"""PAL-NURBS 最简优化链：真实追迹 + 分区联合 M2 + Adam 小步更新。"""
+"""PAL-NURBS V3 优化链：真实追迹 + 路由物理指标 + Adam 小步更新。"""
 from __future__ import annotations
 
 import copy
@@ -14,7 +14,7 @@ import platform
 import shutil
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -40,6 +40,7 @@ from .pal_case_layout import (
     trace_candidate_fields,
     write_preoptimization_artifacts,
 )
+from .opd_zernike import fit_low_order_opd_zernike_torch
 from .psf_database import compute_physical_fft_pixel_pitch_mm
 from .psf_fft import effective_biot_pupil_sample_count, torch_fft_psf_from_phase
 from .regional_nurbs import FixedWeightNURBSPerturbation, audit_exact_refinement
@@ -56,7 +57,20 @@ from .system import (
 )
 
 
-METHOD_NAME = "pal_80case_raw_psf_nonlegacy_m2_astig_a_bspline7_ladder_earlystop19"
+METHOD_NAME = "pal_109case_stratified_corridor_csf_z4_smooth_v3zones"
+
+DEFAULT_GROUP_WEIGHTS = {
+    "far": 0.22,
+    "far_robustness": 0.02,
+    "corridor_upper": 0.07,
+    "corridor_middle": 0.10,
+    "corridor_lower": 0.11,
+    "near": 0.18,
+    "near_robustness": 0.02,
+    "near_edge_astig": 0.04,
+    "peripheral_left": 0.12,
+    "peripheral_right": 0.12,
+}
 
 
 @dataclass(frozen=True)
@@ -82,27 +96,38 @@ class MinimalConfig:
     minimum_learning_rate: float = 1.0e-6
     max_steps_7: int = 10
     max_steps_11: int = 10
-    max_steps_19: int = 10
+    max_steps_19: int = 30
     early_stopping_patience: int = 7
-    relative_improvement_threshold: float = 1.0e-4
-    max_extra_19_steps: int = 50
+    relative_improvement_threshold: float = 1.0e-3
+    max_extra_19_steps: int = 30
     max_backtracks: int = 8
     step_sag_limit_mm: float = 2.0e-3
-    far_tolerance_D: float = 0.2
-    add_tolerance_D: float = 0.3
+    far_tolerance_D: float = 0.15
+    add_tolerance_D: float = 0.25
+    lower_edge_power_tolerance_D: float = 0.50
+    lower_edge_astig_tolerance_D: float = 0.80
     minimum_valid_fraction_ratio: float = 0.5
     seed: int = 42
     far_object_distance_mm: float = float("inf")
     intermediate_object_distance_mm: float = 1000.0
     near_object_distance_mm: float = 500.0
-    candidate_field_min_deg: float = -55.0
-    candidate_field_max_deg: float = 55.0
+    candidate_field_x_min_deg: float = -45.0
+    candidate_field_x_max_deg: float = 45.0
+    candidate_field_y_min_deg: float = -60.0
+    candidate_field_y_max_deg: float = 55.0
     candidate_field_step_deg: float = 1.0
+    # Deprecated square-grid aliases.  They remain explicit identity fields
+    # for old callers but are not used unless supplied.
+    candidate_field_min_deg: float | None = None
+    candidate_field_max_deg: float | None = None
     zone_boundary_safety_mm: float = 1.5
     corridor_zone_boundary_safety_mm: float = 1.0
     aperture_edge_safety_mm: float = 1.5
-    functional_objective_weight: float = 0.85
-    peripheral_objective_weight: float = 0.15
+    group_weights: dict[str, float] = field(
+        default_factory=lambda: dict(DEFAULT_GROUP_WEIGHTS)
+    )
+    near_edge_astig_A_weight: float = 0.10
+    smooth_lambda: float = 0.05
     candidate_trace_import: str | None = None
     forward_qualification_import: str | None = None
     final_phase_qualification_import: str | None = None
@@ -117,6 +142,19 @@ class MinimalConfig:
             raise ValueError("PAL requires remove_tilt=False with the BIOT reference sphere")
         if int(self.requested_np) <= 0:
             raise ValueError("requested_np must be positive")
+        weights = {str(name): float(value) for name, value in self.group_weights.items()}
+        if set(weights) != set(TRAINING_GROUP_COUNTS):
+            raise ValueError("group_weights must define exactly the ten training groups")
+        if any(not math.isfinite(value) or value <= 0.0 for value in weights.values()):
+            raise ValueError("group_weights must be finite and positive")
+        if not math.isclose(sum(weights.values()), 1.0, rel_tol=0.0, abs_tol=1.0e-12):
+            raise ValueError("group_weights must sum to 1")
+        if not 0.0 <= float(self.near_edge_astig_A_weight) <= 1.0:
+            raise ValueError("near_edge_astig_A_weight must be in [0,1]")
+        if not math.isfinite(float(self.smooth_lambda)) or float(self.smooth_lambda) < 0.0:
+            raise ValueError("smooth_lambda must be finite and non-negative")
+        if (self.candidate_field_min_deg is None) != (self.candidate_field_max_deg is None):
+            raise ValueError("deprecated candidate field min/max aliases must be supplied together")
         if int(self.fft_size_px) <= 0:
             raise ValueError("fft_size_px must be positive")
         if int(self.case_batch_size) <= 0:
@@ -139,17 +177,18 @@ class MinimalConfig:
 
 
 RUN_IDENTITY_SCHEMA_VERSION = 6
-CASE_LAYOUT_STATE_SCHEMA_VERSION = 6
-BASELINE_STATE_SCHEMA_VERSION = 5
-BASELINE_PROGRESS_SCHEMA_VERSION = 5
+CASE_LAYOUT_STATE_SCHEMA_VERSION = 7
+BASELINE_STATE_SCHEMA_VERSION = 6
+BASELINE_PROGRESS_SCHEMA_VERSION = 6
 STAGE_RESUME_SCHEMA_VERSION = 2
 RUN_STATE_SCHEMA_VERSION = 1
 STAGE_LADDER = (7, 11, 19)
 FORWARD_POOL_MULTIPLIER = 4
 FORWARD_POOL_GROUP_COUNTS = {
-    "far": TRAINING_GROUP_COUNTS["far"] * FORWARD_POOL_MULTIPLIER,
-    "intermediate": TRAINING_GROUP_COUNTS["intermediate"],
-    "near": TRAINING_GROUP_COUNTS["near"] * FORWARD_POOL_MULTIPLIER,
+    **{
+        group: TRAINING_GROUP_COUNTS[group] * FORWARD_POOL_MULTIPLIER
+        for group in FUNCTIONAL_GROUPS
+    },
     # Keep the already audited 52-case pool per side.  This is the smallest
     # pool that contains the complete 16/16/20 band strata while supporting
     # the final 5/5/6 selection without increasing qualification compute.
@@ -450,6 +489,8 @@ class FieldResult:
     valid_mask: torch.Tensor | None = None
     raw_psf: torch.Tensor | None = None
     raw_pixel_pitch_mm: float | None = None
+    zernike_coefficients_mm: torch.Tensor | None = None
+    z4_defocus_mm2: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -461,6 +502,8 @@ class BatchFieldResult:
     pixel_pitch_mm: torch.Tensor
     edge_fraction: torch.Tensor
     valid_mask: torch.Tensor | None = None
+    zernike_coefficients_mm: torch.Tensor | None = None
+    z4_defocus_mm2: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -561,7 +604,11 @@ def _retain_training_cache(
     *,
     extra_cases: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, int]:
-    required_cases = [*cases, *extra_cases]
+    required_cases = [
+        case
+        for case in (*cases, *extra_cases)
+        if str(case.get("training_group", "")) not in PERIPHERAL_GROUPS
+    ]
     keep = _training_case_keys(model, required_cases)
     materialized = 0
     system_and_rays = getattr(model, "_system_and_rays", None)
@@ -694,6 +741,101 @@ def psf_second_moment_mm2_batch(
     return (normalized * ((xx_mm - cx).square() + (yy_mm - cy).square())).sum(dim=(-2, -1))
 
 
+def csf_weighted_mtf_loss_batch(
+    psf_kernel: torch.Tensor,
+    *,
+    pixel_pitch_mm: torch.Tensor,
+    maximum_frequency_lpmm: float = 30.0,
+    frequency_sample_count: int = 60,
+    angular_sample_count: int = 72,
+) -> torch.Tensor:
+    """Return differentiable Mannos-Sakrison CSF-weighted MTF losses."""
+    if psf_kernel.ndim != 3:
+        raise ValueError("batched CSF-MTF requires PSF shape [B,H,W]")
+    if pixel_pitch_mm.shape != (int(psf_kernel.shape[0]),):
+        raise ValueError("pixel_pitch_mm must have one value per PSF case")
+    if not bool(torch.isfinite(psf_kernel).all()) or bool((psf_kernel < 0.0).any()):
+        raise ValueError("CSF-MTF PSF must be finite and non-negative")
+    if not bool(torch.isfinite(pixel_pitch_mm).all()) or bool((pixel_pitch_mm <= 0.0).any()):
+        raise ValueError("CSF-MTF pixel pitch must be finite and positive")
+    h, w = int(psf_kernel.shape[-2]), int(psf_kernel.shape[-1])
+    otf = torch.fft.fftshift(
+        torch.fft.fft2(psf_kernel, dim=(-2, -1)), dim=(-2, -1)
+    )
+    magnitude = torch.abs(otf)
+    dc = magnitude[:, h // 2, w // 2]
+    if not bool(torch.isfinite(dc).all()) or bool((dc <= 0.0).any()):
+        raise ValueError("CSF-MTF OTF DC must be finite and positive")
+    mtf = magnitude / dc[:, None, None]
+    targets = torch.linspace(
+        0.0,
+        float(maximum_frequency_lpmm),
+        int(frequency_sample_count),
+        device=psf_kernel.device,
+        dtype=psf_kernel.dtype,
+    )
+    if int(targets.numel()) < 2:
+        raise ValueError("frequency_sample_count must be at least two")
+    if int(angular_sample_count) < 8:
+        raise ValueError("angular_sample_count must be at least eight")
+    angles = torch.arange(
+        int(angular_sample_count), device=psf_kernel.device, dtype=psf_kernel.dtype
+    ) * (2.0 * math.pi / int(angular_sample_count))
+    radial_profiles: list[torch.Tensor] = []
+    for case_index in range(int(psf_kernel.shape[0])):
+        pitch = float(pixel_pitch_mm[case_index].detach().cpu())
+        nyquist = 0.5 / pitch
+        if float(maximum_frequency_lpmm) > nyquist + 1.0e-12:
+            raise ValueError(
+                "CSF-MTF maximum frequency exceeds the PSF sampling Nyquist limit"
+            )
+        # Sample the 2-D MTF on concentric circles with bilinear interpolation.
+        # This avoids empty hard radial bins while keeping the complete loss in
+        # Torch/autograd. fftshift DC lies at (w//2, h//2), including even sizes.
+        frequency_x = targets[:, None] * torch.cos(angles)[None, :]
+        frequency_y = targets[:, None] * torch.sin(angles)[None, :]
+        index_x = frequency_x * (w * pitch) + float(w // 2)
+        index_y = frequency_y * (h * pitch) + float(h // 2)
+        grid_x = 2.0 * index_x / float(w - 1) - 1.0
+        grid_y = 2.0 * index_y / float(h - 1) - 1.0
+        grid = torch.stack((grid_x, grid_y), dim=-1).unsqueeze(0)
+        samples = F.grid_sample(
+            mtf[case_index][None, None],
+            grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
+        )[0, 0]
+        radial_profiles.append(samples.mean(dim=-1))
+    radial = torch.stack(radial_profiles, dim=0)
+    frequency_cpd = targets * 0.291
+    csf = (
+        2.6
+        * (0.0192 + 0.114 * frequency_cpd)
+        * torch.exp(-torch.pow(0.114 * frequency_cpd, 1.1))
+    )
+    csf = csf / csf.sum()
+    loss = 1.0 - (radial * csf.unsqueeze(0)).sum(dim=-1)
+    if not bool(torch.isfinite(loss).all()) or bool((loss < -1.0e-12).any()):
+        raise ValueError("CSF-weighted MTF loss is invalid")
+    return loss.clamp_min(0.0)
+
+
+def laplacian_regularizer(
+    module: FixedWeightNURBSPerturbation,
+) -> torch.Tensor:
+    """Return the normalized-control second-difference penalty."""
+    q = module.inner_q
+    if q.ndim != 2 or min(int(q.shape[0]), int(q.shape[1])) < 3:
+        raise ValueError("NURBS inner control grid is too small for a Laplacian penalty")
+    lap_y = q[2:, :] - 2.0 * q[1:-1, :] + q[:-2, :]
+    lap_x = q[:, 2:] - 2.0 * q[:, 1:-1] + q[:, :-2]
+    value = lap_y.square().mean() + lap_x.square().mean()
+    if not bool(torch.isfinite(value)):
+        raise ValueError("NURBS Laplacian regularizer is non-finite")
+    return value
+
+
 def _edge_fraction_batch(psf: torch.Tensor, edge_px: int = 5) -> torch.Tensor:
     normalized = _normalize_psf_batch(psf)
     edge = min(int(edge_px), int(normalized.shape[-2]) // 2, int(normalized.shape[-1]) // 2)
@@ -774,8 +916,13 @@ class MinimalOpticalModel:
         sag = self._pal_sag + self.perturbation.delta_raw(xx, yy)
         maps = torch_averfang_maps(sag, self._pal_power_config)
         result: dict[str, torch.Tensor] = {}
-        for zone in ("astig_left", "astig_right"):
-            mask = self._pal_zones["peripheral_" + zone] & maps["valid"]
+        zone_masks = {
+            "astig_left": "peripheral_astig_left",
+            "astig_right": "peripheral_astig_right",
+            "near": "near",
+        }
+        for zone, mask_name in zone_masks.items():
+            mask = self._pal_zones[mask_name] & maps["valid"]
             if not bool(mask.any()):
                 raise ValueError(f"M/A mask has no valid samples for {zone}")
             value = maps["A_D"][mask].mean()
@@ -987,6 +1134,11 @@ class MinimalOpticalModel:
         if system.physical_fft_pixel_pitch_mm is None:
             raise RuntimeError("missing physical FFT pixel pitch")
         psf = _normalize_psf(fft.psf)
+        zernike_coefficients = fit_low_order_opd_zernike_torch(
+            trace.reference_opl_mm,
+            trace.valid,
+            sample_count=self.sample_count,
+        )
         pitch = float(system.physical_fft_pixel_pitch_mm)
         return FieldResult(
             # ``kernel`` is retained as the historical field name, but now
@@ -998,6 +1150,8 @@ class MinimalOpticalModel:
             valid_mask=trace.valid,
             raw_psf=psf,
             raw_pixel_pitch_mm=pitch,
+            zernike_coefficients_mm=zernike_coefficients,
+            z4_defocus_mm2=zernike_coefficients[..., 4].square(),
         )
 
     def field_batch(self, cases: Sequence[Mapping[str, Any]]) -> BatchFieldResult:
@@ -1029,12 +1183,19 @@ class MinimalOpticalModel:
             device=fft.psf.device, dtype=fft.psf.dtype,
         )
         kernels = _normalize_psf_batch(fft.psf)
+        zernike_coefficients = fit_low_order_opd_zernike_torch(
+            trace.reference_opl_mm,
+            trace.valid,
+            sample_count=self.sample_count,
+        )
         return BatchFieldResult(
             kernels=kernels,
             valid_fraction=trace.valid.to(kernels.dtype).mean(dim=1),
             pixel_pitch_mm=physical_pitch,
             edge_fraction=_edge_fraction_batch(kernels),
             valid_mask=trace.valid,
+            zernike_coefficients_mm=zernike_coefficients,
+            z4_defocus_mm2=zernike_coefficients[..., 4].square(),
         )
 
     def raw_psf_batch(self, cases: Sequence[Mapping[str, Any]]) -> RawPSFBatchResult:
@@ -1145,7 +1306,13 @@ def load_pal(config: MinimalConfig, device: torch.device) -> tuple[torch.Tensor,
     return sag, power_config, zones
 
 
-def prescription_metrics(sag: torch.Tensor, power_config: PALPowerConfig, zones: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+def prescription_metrics(
+    sag: torch.Tensor,
+    power_config: PALPowerConfig,
+    zones: Mapping[str, torch.Tensor],
+    *,
+    baseline_sag: torch.Tensor | None = None,
+) -> dict[str, torch.Tensor]:
     maps = torch_averfang_maps(sag, power_config)
     valid = maps["valid"]
     far = zones["far_reference"] & valid
@@ -1155,16 +1322,54 @@ def prescription_metrics(sag: torch.Tensor, power_config: PALPowerConfig, zones:
         raise ValueError("P_far/ADD masks have no valid power samples")
     pfar = maps["power_D"][far].mean()
     add = maps["power_D"][near].mean() - pfar
-    return {"P_far_D": pfar, "ADD_D": add, "astig_mean_D": maps["astigmatism_D"][monitored].mean()}
+    guard = zones.get("lower_edge_guard")
+    if guard is None:
+        raise ValueError("zones.json must define lower_edge_guard")
+    guard_mask = guard & valid
+    if not bool(guard_mask.any()):
+        raise ValueError("lower_edge_guard has no valid power samples")
+    if baseline_sag is None:
+        guard_power_change = torch.zeros((), device=sag.device, dtype=sag.dtype)
+        guard_astig_change = torch.zeros((), device=sag.device, dtype=sag.dtype)
+    else:
+        baseline_maps = torch_averfang_maps(baseline_sag, power_config)
+        common_guard = guard_mask & baseline_maps["valid"]
+        if not bool(common_guard.any()):
+            raise ValueError("lower_edge_guard has no common baseline/candidate samples")
+        guard_power_change = (
+            maps["power_D"][common_guard] - baseline_maps["power_D"][common_guard]
+        ).abs().max()
+        guard_astig_change = (
+            maps["astigmatism_D"][common_guard]
+            - baseline_maps["astigmatism_D"][common_guard]
+        ).abs().max()
+    return {
+        "P_far_D": pfar,
+        "ADD_D": add,
+        "astig_mean_D": maps["astigmatism_D"][monitored].mean(),
+        "lower_edge_max_abs_power_change_D": guard_power_change,
+        "lower_edge_max_abs_astig_change_D": guard_astig_change,
+    }
 
 
 def build_joint_training_cases(
     traced_candidates: Sequence[Mapping[str, Any]], config: MinimalConfig,
     *, corridor_y_min_mm: float, corridor_y_max_mm: float,
+    zones_payload: Mapping[str, Any],
     group_counts: Mapping[str, int] = TRAINING_GROUP_COUNTS,
     peripheral_band_counts: Mapping[str, int] = PERIPHERAL_BAND_COUNTS,
 ) -> list[dict[str, Any]]:
-    """Build the fixed 80-case contract from traced dense-field candidates."""
+    """Build the fixed 109-case contract from traced dense-field candidates."""
+    maps = dict(zones_payload.get("maps", {}))
+    if "power_D" not in maps:
+        raise ValueError("zones.json must store the Original PAL power_D map")
+    power_map = np.asarray(maps["power_D"], dtype=np.float64)
+    far_reference = np.asarray(
+        dict(zones_payload["masks"])["far_reference"], dtype=bool
+    )
+    if power_map.shape != far_reference.shape or not bool(far_reference.any()):
+        raise ValueError("zones Original PAL power map/far reference is malformed")
+    pfar = float(np.mean(power_map[far_reference]))
     return select_training_cases(
         traced_candidates,
         far_object_distance_mm=config.far_object_distance_mm,
@@ -1172,6 +1377,9 @@ def build_joint_training_cases(
         near_object_distance_mm=config.near_object_distance_mm,
         corridor_y_min_mm=corridor_y_min_mm,
         corridor_y_max_mm=corridor_y_max_mm,
+        power_map=power_map,
+        pfar=pfar,
+        zones_payload=zones_payload,
         group_counts=group_counts,
         peripheral_band_counts=peripheral_band_counts,
     )
@@ -1189,10 +1397,17 @@ def _trace_preoptimization_case_geometry(
     for case in cases:
         fx = float(case["field_x_deg"])
         fy = float(case["field_y_deg"])
-        reference_x, reference_y = model.reference_rear_intersection(
-            reference_distance_mm, fx, fy
-        )
-        case_x, case_y = model.reference_rear_intersection(float(case["distance_mm"]), fx, fy)
+        if str(case["training_group"]) in PERIPHERAL_GROUPS:
+            reference_x = float(case["reference_lens_x_mm"])
+            reference_y = float(case["reference_lens_physical_y_mm"])
+            case_x, case_y = reference_x, reference_y
+        else:
+            reference_x, reference_y = model.reference_rear_intersection(
+                reference_distance_mm, fx, fy
+            )
+            case_x, case_y = model.reference_rear_intersection(
+                float(case["distance_mm"]), fx, fy
+            )
         result.append(
             {
                 **dict(case),
@@ -1225,9 +1440,25 @@ def _prepare_case_layout(
     if not isinstance(corridor_range, list) or len(corridor_range) != 2:
         raise ValueError("zones.json must declare corridor physical_y_range_mm")
     candidate_fields = generate_dense_candidate_fields(
+        field_x_min_deg=(
+            None if config.candidate_field_min_deg is not None
+            else config.candidate_field_x_min_deg
+        ),
+        field_x_max_deg=(
+            None if config.candidate_field_max_deg is not None
+            else config.candidate_field_x_max_deg
+        ),
+        field_y_min_deg=(
+            None if config.candidate_field_min_deg is not None
+            else config.candidate_field_y_min_deg
+        ),
+        field_y_max_deg=(
+            None if config.candidate_field_max_deg is not None
+            else config.candidate_field_y_max_deg
+        ),
+        field_step_deg=config.candidate_field_step_deg,
         field_min_deg=config.candidate_field_min_deg,
         field_max_deg=config.candidate_field_max_deg,
-        field_step_deg=config.candidate_field_step_deg,
     )
     candidate_progress_path = output / "candidate_trace_progress.json"
     if config.candidate_trace_import is not None and not candidate_progress_path.exists():
@@ -1266,11 +1497,13 @@ def _prepare_case_layout(
         traced_candidates, config,
         corridor_y_min_mm=float(corridor_range[0]),
         corridor_y_max_mm=float(corridor_range[1]),
+        zones_payload=zones_payload,
         group_counts=FORWARD_POOL_GROUP_COUNTS,
         peripheral_band_counts=FORWARD_POOL_PERIPHERAL_BAND_COUNTS,
     )
     pool_identity = _canonical_json_sha256([
         {
+            "case_id": str(case["case_id"]),
             "candidate_id": str(case["candidate_id"]),
             "distance_mm": float(case["distance_mm"]),
             "field_x_deg": float(case["field_x_deg"]),
@@ -1294,7 +1527,7 @@ def _prepare_case_layout(
         if not isinstance(rows, list):
             raise ValueError("forward qualification progress rows are malformed")
         pool_attempts = [dict(row) for row in rows]
-    attempted = {str(row["candidate_id"]): row for row in pool_attempts}
+    attempted = {str(row["pool_case_id"]): row for row in pool_attempts}
     traced_by_id = {str(row["candidate_id"]): row for row in traced_candidates}
 
     def save_qualification_progress(status: str) -> None:
@@ -1311,39 +1544,53 @@ def _prepare_case_layout(
 
     for pool_index, case in enumerate(qualification_pool, 1):
         candidate_id = str(case["candidate_id"])
-        prior = attempted.get(candidate_id)
+        pool_case_id = str(case["case_id"])
+        group = str(case["training_group"])
+        prior = attempted.get(pool_case_id)
         if prior is None:
-            diagnostic_stream = io.StringIO()
-            try:
-                with contextlib.redirect_stdout(diagnostic_stream), contextlib.redirect_stderr(diagnostic_stream):
-                    aiming_audit = model.validate_training_case_wfno(case)
+            if group in PERIPHERAL_GROUPS:
                 prior = {
                     "candidate_id": candidate_id,
                     "pool_case_id": str(case["case_id"]),
-                    "training_group": str(case["training_group"]),
+                    "training_group": group,
                     "distance_mm": float(case["distance_mm"]),
                     "field_x_deg": float(case["field_x_deg"]),
                     "field_y_deg": float(case["field_y_deg"]),
-                    "status": "ok",
-                    **dict(aiming_audit),
+                    "status": "surface_only",
+                    "qualification_mode": "no_ray_trace_surface_astigmatism",
                 }
-            except Exception as exc:
-                diagnostic = diagnostic_stream.getvalue()
-                prior = {
-                    "candidate_id": candidate_id,
-                    "pool_case_id": str(case["case_id"]),
-                    "training_group": str(case["training_group"]),
-                    "distance_mm": float(case["distance_mm"]),
-                    "field_x_deg": float(case["field_x_deg"]),
-                    "field_y_deg": float(case["field_y_deg"]),
-                    "status": "failed",
-                    "error_type": type(exc).__name__,
-                    "error": str(exc),
-                    "diagnostic_sha256": hashlib.sha256(diagnostic.encode("utf-8")).hexdigest(),
-                    "diagnostic_tail": diagnostic[-4000:],
-                }
+            else:
+                diagnostic_stream = io.StringIO()
+                try:
+                    with contextlib.redirect_stdout(diagnostic_stream), contextlib.redirect_stderr(diagnostic_stream):
+                        aiming_audit = model.validate_training_case_wfno(case)
+                    prior = {
+                        "candidate_id": candidate_id,
+                        "pool_case_id": str(case["case_id"]),
+                        "training_group": group,
+                        "distance_mm": float(case["distance_mm"]),
+                        "field_x_deg": float(case["field_x_deg"]),
+                        "field_y_deg": float(case["field_y_deg"]),
+                        "status": "ok",
+                        **dict(aiming_audit),
+                    }
+                except Exception as exc:
+                    diagnostic = diagnostic_stream.getvalue()
+                    prior = {
+                        "candidate_id": candidate_id,
+                        "pool_case_id": str(case["case_id"]),
+                        "training_group": group,
+                        "distance_mm": float(case["distance_mm"]),
+                        "field_x_deg": float(case["field_x_deg"]),
+                        "field_y_deg": float(case["field_y_deg"]),
+                        "status": "failed",
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                        "diagnostic_sha256": hashlib.sha256(diagnostic.encode("utf-8")).hexdigest(),
+                        "diagnostic_tail": diagnostic[-4000:],
+                    }
             pool_attempts.append(prior)
-            attempted[candidate_id] = prior
+            attempted[pool_case_id] = prior
             save_qualification_progress("running")
             if pool_index % 20 == 0 or pool_index == len(qualification_pool):
                 print(
@@ -1353,11 +1600,12 @@ def _prepare_case_layout(
                 )
         source = traced_by_id[candidate_id]
         source["forward_wfno_status"] = str(prior["status"])
-        if prior["status"] == "ok":
-            case["forward_wfno_validation"] = {
-                name: prior[name]
-                for name in ("physical_fft_pixel_pitch_mm",)
-            }
+        if prior["status"] in {"ok", "surface_only"}:
+            case["forward_wfno_validation"] = (
+                {"physical_fft_pixel_pitch_mm": prior["physical_fft_pixel_pitch_mm"]}
+                if prior["status"] == "ok"
+                else {"qualification_mode": prior["qualification_mode"]}
+            )
         else:
             case["eligible"] = False
             source["forward_wfno_error_type"] = str(prior["error_type"])
@@ -1381,20 +1629,24 @@ def _prepare_case_layout(
         if not isinstance(rows, list):
             raise ValueError("final phase qualification progress rows are malformed")
         forward_attempts = [dict(row) for row in rows]
-        pool_by_id = {str(row["candidate_id"]): row for row in qualified_pool}
+        pool_by_id = {str(row["case_id"]): row for row in qualified_pool}
         for attempt in forward_attempts:
-            pool_case = pool_by_id.get(str(attempt["candidate_id"]))
+            pool_case = pool_by_id.get(str(attempt["case_id"]))
             if pool_case is None:
                 raise ValueError("final phase qualification progress references a foreign candidate")
-            if attempt["status"] == "ok":
-                pool_case["forward_training_status"] = "ok"
-                pool_case["forward_training_validation"] = {
-                    name: attempt[name]
-                    for name in (
-                        "ray_count", "valid_ray_count", "valid_fraction",
-                        "physical_fft_pixel_pitch_mm",
-                    )
-                }
+            if attempt["status"] in {"ok", "surface_only"}:
+                pool_case["forward_training_status"] = str(attempt["status"])
+                pool_case["forward_training_validation"] = (
+                    {
+                        name: attempt[name]
+                        for name in (
+                            "ray_count", "valid_ray_count", "valid_fraction",
+                            "physical_fft_pixel_pitch_mm",
+                        )
+                    }
+                    if attempt["status"] == "ok"
+                    else {"qualification_mode": attempt["qualification_mode"]}
+                )
             elif attempt["status"] == "failed":
                 pool_case["eligible"] = False
             else:
@@ -1421,6 +1673,7 @@ def _prepare_case_layout(
             qualified_pool, config,
             corridor_y_min_mm=float(corridor_range[0]),
             corridor_y_max_mm=float(corridor_range[1]),
+            zones_payload=zones_payload,
         )
         training_cases = _trace_preoptimization_case_geometry(
             model, training_cases, zones_json=config.zones_json,
@@ -1429,14 +1682,29 @@ def _prepare_case_layout(
         failed_ids: set[str] = set()
         for case in training_cases:
             candidate_id = str(case["candidate_id"])
+            case_id = str(case["case_id"])
             pool_case = next(
                 row for row in qualified_pool
-                if str(row.get("candidate_id")) == candidate_id
+                if str(row.get("case_id")) == case_id
             )
-            if pool_case.get("forward_training_status") == "ok":
+            if pool_case.get("forward_training_status") in {"ok", "surface_only"}:
                 case["forward_training_validation"] = dict(
                     pool_case["forward_training_validation"]
                 )
+                continue
+            if str(case["training_group"]) in PERIPHERAL_GROUPS:
+                audit = {"qualification_mode": "no_ray_trace_surface_astigmatism"}
+                pool_case["forward_training_status"] = "surface_only"
+                pool_case["forward_training_validation"] = dict(audit)
+                case["forward_training_validation"] = dict(audit)
+                forward_attempts.append({
+                    "validation_round": validation_round,
+                    "candidate_id": candidate_id,
+                    "case_id": case_id,
+                    "status": "surface_only",
+                    **audit,
+                })
+                save_phase_progress("running")
                 continue
             diagnostic_stream = io.StringIO()
             try:
@@ -1456,7 +1724,7 @@ def _prepare_case_layout(
             except Exception as exc:
                 diagnostic = diagnostic_stream.getvalue()
                 pool_case["eligible"] = False
-                failed_ids.add(candidate_id)
+                failed_ids.add(case_id)
                 forward_attempts.append({
                     "validation_round": validation_round,
                     "candidate_id": candidate_id,
@@ -1486,8 +1754,10 @@ def _prepare_case_layout(
         {
             "schema_version": 1,
             "contract": (
-                "fixed 260-case regional FPS pool + exact BIOT_vis field-dependent WFNO + "
-                "final regional FPS + complete pre-FFT phase trace"
+                f"fixed {sum(FORWARD_POOL_GROUP_COUNTS.values())}-case regional FPS pool + "
+                "exact BIOT_vis field-dependent WFNO for traced functional cases + "
+                "surface-only peripheral qualification + final regional FPS + "
+                "complete pre-FFT phase trace for 79 functional cases"
             ),
             "pool_group_counts": FORWARD_POOL_GROUP_COUNTS,
             "pool_peripheral_band_counts": FORWARD_POOL_PERIPHERAL_BAND_COUNTS,
@@ -1515,13 +1785,17 @@ def _prepare_case_layout(
         sampling_contract={
             "method": (
                 "dense field -> Original PAL rear trace -> mask/clearance -> "
-                "fixed 260-case region-wise lens-plane FPS pool -> exact aiming/WFNO qualification -> "
-                "final region-wise FPS -> complete pre-FFT phase qualification"
+                "fixed region-wise lens-plane FPS pool -> exact aiming/WFNO qualification for functional cases -> "
+                "final region-wise FPS -> 79-case complete pre-FFT phase qualification; peripheral is surface-only"
             ),
             "field_grid_deg": {
-                "min": config.candidate_field_min_deg,
-                "max": config.candidate_field_max_deg,
+                "x_min": config.candidate_field_x_min_deg,
+                "x_max": config.candidate_field_x_max_deg,
+                "y_min": config.candidate_field_y_min_deg,
+                "y_max": config.candidate_field_y_max_deg,
                 "step": config.candidate_field_step_deg,
+                "deprecated_square_min": config.candidate_field_min_deg,
+                "deprecated_square_max": config.candidate_field_max_deg,
             },
             "zone_boundary_safety_mm": {
                 "default": config.zone_boundary_safety_mm,
@@ -1535,16 +1809,17 @@ def _prepare_case_layout(
             },
             "peripheral_band_distance_mm": {
                 "upper": config.far_object_distance_mm,
-                "middle": config.intermediate_object_distance_mm,
-                "lower": config.near_object_distance_mm,
+                "middle": config.far_object_distance_mm,
+                "lower": config.far_object_distance_mm,
             },
             "group_counts": TRAINING_GROUP_COUNTS,
-            "corridor": "4 vertical layers x 3 FPS points; centre and both side boundaries",
-            "peripheral": "16 exact field-mirror pairs per side; upper/middle/lower = 5/5/6; upper preserves the outer-x anchor",
-            "peripheral_distance": "upper=far, middle=intermediate, lower=near; one distance per case",
+            "corridor": "upper/middle/lower ADD strata; five lens-plane FPS points per stratum",
+            "peripheral": "15 exact field-mirror pairs per side; upper/middle/lower = 4/5/6",
+            "peripheral_distance": "surface-only metric; all cases retain the far reference distance",
             "forward_qualification": (
-                "fixed 260-case spatial pool; exact BIOT_vis field-dependent WFNO on the pool; "
-                f"complete pre-FFT phase trace on final {TOTAL_TRAINING_CASES} cases"
+                f"fixed {sum(FORWARD_POOL_GROUP_COUNTS.values())}-case spatial pool; exact BIOT_vis "
+                "field-dependent WFNO for functional cases; complete pre-FFT phase trace on final "
+                "79 functional cases; 30 peripheral cases use no ray trace"
             ),
             "forward_pool_group_counts": FORWARD_POOL_GROUP_COUNTS,
             "forward_pool_peripheral_band_counts": FORWARD_POOL_PERIPHERAL_BAND_COUNTS,
@@ -1653,14 +1928,14 @@ def _summarize_training_baseline(
     required = set(FUNCTIONAL_GROUPS + PERIPHERAL_GROUPS)
     actual = {str(row.get("training_group")) for row in rows}
     if actual != required:
-        raise ValueError(f"baseline rows do not contain exactly the five groups: {sorted(actual)}")
+        raise ValueError(f"baseline rows do not contain exactly the ten groups: {sorted(actual)}")
     maximum_edge = max(float(row["edge_fraction"]) for row in rows)
     health: dict[str, Any] = {
         "minimum_valid_fraction_ratio": 1.0,
         "maximum_edge_fraction": maximum_edge,
         "objective_name": (
-            "J=0.85*J_functional(M2/M2_original)+"
-            "0.15*J_peripheral(A_D/A_D_original)"
+            "J=sum(group_weight*mean(normalized routed metric)); "
+            "far=CSF-MTF loss, corridor/near=Z4 OPD mm^2, peripheral=surface A_D"
         ),
     }
     for name in FUNCTIONAL_GROUPS + PERIPHERAL_GROUPS:
@@ -1714,6 +1989,16 @@ def _field_batch(model: Any, cases: Sequence[Mapping[str, Any]]) -> BatchFieldRe
         pixel_pitch_mm=pitch,
         edge_fraction=torch.stack([item.edge_fraction.to(kernels.dtype) for item in scalar]),
         valid_mask=None,
+        zernike_coefficients_mm=(
+            None
+            if any(item.zernike_coefficients_mm is None for item in scalar)
+            else torch.stack([item.zernike_coefficients_mm for item in scalar])
+        ),
+        z4_defocus_mm2=(
+            None
+            if any(item.z4_defocus_mm2 is None for item in scalar)
+            else torch.stack([item.z4_defocus_mm2 for item in scalar])
+        ),
     )
 
 
@@ -1722,6 +2007,10 @@ def _batch_rows(
     moments: torch.Tensor, loss_metrics: torch.Tensor,
     loss_metric_names: Sequence[str], baseline_valid: Mapping[str, float] | None,
     scores: torch.Tensor,
+    *,
+    z4_defocus_mm2: torch.Tensor,
+    csf_mtf_loss: torch.Tensor,
+    astig_A_D: torch.Tensor,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for index, case in enumerate(cases):
@@ -1730,9 +2019,9 @@ def _batch_rows(
         rows.append({
             **dict(case),
             "m2_mm2": float(moments[index].detach().cpu()),
-            "astig_A_D": float(loss_metrics[index].detach().cpu())
-            if loss_metric_names[index] == "astig_A_D"
-            else 0.0,
+            "astig_A_D": float(astig_A_D[index].detach().cpu()),
+            "z4_defocus_mm2": float(z4_defocus_mm2[index].detach().cpu()),
+            "csf_mtf_loss": float(csf_mtf_loss[index].detach().cpu()),
             "loss_metric": float(loss_metrics[index].detach().cpu()),
             "loss_metric_name": loss_metric_names[index],
             "score": float(scores[index].detach().cpu()),
@@ -1746,21 +2035,43 @@ def _batch_rows(
 def _loss_metrics_for_batch(
     model: MinimalOpticalModel,
     cases: Sequence[Mapping[str, Any]],
+    result: BatchFieldResult,
     moments: torch.Tensor,
-) -> tuple[torch.Tensor, list[str]]:
-    needs_astig = any(str(case["training_group"]) in PERIPHERAL_GROUPS for case in cases)
+) -> tuple[torch.Tensor, list[str], torch.Tensor, torch.Tensor, torch.Tensor]:
+    if result.z4_defocus_mm2 is None:
+        raise RuntimeError("traced batch is missing continuous-OPD Z4 coefficients")
+    z4_values = result.z4_defocus_mm2.reshape(-1)
+    if z4_values.shape != moments.shape:
+        raise ValueError("Z4 batch shape does not match traced cases")
+    csf_values = csf_weighted_mtf_loss_batch(
+        result.kernels, pixel_pitch_mm=result.pixel_pitch_mm
+    )
+    needs_astig = any(str(case["training_group"]) == "near_edge_astig" for case in cases)
     astig_by_zone = model.astig_A_by_zone() if needs_astig else {}
     metrics: list[torch.Tensor] = []
     names: list[str] = []
+    astig_values: list[torch.Tensor] = []
     for index, case in enumerate(cases):
         group = str(case["training_group"])
-        if group in PERIPHERAL_GROUPS:
-            metrics.append(astig_by_zone[GROUP_TO_ZONE[group]])
-            names.append("astig_A_D")
+        if group in {"far", "far_robustness"}:
+            metrics.append(csf_values[index])
+            names.append("csf_mtf_loss")
+            astig_values.append(torch.zeros_like(metrics[-1]))
+        elif group == "near_edge_astig":
+            metrics.append(z4_values[index])
+            names.append("z4_defocus_mm2_plus_astig_A_D")
+            astig_values.append(astig_by_zone["near"])
         else:
-            metrics.append(moments[index])
-            names.append("m2_mm2")
-    return torch.stack(metrics), names
+            metrics.append(z4_values[index])
+            names.append("z4_defocus_mm2")
+            astig_values.append(torch.zeros_like(metrics[-1]))
+    return (
+        torch.stack(metrics),
+        names,
+        torch.stack(astig_values),
+        z4_values,
+        csf_values,
+    )
 
 
 def _evaluate_original_training_baseline_with_resume(
@@ -1812,7 +2123,18 @@ def _evaluate_original_training_baseline_with_resume(
         training_rows = []
 
     batch_size = int(getattr(getattr(model, "config", None), "case_batch_size", 1))
-    if len(training_rows) % batch_size != 0 and len(training_rows) != len(training_cases):
+    traced_cases = [
+        case for case in training_cases
+        if str(case["training_group"]) not in PERIPHERAL_GROUPS
+    ]
+    peripheral_cases = [
+        case for case in training_cases
+        if str(case["training_group"]) in PERIPHERAL_GROUPS
+    ]
+    if (
+        len(training_rows) < len(traced_cases)
+        and len(training_rows) % batch_size != 0
+    ):
         raise ValueError("baseline progress ends inside a case batch and cannot be resumed")
 
     def save_progress(status: str) -> None:
@@ -1833,9 +2155,9 @@ def _evaluate_original_training_baseline_with_resume(
 
     if not path.is_file():
         save_progress("training")
-    remaining = training_cases[len(training_rows) :]
+    remaining = traced_cases[len(training_rows) :] if len(training_rows) < len(traced_cases) else []
     batches = _case_batches(remaining, batch_size)
-    total_batches = (len(training_cases) + batch_size - 1) // batch_size
+    total_batches = (len(traced_cases) + batch_size - 1) // batch_size
     first_batch = len(training_rows) // batch_size
     for batch_index, batch in enumerate(batches, start=first_batch + 1):
         with torch.no_grad():
@@ -1848,10 +2170,19 @@ def _evaluate_original_training_baseline_with_resume(
             moments = psf_second_moment_mm2_batch(
                 result.kernels, pixel_pitch_mm=result.pixel_pitch_mm,
             )
-            loss_metrics, loss_metric_names = _loss_metrics_for_batch(model, batch, moments)
+            (
+                loss_metrics,
+                loss_metric_names,
+                astig_values,
+                z4_values,
+                csf_values,
+            ) = _loss_metrics_for_batch(model, batch, result, moments)
             scores = torch.ones_like(loss_metrics)
         batch_rows = _batch_rows(
             batch, result, moments, loss_metrics, loss_metric_names, None, scores,
+            z4_defocus_mm2=z4_values,
+            csf_mtf_loss=csf_values,
+            astig_A_D=astig_values,
         )
         for row in batch_rows:
             row["group_loss"] = 1.0
@@ -1865,6 +2196,28 @@ def _evaluate_original_training_baseline_with_resume(
         result_device = result.kernels.device
         del result, energy, moments, loss_metrics, scores
         _release_inactive_case_cuda_cache(result_device)
+    if len(training_rows) >= len(traced_cases) and len(training_rows) < len(training_cases):
+        completed_peripheral = len(training_rows) - len(traced_cases)
+        with torch.no_grad():
+            astig_by_zone = model.astig_A_by_zone()
+        for case in peripheral_cases[completed_peripheral:]:
+            group = str(case["training_group"])
+            value = astig_by_zone[GROUP_TO_ZONE[group]]
+            training_rows.append({
+                **dict(case),
+                "m2_mm2": 0.0,
+                "astig_A_D": float(value.detach().cpu()),
+                "z4_defocus_mm2": 0.0,
+                "csf_mtf_loss": 0.0,
+                "loss_metric": float(value.detach().cpu()),
+                "loss_metric_name": "astig_A_D",
+                "score": 1.0,
+                "valid_fraction": 1.0,
+                "valid_fraction_ratio": 1.0,
+                "edge_fraction": 0.0,
+                "group_loss": 1.0,
+            })
+        save_progress("complete")
     save_progress("complete")
     baseline_value, baseline_health = _summarize_training_baseline(training_rows)
     return baseline_value, training_rows, baseline_health
@@ -1873,14 +2226,16 @@ def _evaluate_original_training_baseline_with_resume(
 def _evaluate(
     model: MinimalOpticalModel, cases: Sequence[Mapping[str, Any]], baseline: Mapping[str, Mapping[str, float]] | None,
     *, with_grad: bool, baseline_valid: Mapping[str, float] | None = None,
-    functional_weight: float = 0.85, peripheral_weight: float = 0.15,
+    group_weights: Mapping[str, float] = DEFAULT_GROUP_WEIGHTS,
+    near_edge_astig_A_weight: float = 0.10,
     progress_stage: str | None = None,
     progress_step: str | None = None,
     progress_learning_rate: float | None = None,
     progress_update: str = "PENDING",
     print_progress: bool = True,
 ) -> tuple[float, list[dict[str, Any]], dict[str, float]]:
-    rows, group_values = [], {}
+    rows: list[dict[str, Any]] = []
+    group_values: dict[str, list[float]] = {}
     if not cases:
         raise ValueError("cannot evaluate an empty case set")
     if any("training_group" not in case for case in cases):
@@ -1893,13 +2248,25 @@ def _evaluate(
     actual = set(group_counts)
     if actual != required or any(group_counts[name] <= 0 for name in required):
         raise ValueError(
-            "grouped training schema must contain exactly the five groups "
+            "grouped training schema must contain exactly the ten groups "
             f"{sorted(required)}, got {sorted(actual)}"
         )
+    weights = {str(name): float(value) for name, value in group_weights.items()}
+    if set(weights) != required or not math.isclose(
+        sum(weights.values()), 1.0, rel_tol=0.0, abs_tol=1.0e-12
+    ):
+        raise ValueError("group_weights must define the ten groups and sum to 1")
     minimum_ratio, maximum_edge = math.inf, 0.0
     batch_size = int(getattr(getattr(model, "config", None), "case_batch_size", 1))
-    batches = _case_batches(cases, batch_size)
-    peripheral_count = sum(group_counts[name] for name in PERIPHERAL_GROUPS)
+    traced_cases = [
+        case for case in cases
+        if str(case["training_group"]) not in PERIPHERAL_GROUPS
+    ]
+    peripheral_cases = [
+        case for case in cases
+        if str(case["training_group"]) in PERIPHERAL_GROUPS
+    ]
+    batches = _case_batches(traced_cases, batch_size)
     for batch_index, batch in enumerate(batches, start=1):
         with torch.set_grad_enabled(with_grad):
             result = _field_batch(model, batch)
@@ -1909,26 +2276,44 @@ def _evaluate(
             if bool((energy - 1.0).abs().max() > 1e-10):
                 raise ValueError("evaluation batch contains a non-unit PSF energy")
             moments = psf_second_moment_mm2_batch(result.kernels, pixel_pitch_mm=result.pixel_pitch_mm)
-            loss_metrics, loss_metric_names = _loss_metrics_for_batch(model, batch, moments)
+            (
+                loss_metrics,
+                loss_metric_names,
+                astig_values,
+                z4_values,
+                csf_values,
+            ) = _loss_metrics_for_batch(model, batch, result, moments)
             if baseline is None:
                 scores = torch.ones_like(loss_metrics)
             else:
-                denominators = []
-                for case in batch:
+                score_values: list[torch.Tensor] = []
+                for index, case in enumerate(batch):
+                    group = str(case["training_group"])
                     denominator = float(baseline[str(case["case_id"])]["loss_metric"])
                     if not math.isfinite(denominator) or denominator <= 0.0:
                         raise ValueError(
                             f"invalid Original PAL loss denominator for {case['case_id']}: {denominator}"
                         )
-                    denominators.append(denominator)
-                scores = loss_metrics / torch.as_tensor(
-                    denominators, device=loss_metrics.device, dtype=loss_metrics.dtype,
-                )
+                    primary = loss_metrics[index] / denominator
+                    if group == "near_edge_astig":
+                        astig_denominator = float(
+                            baseline[str(case["case_id"])]["astig_A_D"]
+                        )
+                        if not math.isfinite(astig_denominator) or astig_denominator <= 0.0:
+                            raise ValueError(
+                                f"invalid Original PAL astig denominator for {case['case_id']}"
+                            )
+                        blend = float(near_edge_astig_A_weight)
+                        primary = (
+                            (1.0 - blend) * primary
+                            + blend * astig_values[index] / astig_denominator
+                        )
+                    score_values.append(primary)
+                scores = torch.stack(score_values)
             coefficients = torch.as_tensor(
                 [
-                    functional_weight / (3.0 * group_counts[str(case["training_group"])])
-                    if str(case["training_group"]) in FUNCTIONAL_GROUPS
-                    else peripheral_weight / peripheral_count
+                    weights[str(case["training_group"])]
+                    / group_counts[str(case["training_group"])]
                     for case in batch
                 ], device=scores.device, dtype=scores.dtype,
             )
@@ -1955,15 +2340,18 @@ def _evaluate(
                 loss_metric_names,
                 baseline_valid,
                 scores,
+                z4_defocus_mm2=z4_values,
+                csf_mtf_loss=csf_values,
+                astig_A_D=astig_values,
             )
         )
-        completed = min(batch_index * batch_size, len(cases))
+        completed = min(batch_index * batch_size, len(traced_cases))
         if print_progress and (batch_index % 8 == 0 or batch_index == len(batches)):
             batch_loss_value = float(batch_loss.detach().cpu())
             if progress_stage is None:
                 print(
                     f"[pal-eval] batch={batch_index}/{len(batches)} "
-                    f"cases={completed - len(batch) + 1}-{completed}/{len(cases)} "
+                    f"cases={completed - len(batch) + 1}-{completed}/{len(traced_cases)} "
                     f"loss={batch_loss_value:.6g}", flush=True,
                 )
             else:
@@ -1972,13 +2360,51 @@ def _evaluate(
                 print(
                     f"[pal-train] stage={progress_stage} step={step_text} "
                     f"batch={batch_index}/{len(batches)} "
-                    f"cases={completed - len(batch) + 1}-{completed}/{len(cases)} "
+                    f"cases={completed - len(batch) + 1}-{completed}/{len(traced_cases)} "
                     f"loss={batch_loss_value:.6g} update={progress_update} lr={lr_text}",
                     flush=True,
                 )
         result_device = result.kernels.device
         del result, energy, moments, loss_metrics, scores, coefficients, batch_loss
         _release_inactive_case_cuda_cache(result_device)
+    with torch.set_grad_enabled(with_grad):
+        astig_by_zone = model.astig_A_by_zone()
+        peripheral_loss: torch.Tensor | None = None
+        for case in peripheral_cases:
+            group = str(case["training_group"])
+            raw = astig_by_zone[GROUP_TO_ZONE[group]]
+            if baseline is None:
+                score = torch.ones_like(raw)
+            else:
+                denominator = float(baseline[str(case["case_id"])]["loss_metric"])
+                if not math.isfinite(denominator) or denominator <= 0.0:
+                    raise ValueError(
+                        f"invalid Original PAL loss denominator for {case['case_id']}: {denominator}"
+                    )
+                score = raw / denominator
+            weighted = score * (weights[group] / group_counts[group])
+            peripheral_loss = weighted if peripheral_loss is None else peripheral_loss + weighted
+            value = float(score.detach().cpu())
+            group_values.setdefault(group, []).append(value)
+            rows.append({
+                **dict(case),
+                "m2_mm2": 0.0,
+                "astig_A_D": float(raw.detach().cpu()),
+                "z4_defocus_mm2": 0.0,
+                "csf_mtf_loss": 0.0,
+                "loss_metric": float(raw.detach().cpu()),
+                "loss_metric_name": "astig_A_D",
+                "score": value,
+                "valid_fraction": 1.0,
+                "valid_fraction_ratio": 1.0,
+                "edge_fraction": 0.0,
+            })
+        if with_grad:
+            if peripheral_loss is None or not peripheral_loss.requires_grad:
+                raise RuntimeError(
+                    "surface-only peripheral loss is detached from NURBS parameters"
+                )
+            peripheral_loss.backward()
     group_losses = {
         name: sum(group_values[name]) / len(group_values[name])
         for name in FUNCTIONAL_GROUPS + PERIPHERAL_GROUPS
@@ -1986,18 +2412,30 @@ def _evaluate(
     for row in rows:
         row["group_loss"] = float(group_losses[row["training_group"]])
     group_summary = {f"J_{name}": float(value) for name, value in group_losses.items()}
-    group_summary["J_mid"] = group_summary["J_intermediate"]
-    functional = sum(group_losses[name] for name in FUNCTIONAL_GROUPS) / 3.0
-    peripheral = sum(sum(group_values[name]) for name in PERIPHERAL_GROUPS) / peripheral_count
-    objective_value = functional_weight * functional + peripheral_weight * peripheral
+    group_summary["J_mid"] = sum(
+        group_losses[name]
+        for name in ("corridor_upper", "corridor_middle", "corridor_lower")
+    ) / 3.0
+    functional_weight = sum(weights[name] for name in FUNCTIONAL_GROUPS)
+    peripheral_weight = sum(weights[name] for name in PERIPHERAL_GROUPS)
+    functional = sum(
+        weights[name] * group_losses[name] for name in FUNCTIONAL_GROUPS
+    ) / functional_weight
+    peripheral = sum(
+        weights[name] * group_losses[name] for name in PERIPHERAL_GROUPS
+    ) / peripheral_weight
+    objective_value = sum(
+        weights[name] * group_losses[name]
+        for name in FUNCTIONAL_GROUPS + PERIPHERAL_GROUPS
+    )
     group_summary.update({
         "J_functional": float(functional),
         "J_peripheral": float(peripheral),
         "J_total": float(objective_value),
     })
     objective_name = (
-        "J=0.85*J_functional(M2/M2_original)+"
-        "0.15*J_peripheral(A_D/A_D_original)"
+        "J=sum(group_weight*mean(normalized routed metric)); "
+        "far=CSF-MTF loss, corridor/near=Z4 OPD mm^2, peripheral=surface A_D"
     )
     return float(objective_value), rows, {
         "minimum_valid_fraction_ratio": minimum_ratio,
@@ -2036,12 +2474,13 @@ def _accumulate_startup_case_gradients(
     if not cases:
         raise ValueError("startup gradient check requires at least one case")
     if not callable(getattr(model, "field_batch", None)):
-        # Test doubles from the legacy unit suite do not model the production
-        # batch interface. Keep their historical event contract isolated here.
-        pixel_pitch_mm = model.size_reference_mm[config.intermediate_object_distance_mm] / config.kernel_size_px
+        # This branch exists only for explicit scalar test doubles.  It still
+        # requires the routed Z4 metric and never substitutes M2.
         for case in cases:
             result = model.field(case)
-            case_loss = psf_second_moment_mm2(result.kernel, pixel_pitch_mm=pixel_pitch_mm)
+            if result.z4_defocus_mm2 is None:
+                raise RuntimeError("startup scalar field is missing continuous-OPD Z4")
+            case_loss = result.z4_defocus_mm2
             case_loss.backward()
             result_device = result.kernel.device
             del case_loss, result
@@ -2051,12 +2490,11 @@ def _accumulate_startup_case_gradients(
             raise RuntimeError("startup gradient check failed: fewer than two finite non-zero zp gradients")
         return grad.detach().clone()
     result = _field_batch(model, cases)
-    moments = psf_second_moment_mm2_batch(
-        result.kernels, pixel_pitch_mm=result.pixel_pitch_mm,
-    )
-    moments.sum().backward()
+    if result.z4_defocus_mm2 is None:
+        raise RuntimeError("startup batch is missing continuous-OPD Z4")
+    result.z4_defocus_mm2.sum().backward()
     result_device = result.kernels.device
-    del result, moments
+    del result
     _release_inactive_case_cuda_cache(result_device)
     grad = module.inner_q.grad
     if grad is None or not bool(torch.isfinite(grad).all()) or int((grad.abs() > 0).sum()) < 2:
@@ -2343,8 +2781,8 @@ def _run_bound(
         config, output, model, identity_sha256=identity_sha256,
     )
     objective_options = {
-        "functional_weight": config.functional_objective_weight,
-        "peripheral_weight": config.peripheral_objective_weight,
+        "group_weights": config.group_weights,
+        "near_edge_astig_A_weight": config.near_edge_astig_A_weight,
     }
 
     baseline_state_path = output / "baseline_state.pt"
@@ -2568,7 +3006,7 @@ def _run_bound(
                 # The 7x7 module is verified above to be the exact zero-residual
                 # Original PAL state. Every case denominator is that same physical
                 # baseline, so all group objectives and J are exactly 1 without an
-                # additional 80-case PSF pass.
+                # additional 109-case evaluation pass.
                 current = float(baseline_value)
                 health = dict(baseline_health)
                 if abs(current - 1.0) > 1.0e-15 or any(
@@ -2701,6 +3139,11 @@ def _run_bound(
                     progress_step=f"{step}/{maximum_steps}",
                     progress_learning_rate=lr,
                 )
+                smooth_loss_value = 0.0
+                if control_count == 19 and config.smooth_lambda > 0.0:
+                    smooth_loss = laplacian_regularizer(module)
+                    (float(config.smooth_lambda) * smooth_loss).backward()
+                    smooth_loss_value = float(smooth_loss.detach().cpu())
                 if module.inner_q.grad is None or not bool(torch.isfinite(module.inner_q.grad).all()):
                     raise RuntimeError("non-finite Adam gradient")
                 parameter_state = module.inner_q.detach().clone()
@@ -2739,7 +3182,10 @@ def _run_bound(
                     )
                     yy, xx = torch.meshgrid(coord, coord, indexing="ij")
                     power = prescription_metrics(
-                        base_sag + module.delta_raw(xx, yy), power_config, zones
+                        base_sag + module.delta_raw(xx, yy),
+                        power_config,
+                        zones,
+                        baseline_sag=base_sag,
                     )
                     far_change = abs(
                         float(power["P_far_D"].detach().cpu())
@@ -2749,7 +3195,18 @@ def _run_bound(
                         float(power["ADD_D"].detach().cpu())
                         - float(baseline_power["ADD_D"])
                     )
-                    if far_change > config.far_tolerance_D or add_change > config.add_tolerance_D:
+                    guard_power_change = float(
+                        power["lower_edge_max_abs_power_change_D"].detach().cpu()
+                    )
+                    guard_astig_change = float(
+                        power["lower_edge_max_abs_astig_change_D"].detach().cpu()
+                    )
+                    if (
+                        far_change > config.far_tolerance_D
+                        or add_change > config.add_tolerance_D
+                        or guard_power_change > config.lower_edge_power_tolerance_D
+                        or guard_astig_change > config.lower_edge_astig_tolerance_D
+                    ):
                         reason = "prescription"
                         continue
                     candidate, candidate_rows, candidate_health = _evaluate(
@@ -2765,13 +3222,28 @@ def _run_bound(
                         progress_update="TRIAL",
                         print_progress=False,
                     )
+                    candidate_smooth_loss = (
+                        float(laplacian_regularizer(module).detach().cpu())
+                        if control_count == 19 and config.smooth_lambda > 0.0
+                        else 0.0
+                    )
+                    current_total_loss = (
+                        current + float(config.smooth_lambda) * smooth_loss_value
+                    )
+                    candidate_total_loss = (
+                        candidate
+                        + float(config.smooth_lambda) * candidate_smooth_loss
+                    )
                     if (
                         candidate_health["minimum_valid_fraction_ratio"]
                         < config.minimum_valid_fraction_ratio
                     ):
                         reason = "health"
                         continue
-                    if not math.isfinite(candidate) or candidate > current:
+                    if (
+                        not math.isfinite(candidate_total_loss)
+                        or candidate_total_loss > current_total_loss
+                    ):
                         reason = "objective"
                         continue
                     accepted, reason, lr = (
@@ -2836,6 +3308,8 @@ def _run_bound(
                         "learning_rate": lr,
                         "minimum_valid_fraction_ratio": health["minimum_valid_fraction_ratio"],
                         "maximum_edge_fraction": health["maximum_edge_fraction"],
+                        "smooth_laplacian": smooth_loss_value,
+                        "smooth_weighted_loss": float(config.smooth_lambda) * smooth_loss_value,
                         "minimum_steps": minimum_steps,
                         "maximum_steps": maximum_steps,
                         "actual_steps": step,
@@ -3051,7 +3525,9 @@ def _run_bound(
     )
     yy, xx = torch.meshgrid(coord, coord, indexing="ij")
     delta = module.delta_raw(xx, yy)
-    final_power = prescription_metrics(base_sag + delta, power_config, zones)
+    final_power = prescription_metrics(
+        base_sag + delta, power_config, zones, baseline_sag=base_sag
+    )
     final_p_far_D = float(final_power["P_far_D"])
     final_add_D = float(final_power["ADD_D"])
     max_abs_sag_delta_mm = float(delta.abs().max())
@@ -3064,10 +3540,10 @@ def _run_bound(
     summary = {
         "identity_sha256": identity_sha256,
         "baseline_J": baseline_value,
-        "objective_name": (
-            "J=0.85*J_functional(M2/M2_original)+"
-            "0.15*J_peripheral(A_D/A_D_original)"
-        ),
+        "objective_name": final_health["objective_name"],
+        "group_weights": dict(config.group_weights),
+        "near_edge_astig_A_weight": config.near_edge_astig_A_weight,
+        "smooth_lambda": config.smooth_lambda,
         "training_case_count": len(training_cases),
         "training_groups": {
             name: sum(row["training_group"] == name for row in training_cases)
@@ -3093,6 +3569,12 @@ def _run_bound(
         "max_abs_sag_delta_mm": max_abs_sag_delta_mm,
         "P_far_change_D": final_p_far_D - float(baseline_power["P_far_D"]),
         "ADD_change_D": final_add_D - float(baseline_power["ADD_D"]),
+        "lower_edge_max_abs_power_change_D": float(
+            final_power["lower_edge_max_abs_power_change_D"]
+        ),
+        "lower_edge_max_abs_astig_change_D": float(
+            final_power["lower_edge_max_abs_astig_change_D"]
+        ),
         "runtime_seconds": runtime_seconds,
         "training_log": "training.log",
         "trace_psf_exception": False,

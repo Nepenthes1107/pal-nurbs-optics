@@ -54,20 +54,28 @@ python -m biot.gui
 - 控制网格为 `7x7 -> 11x11 -> 19x19`，通过精确 knot refinement 晋级。
 - `--steps S7 S11 S19` 中，7×7 和 11×11 恰好各运行 `S7`、`S11`
   个完整 attempt，19×19 至少运行 `S19` 个；拒绝的候选也消耗 attempt。
-  达到最低总预算 `S7+S11+S19` 后只在 19×19 继续训练。默认连续 7 个
-  attempt 未使 best 相对改善严格超过 `1e-4` 时 early stop，最多额外运行
-  50 个 attempt。最低 19×19 配额前只累计 patience，不允许 early stop。
-- 80 个真实 case：Far 18、Intermediate 12、Near 18、Peripheral-left/right 各 16。
-- 三个物距统一为 `D500=500 mm`、`D1000=1000 mm`、`Dinf=Infinity`；Infinity 使用真实无穷远条件。
-- 使用真实可微追迹、GRIN3 固定步长 RK4、连续 OPL、去 pupil tilt FFT PSF；离线 PSF 不参与反传。
+  达到最低总预算 `S7+S11+S19` 后只在 19×19 继续训练。默认 `S19=30`，
+  连续 7 个 attempt 未使 best 相对改善严格超过 `1e-3` 时 early stop，
+  最多额外运行 30 个 attempt。最低 19×19 配额前只累计 patience，不允许 early stop。
+- 109 个 case 分为 10 组：Far 20、Far-robustness 8、Corridor upper/middle/lower 各 5、
+  Near 20、Near-robustness 8、Near-edge-astig 8、Peripheral-left/right 各 15。
+- Far 使用真实 `Dinf`，robustness 使用 `D1000`，Near 使用 `D500`；
+  corridor 从 Original PAL 中心带局部 ADD 逐行计算 `distance_mm=1000/ADD_D`。
+- 使用真实可微追迹、GRIN3 固定步长 RK4、连续参考球 OPL 和 FFT PSF；
+  离线 PSF 不参与反传。Z4 复用 BIOT 的 OSA/ANSI RMS 基、全低阶最小二乘与
+  `(n,m)=(2,0)` 映射，执行层为 Torch QR，不从 PSF 逆变换相位。
 - 两个分支统一使用 `legacy_pupil_phase=False`、`phase_reference="biot_reference_sphere"` 和 `remove_tilt=False`；训练 loss、健康检查和梯度均直接基于原始 `512×512` 物理 FFT PSF 及其物理像素间距。`130×130` crop/render 仅用于评价数据库与拼接显示。
-- 默认 pupil 采样为 `np=256`、FFT 为 `512`；80 个 case 按 `case_batch_size=8` 做 GPU tensor 追迹和 FFT，每批聚合一次 loss 并 backward，不因 OOM 自动缩小 batch。
+- 默认 pupil 采样为 `np=256`、FFT 为 `512`；79 个功能 case 按
+  `case_batch_size=8` 做 GPU tensor 追迹和 FFT，30 个周边 case 直接使用面形 A_D，
+  不做光线追迹；不因 OOM 自动缩小 batch。
 - 训练输出统一包含 `stage`、`step`、`batch`、`loss`、`update` 和 `lr`；每个 run 的 `training.log` 持久化同样的进度摘要，中断时追加异常信息，各阶段仍保留结构化 `history.csv`。
 - 追迹失败保持失败关闭，由当前 run 的资格筛选进度记录错误；底层追迹不在项目根目录自动导出 `wrong_result` Excel。
-- `J=(0.85*J_functional+0.15*J_peripheral)`：功能区使用逐 case 的
-  `M2_mm²/Original PAL M2_mm²`，左右周边区使用各自区域平均
-  `A_D/Original PAL A_D`；Original PAL 分母固定。
-- 仅使用 trace/PSF health、`P_far`、`ADD` 和单步 sag trust region 约束。
+- `J=sum(group_weight*group_mean)`，10 组权重显式且和为 1。Far 路由到
+  Mannos-Sakrison CSF 加权 MTF loss，corridor/near 路由到 Z4²，near-edge 为
+  90% Z4² + 10% near 区 A_D，周边区为对应区平均 A_D；均用 Original PAL 归一化。
+- 19×19 阶段额外使用 `smooth_lambda=0.05` 的控制点归一化二阶差分正则。
+- 约束包括 trace/PSF health、`P_far`、`ADD`、下缘监管带相对 Original PAL 的
+  最大光焦度/像散变化和单步 sag trust region。
 - 不自动运行历史 192-case posthoc 或 SSIM 链；PSF 数据库、weighted MTF、PSF stitch 和 chart stitch 仅在正式评价入口中运行。
 
 ## 完成优化后的评价
@@ -104,16 +112,17 @@ python run_pal_nurbs.py `
   --output results/optimization/run_001 `
   --excel eye_image_glass_grad3.xlsx --device cuda `
   --requested-np 256 --fft-size-px 512 --case-batch-size 8 `
-  --steps 10 10 10 `
+  --steps 10 10 30 `
   --early-stopping-patience 7 `
-  --relative-improvement-threshold 1e-4 `
-  --max-extra-19-steps 50
+  --relative-improvement-threshold 1e-3 `
+  --max-extra-19-steps 30 `
+  --smooth-lambda 0.05
 ```
 
-该示例最低训练 30 个 attempt，最多训练 80 个 attempt。19×19 每个 attempt
+该示例最低训练 50 个 attempt，最多训练 80 个 attempt。19×19 每个 attempt
 完成后先原子保存 resume/history，再按 early stopping、学习率下限和额外预算
 顺序判断；最低预算前若学习率跌破下限，则 run 失败且不写成功 `summary.json`。
-最终结果始终加载 19×19 best state 并完成 80-case 无梯度复核后才标记 complete。
+最终结果始终加载 19×19 best state 并完成 109-case 无梯度复核后才标记 complete。
 
 普通 `--resume` 只允许恢复同一运行目录中 identity、配置、输入哈希、实现闭包、
 最低/最大预算、patience 计数和终止规则完全一致的 checkpoint。本次 early

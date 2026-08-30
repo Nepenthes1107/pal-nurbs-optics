@@ -16,12 +16,13 @@ from matplotlib.lines import Line2D
 
 
 PARTITION_ORDER = (
-    "far", "corridor", "near",
+    "far", "corridor", "corridor_flank", "near",
     "peripheral_astig_left", "peripheral_astig_right",
 )
 ZONE_COLORS = {
     "far": "#4c78a8",
     "corridor": "#b279a2",
+    "corridor_flank": "#d4a6c8",
     "near": "#59a14f",
     "peripheral_astig_left": "#e15759",
     "peripheral_astig_right": "#f28e2b",
@@ -29,14 +30,20 @@ ZONE_COLORS = {
 ZONE_LABELS = {
     "far": "Far",
     "corridor": "Intermediate corridor",
+    "corridor_flank": "Corridor flank",
     "near": "Near",
     "peripheral_astig_left": "Peripheral-left",
     "peripheral_astig_right": "Peripheral-right",
 }
 GROUP_STYLES = {
     "far": ("#174a7e", "o", "Far"),
-    "intermediate": ("#6f3b74", "s", "Intermediate"),
+    "far_robustness": ("#5b8db8", "o", "Far robustness"),
+    "corridor_upper": ("#9467bd", "s", "Corridor upper"),
+    "corridor_middle": ("#6f3b74", "s", "Corridor middle"),
+    "corridor_lower": ("#b279a2", "s", "Corridor lower"),
     "near": ("#27632a", "^", "Near"),
+    "near_robustness": ("#59a14f", "^", "Near robustness"),
+    "near_edge_astig": ("#8cd17d", "D", "Near edge astig"),
     "peripheral_left": ("#a72d34", "<", "Peripheral-left"),
     "peripheral_right": ("#b96500", ">", "Peripheral-right"),
 }

@@ -14,7 +14,7 @@ def main() -> int:
     parser.add_argument("--output", default=MinimalConfig.output)
     parser.add_argument("--excel", default=MinimalConfig.excel, help="PAL-NURBS 使用的镜片系统 Excel")
     parser.add_argument("--support-json", default=MinimalConfig.support_json, help="Original PAL 支持参数 JSON")
-    parser.add_argument("--zones-json", default=MinimalConfig.zones_json, help="Far/Intermediate/Near 分区 JSON")
+    parser.add_argument("--zones-json", default=MinimalConfig.zones_json, help="V3 PAL 功能分区 JSON")
     parser.add_argument("--device", default=MinimalConfig.device)
     parser.add_argument("--requested-np", type=int, default=MinimalConfig.requested_np)
     parser.add_argument("--fft-size-px", type=int, default=MinimalConfig.fft_size_px)
@@ -44,12 +44,13 @@ def main() -> int:
         "--baseline-state-import",
         default=None,
         help=(
-            "导入已完成的 Original PAL 80-case baseline 状态；源文件哈希进入新 run identity，"
+            "导入已完成的 Original PAL 109-case baseline 状态；源文件哈希进入新 run identity，"
             "导入后仍严格校验 case IDs、7x7 零 residual 与 baseline schema"
         ),
     )
     parser.add_argument(
-        "--steps", type=int, nargs=3, metavar=("S7", "S11", "S19"), default=(10, 10, 10),
+        "--steps", type=int, nargs=3, metavar=("S7", "S11", "S19"),
+        default=(MinimalConfig.max_steps_7, MinimalConfig.max_steps_11, MinimalConfig.max_steps_19),
         help=(
             "7x7/11x11 的固定 attempt 数与 19x19 的最低 attempt 数；"
             "拒绝的 attempt 同样计数"
@@ -74,6 +75,12 @@ def main() -> int:
         help="19x19 最低预算后允许的最大额外 attempt 数",
     )
     parser.add_argument(
+        "--smooth-lambda",
+        type=float,
+        default=MinimalConfig.smooth_lambda,
+        help="仅在 19x19 阶段启用的 NURBS 归一化二阶差分权重",
+    )
+    parser.add_argument(
         "--prepare-only",
         action="store_true",
         help="只输出优化前分区图、case 清单和镜片/物方 case 分布图，不启动 PSF 优化",
@@ -93,6 +100,7 @@ def main() -> int:
         early_stopping_patience=args.early_stopping_patience,
         relative_improvement_threshold=args.relative_improvement_threshold,
         max_extra_19_steps=args.max_extra_19_steps,
+        smooth_lambda=args.smooth_lambda,
         candidate_trace_import=args.candidate_trace_import,
         forward_qualification_import=args.forward_qualification_import,
         final_phase_qualification_import=args.final_phase_qualification_import,

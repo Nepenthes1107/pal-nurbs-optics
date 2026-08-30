@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import numpy as np
 
 from biot.e2e.pal_case_layout import (
     PERIPHERAL_BAND_COUNTS,
@@ -27,17 +28,26 @@ def _zones_payload() -> dict[str, object]:
     left = [[int(xx <= -15) for xx in x] for _ in y]
     right = [[int(xx >= 15) for xx in x] for _ in y]
     monitored = [[1 for _ in x] for _ in y]
+    empty = [[0 for _ in x] for _ in y]
+    lower_edge_guard = [[int(-23 <= yy <= -18) for _ in x] for yy in y]
+    power = []
+    for yy in y:
+        local_add = 0.35 if yy >= -3 else 0.8 if yy >= -9 else 1.6
+        power.append([1.0 + local_add if -14 <= xx <= 14 and -12 <= yy <= 0 else 1.0 for xx in x])
     return {
         "x_mm": x,
         "physical_y_mm": y,
         "masks": {
             "far": far,
             "corridor": corridor,
+            "corridor_flank": empty,
             "near": near,
             "peripheral_astig_left": left,
             "peripheral_astig_right": right,
             "monitored": monitored,
+            "lower_edge_guard": lower_edge_guard,
         },
+        "maps": {"power_D": power, "astigmatism_D": [[0.0 for _ in x] for _ in y]},
         "rules": {"topology": {}},
         "statistics": {"corridor": {"physical_y_range_mm": [-9.0, -3.0]}},
     }
@@ -59,8 +69,8 @@ def _traced_candidates() -> list[dict[str, object]]:
         for iy, y in enumerate((y0 - 6, y0 - 2, y0 + 2, y0 + 6)):
             for ix, x in enumerate((-12.0, -6.0, 0.0, 6.0, 12.0)):
                 rows.append(_candidate(f"{zone}_{iy}_{ix}", zone, x, y, x, y))
-    for iy, y in enumerate((-9.0, -7.0, -5.0, -3.0)):
-        for x in (-4.0, 0.0, 4.0):
+    for iy, y in enumerate((-10.0, -6.0, -2.0)):
+        for x in (-8.0, -4.0, 0.0, 4.0, 8.0):
             rows.append(_candidate(f"mid_{iy}_{x}", "corridor", x, y, x, y))
     for band, y_values in (
         ("upper", (2.0, 4.25, 6.5, 8.75, 11.0)),
@@ -75,10 +85,14 @@ def _traced_candidates() -> list[dict[str, object]]:
 
 
 def _selected_cases(*, far_distance: float = 100000.0) -> list[dict[str, object]]:
+    zones = _zones_payload()
     return select_training_cases(
         _traced_candidates(), far_object_distance_mm=far_distance,
         intermediate_object_distance_mm=2000.0, near_object_distance_mm=500.0,
         corridor_y_min_mm=-9.0, corridor_y_max_mm=-3.0,
+        power_map=np.asarray(zones["maps"]["power_D"], dtype=np.float64),
+        pfar=1.0,
+        zones_payload=zones,
     )
 
 
@@ -91,7 +105,7 @@ def _sampling_contract(*, far_distance: float = 100000.0) -> dict[str, object]:
             "far": far_distance, "intermediate": 2000.0, "near": 500.0,
         },
         "peripheral_band_distance_mm": {
-            "upper": far_distance, "middle": 2000.0, "lower": 500.0,
+            "upper": far_distance, "middle": far_distance, "lower": far_distance,
         },
     }
 
@@ -99,7 +113,7 @@ def _sampling_contract(*, far_distance: float = 100000.0) -> dict[str, object]:
 def test_dense_grid_is_deterministic_and_not_a_lens_plane_prescription() -> None:
     fields = generate_dense_candidate_fields(field_min_deg=-4.0, field_max_deg=4.0, field_step_deg=2.0)
     assert len(fields) == 25
-    assert fields[0] == {"candidate_id": "cand_0001", "field_x_deg": -4.0, "field_y_deg": -4.0}
+    assert fields[0] == {"candidate_id": "cand_00001", "field_x_deg": -4.0, "field_y_deg": -4.0}
     assert "reference_lens_x_mm" not in fields[0]
 
 
@@ -139,13 +153,20 @@ def test_candidate_trace_rejects_invalid_sampling_margins_before_tracing() -> No
     assert called is False
 
 
-def test_selects_fixed_80_cases_with_layered_corridor_and_mirrored_peripheral() -> None:
+def test_selects_fixed_109_cases_with_stratified_corridor_and_mirrored_peripheral() -> None:
     cases = _selected_cases()
     counts = {group: sum(case["training_group"] == group for case in cases) for group in TRAINING_GROUP_COUNTS}
     assert counts == TRAINING_GROUP_COUNTS
-    intermediate = [case for case in cases if case["training_group"] == "intermediate"]
-    assert {case["corridor_vertical_layer"] for case in intermediate} == {1, 2, 3, 4}
-    assert all(sum(case["corridor_vertical_layer"] == layer for case in intermediate) == 3 for layer in range(1, 5))
+    assert len(cases) == 109
+    expected_add_ranges = {
+        "corridor_upper": (0.2, 0.5),
+        "corridor_middle": (0.5, 1.3),
+        "corridor_lower": (1.3, 2.0),
+    }
+    for group, (lower, upper) in expected_add_ranges.items():
+        values = [float(case["corridor_local_add_D"]) for case in cases if case["training_group"] == group]
+        assert len(values) == 5
+        assert all(lower <= value <= upper for value in values)
     left = {case["peripheral_pair_id"]: case for case in cases if case["training_group"] == "peripheral_left"}
     right = {case["peripheral_pair_id"]: case for case in cases if case["training_group"] == "peripheral_right"}
     assert left.keys() == right.keys()
@@ -154,7 +175,7 @@ def test_selects_fixed_80_cases_with_layered_corridor_and_mirrored_peripheral() 
         assert left[pair_id]["field_y_deg"] == right[pair_id]["field_y_deg"]
         assert left[pair_id]["distance_mm"] == right[pair_id]["distance_mm"]
     by_band = {band: {case["distance_mm"] for case in left.values() if case["peripheral_band"] == band} for band in ("upper", "middle", "lower")}
-    assert by_band == {"upper": {100000.0}, "middle": {2000.0}, "lower": {500.0}}
+    assert by_band == {"upper": {100000.0}, "middle": {100000.0}, "lower": {100000.0}}
     assert {
         band: sum(case["peripheral_band"] == band for case in left.values())
         for band in ("upper", "middle", "lower")
@@ -175,7 +196,7 @@ def test_partition_classification_respects_physical_y_order() -> None:
     assert classify_partition_point(payload, x_mm=0.0, physical_y_mm=-20.0) == "near"
 
 
-def test_preoptimization_artifacts_record_candidates_and_five_groups(tmp_path) -> None:
+def test_preoptimization_artifacts_record_candidates_and_ten_groups(tmp_path) -> None:
     zones_path = tmp_path / "zones.json"
     zones_path.write_text(json.dumps(_zones_payload()), encoding="utf-8")
     excel_path = tmp_path / "lens.xlsx"
@@ -200,10 +221,10 @@ def test_preoptimization_artifacts_record_candidates_and_five_groups(tmp_path) -
     ):
         assert (output / name).is_file()
     manifest = json.loads((output / "case_manifest.json").read_text(encoding="utf-8"))
-    assert manifest["schema_version"] == 5
+    assert manifest["schema_version"] == 6
     assert "posthoc_cases_json" not in manifest["source"]
     assert manifest["group_counts"] == TRAINING_GROUP_COUNTS
-    assert manifest["objective_contract"]["J"] == "0.85 * J_functional + 0.15 * J_peripheral"
+    assert "group_weight" in manifest["objective_contract"]["J"]
     assert manifest["case_geometry_audit"]["passed"] is True
     assert manifest["coverage_audit"]["overall_passed"] is True
     coverage = json.loads((output / "coverage_audit.json").read_text(encoding="utf-8"))
@@ -324,7 +345,7 @@ def test_preoptimization_contract_rejects_wrong_peripheral_distance(tmp_path) ->
         )
 
 
-def test_preoptimization_contract_rejects_swapped_corridor_roles(tmp_path) -> None:
+def test_preoptimization_contract_rejects_corridor_add_outside_stratum(tmp_path) -> None:
     zones_path = tmp_path / "zones.json"
     zones_path.write_text(json.dumps(_zones_payload()), encoding="utf-8")
     excel_path = tmp_path / "lens.xlsx"
@@ -334,17 +355,10 @@ def test_preoptimization_contract_rejects_swapped_corridor_roles(tmp_path) -> No
         case["case_lens_x_mm"] = case["reference_lens_x_mm"]
         case["case_lens_physical_y_mm"] = case["reference_lens_physical_y_mm"]
         case["case_position_partition_zone"] = case["reference_partition_zone"]
-    layer = [
-        case for case in cases
-        if case.get("training_group") == "intermediate"
-        and case.get("corridor_vertical_layer") == 1
-    ]
-    left = next(case for case in layer if case["corridor_horizontal_role"] == "left_boundary")
-    centre = next(case for case in layer if case["corridor_horizontal_role"] == "centre")
-    left["corridor_horizontal_role"], centre["corridor_horizontal_role"] = (
-        centre["corridor_horizontal_role"], left["corridor_horizontal_role"]
-    )
-    with pytest.raises(ValueError, match="roles do not match x order"):
+    target = next(case for case in cases if case["training_group"] == "corridor_upper")
+    target["corridor_local_add_D"] = 0.8
+    target["distance_mm"] = 1250.0
+    with pytest.raises(ValueError, match="outside corridor_upper band"):
         write_preoptimization_artifacts(
             output_dir=tmp_path / "swapped_roles", excel_path=excel_path,
             zones_json=zones_path,
