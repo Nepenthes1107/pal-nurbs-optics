@@ -1621,6 +1621,38 @@ def _prepare_case_layout(
         pool_identity_sha256=pool_identity,
         progress_name="final phase qualification progress",
     )
+    def pool_match_key(row: Mapping[str, Any]) -> tuple[str, str, float, float, float]:
+        return (
+            str(row["training_group"]),
+            str(row["candidate_id"]),
+            round(float(row["distance_mm"]), 9),
+            round(float(row["field_x_deg"]), 9),
+            round(float(row["field_y_deg"]), 9),
+        )
+
+    qualified_pool_by_key: dict[tuple[str, str, float, float, float], dict[str, Any]] = {}
+    for pool_row in qualified_pool:
+        key = pool_match_key(pool_row)
+        if key in qualified_pool_by_key:
+            raise ValueError(
+                "qualified pool contains duplicate stable case key: "
+                f"group={key[0]}, candidate={key[1]}, distance={key[2]:g}, "
+                f"field=({key[3]:g},{key[4]:g})"
+            )
+        qualified_pool_by_key[key] = pool_row
+
+    def pool_case_for_final_case(case: Mapping[str, Any]) -> dict[str, Any]:
+        key = pool_match_key(case)
+        pool_case = qualified_pool_by_key.get(key)
+        if pool_case is None:
+            raise ValueError(
+                "final training case has no matching qualified-pool record; "
+                f"stable_key={key!r}, final_case_id={case.get('case_id')!r}. "
+                "The final case must retain the same training_group, candidate_id, "
+                "distance and field coordinates as its qualified source."
+            )
+        return pool_case
+
     if phase_progress_path.is_file():
         saved = _read_json(phase_progress_path)
         if saved.get("schema_version") != 1 or saved.get("pool_identity_sha256") != pool_identity:
@@ -1629,11 +1661,43 @@ def _prepare_case_layout(
         if not isinstance(rows, list):
             raise ValueError("final phase qualification progress rows are malformed")
         forward_attempts = [dict(row) for row in rows]
-        pool_by_id = {str(row["case_id"]): row for row in qualified_pool}
         for attempt in forward_attempts:
-            pool_case = pool_by_id.get(str(attempt["case_id"]))
+            pool_case = None
+            exact_case_id = str(attempt.get("case_id", ""))
+            for row in qualified_pool:
+                if str(row.get("case_id")) == exact_case_id:
+                    pool_case = row
+                    break
+            if pool_case is None and attempt.get("training_group") is not None:
+                try:
+                    pool_case = qualified_pool_by_key.get(
+                        pool_match_key({
+                            "training_group": attempt["training_group"],
+                            "candidate_id": attempt["candidate_id"],
+                            "distance_mm": attempt["distance_mm"],
+                            "field_x_deg": attempt["field_x_deg"],
+                            "field_y_deg": attempt["field_y_deg"],
+                        })
+                    )
+                except KeyError:
+                    pool_case = None
+            if pool_case is None and attempt.get("candidate_id") is not None:
+                # Compatibility with older progress files: candidate IDs are
+                # unique within a training group, while the same candidate may
+                # legitimately be reused by different groups.
+                prefix_matches = [
+                    row for row in qualified_pool
+                    if str(row.get("candidate_id")) == str(attempt["candidate_id"])
+                    and exact_case_id.startswith(str(row.get("training_group")) + "_")
+                ]
+                if len(prefix_matches) == 1:
+                    pool_case = prefix_matches[0]
             if pool_case is None:
-                raise ValueError("final phase qualification progress references a foreign candidate")
+                raise ValueError(
+                    "final phase qualification progress references a foreign or "
+                    "renumbered candidate; include training_group/candidate_id and "
+                    f"stable coordinates in the progress record (case_id={exact_case_id!r})"
+                )
             if attempt["status"] in {"ok", "surface_only"}:
                 pool_case["forward_training_status"] = str(attempt["status"])
                 pool_case["forward_training_validation"] = (
@@ -1683,10 +1747,7 @@ def _prepare_case_layout(
         for case in training_cases:
             candidate_id = str(case["candidate_id"])
             case_id = str(case["case_id"])
-            pool_case = next(
-                row for row in qualified_pool
-                if str(row.get("case_id")) == case_id
-            )
+            pool_case = pool_case_for_final_case(case)
             if pool_case.get("forward_training_status") in {"ok", "surface_only"}:
                 case["forward_training_validation"] = dict(
                     pool_case["forward_training_validation"]
@@ -1701,6 +1762,10 @@ def _prepare_case_layout(
                     "validation_round": validation_round,
                     "candidate_id": candidate_id,
                     "case_id": case_id,
+                    "training_group": str(case["training_group"]),
+                    "distance_mm": float(case["distance_mm"]),
+                    "field_x_deg": float(case["field_x_deg"]),
+                    "field_y_deg": float(case["field_y_deg"]),
                     "status": "surface_only",
                     **audit,
                 })
@@ -1717,6 +1782,10 @@ def _prepare_case_layout(
                     "validation_round": validation_round,
                     "candidate_id": candidate_id,
                     "case_id": str(case["case_id"]),
+                    "training_group": str(case["training_group"]),
+                    "distance_mm": float(case["distance_mm"]),
+                    "field_x_deg": float(case["field_x_deg"]),
+                    "field_y_deg": float(case["field_y_deg"]),
                     "status": "ok",
                     **dict(audit),
                 })
@@ -1729,6 +1798,10 @@ def _prepare_case_layout(
                     "validation_round": validation_round,
                     "candidate_id": candidate_id,
                     "case_id": str(case["case_id"]),
+                    "training_group": str(case["training_group"]),
+                    "distance_mm": float(case["distance_mm"]),
+                    "field_x_deg": float(case["field_x_deg"]),
+                    "field_y_deg": float(case["field_y_deg"]),
                     "status": "failed",
                     "error_type": type(exc).__name__,
                     "error": str(exc),

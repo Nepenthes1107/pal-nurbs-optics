@@ -863,7 +863,12 @@ def test_case_layout_filters_oversampled_pool_before_final_fps(
             selected_rows = [next(row for row in rows if row["eligible"])]
         return [
             {
-                **selected, "case_id": f"case_{selected['candidate_id']}",
+                **selected,
+                "case_id": (
+                    f"pool_{selected['candidate_id']}"
+                    if kwargs.get("group_counts") is pal_nurbs.FORWARD_POOL_GROUP_COUNTS
+                    else "final_01_Dinf"
+                ),
                 "training_group": "far", "distance_mm": 100000.0,
                 "field_x_deg": 0.0, "field_y_deg": 0.0,
             }
