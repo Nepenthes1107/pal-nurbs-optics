@@ -561,42 +561,80 @@ def select_training_cases(
     if sum(resolved_band_counts.values()) != resolved_counts["peripheral_left"]:
         raise ValueError("peripheral band counts do not match the group count")
     eligible = [dict(row) for row in traced_candidates if bool(row.get("eligible"))]
-    zone_rows = lambda zone: [row for row in eligible if row.get("reference_partition_zone") == zone]
-    far_rows = zone_rows("far")
-    corridor_rows = zone_rows("corridor")
-    near_rows = zone_rows("near")
+    tagged = [row.get("training_group") is not None for row in eligible]
+    if any(tagged) and not all(tagged):
+        raise ValueError(
+            "eligible candidates must either all omit training_group or all retain it"
+        )
+    retain_source_groups = bool(tagged) and all(tagged)
+
+    def source_rows(group: str, zone: str) -> list[dict[str, Any]]:
+        """Return one group's own qualified source domain for final FPS.
+
+        Dense traced candidates are initially untagged and may feed every
+        objective group associated with their physical partition.  The
+        forward-qualified oversampling pool is already tagged, however, and
+        each record carries group-specific distance/qualification evidence.
+        Re-selection from that pool must not mix sibling groups that happen
+        to share a partition (for example far and far_robustness).
+        """
+        return [
+            row for row in eligible
+            if row.get("reference_partition_zone") == zone
+            and (
+                not retain_source_groups
+                or str(row.get("training_group")) == group
+            )
+        ]
+
+    far_rows = source_rows("far", "far")
+    far_robustness_rows = source_rows("far_robustness", "far")
+    corridor_upper_rows = source_rows("corridor_upper", "corridor")
+    corridor_middle_rows = source_rows("corridor_middle", "corridor")
+    corridor_lower_rows = source_rows("corridor_lower", "corridor")
+    near_rows = source_rows("near", "near")
+    near_robustness_rows = source_rows("near_robustness", "near")
+    near_edge_astig_rows = source_rows("near_edge_astig", "near")
     groups: dict[str, list[dict[str, Any]]] = {
         "far": _fps_rows(far_rows, resolved_counts["far"]),
         "far_robustness": _fps_rows(
-            far_rows, resolved_counts["far_robustness"], (0.0, 15.0)
+            far_robustness_rows,
+            resolved_counts["far_robustness"],
+            (0.0, 15.0),
         ),
         "corridor_upper": _select_corridor_stratum(
-            corridor_rows, resolved_counts["corridor_upper"],
+            corridor_upper_rows, resolved_counts["corridor_upper"],
             add_min_D=0.2, add_max_D=0.5, include_upper=False,
             power_map=power_map, pfar=pfar, zones_payload=zones_payload,
         ),
         "corridor_middle": _select_corridor_stratum(
-            corridor_rows, resolved_counts["corridor_middle"],
+            corridor_middle_rows, resolved_counts["corridor_middle"],
             add_min_D=0.5, add_max_D=1.3, include_upper=False,
             power_map=power_map, pfar=pfar, zones_payload=zones_payload,
         ),
         "corridor_lower": _select_corridor_stratum(
-            corridor_rows, resolved_counts["corridor_lower"],
+            corridor_lower_rows, resolved_counts["corridor_lower"],
             add_min_D=1.3, add_max_D=2.0, include_upper=True,
             power_map=power_map, pfar=pfar, zones_payload=zones_payload,
         ),
         "near": _fps_rows(near_rows, resolved_counts["near"]),
         "near_robustness": _fps_rows(
-            near_rows, resolved_counts["near_robustness"]
+            near_robustness_rows, resolved_counts["near_robustness"]
         ),
         "near_edge_astig": _fps_rows(
-            [row for row in near_rows if abs(float(row["reference_lens_x_mm"])) > 10.0],
+            [
+                row for row in near_edge_astig_rows
+                if abs(float(row["reference_lens_x_mm"])) > 10.0
+            ],
             resolved_counts["near_edge_astig"],
             (12.0, -28.0),
         ),
         "peripheral_left": [], "peripheral_right": [],
     }
-    peripheral = zone_rows("astig_left") + zone_rows("astig_right")
+    peripheral = (
+        source_rows("peripheral_left", "astig_left")
+        + source_rows("peripheral_right", "astig_right")
+    )
     pairs = _select_peripheral(
         peripheral, corridor_y_min_mm, corridor_y_max_mm,
         band_counts=resolved_band_counts,

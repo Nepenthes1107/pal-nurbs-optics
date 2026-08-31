@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 import sys
 from pathlib import Path
@@ -187,6 +188,64 @@ def test_select_training_cases_serializes_infinite_distance_without_overflow() -
     far_cases = [case for case in cases if case["training_group"] == "far"]
     assert far_cases
     assert all(case["case_id"].endswith("_Dinf") for case in far_cases)
+
+
+def test_final_fps_retains_each_qualified_pool_training_group() -> None:
+    zones = _zones_payload()
+    qualified_pool = _selected_cases(far_distance=float("inf"))
+    rogue = next(
+        dict(case)
+        for case in qualified_pool
+        if case["training_group"] == "far_robustness"
+    )
+    rogue.update(
+        {
+            "candidate_id": "robustness_only_extreme",
+            "case_id": "far_robustness_pool_extreme_D2000",
+            "field_x_deg": 99.0,
+            "reference_lens_x_mm": 100.0,
+            "distance_mm": 2000.0,
+        }
+    )
+    qualified_pool.append(rogue)
+
+    final_cases = select_training_cases(
+        qualified_pool,
+        far_object_distance_mm=float("inf"),
+        intermediate_object_distance_mm=2000.0,
+        near_object_distance_mm=500.0,
+        corridor_y_min_mm=-9.0,
+        corridor_y_max_mm=-3.0,
+        power_map=np.asarray(zones["maps"]["power_D"], dtype=np.float64),
+        pfar=1.0,
+        zones_payload=zones,
+    )
+
+    qualified_keys = {
+        (
+            str(case["training_group"]),
+            str(case["candidate_id"]),
+            float(case["distance_mm"]),
+            float(case["field_x_deg"]),
+            float(case["field_y_deg"]),
+        )
+        for case in qualified_pool
+    }
+    assert all(
+        (
+            str(case["training_group"]),
+            str(case["candidate_id"]),
+            float(case["distance_mm"]),
+            float(case["field_x_deg"]),
+            float(case["field_y_deg"]),
+        )
+        in qualified_keys
+        for case in final_cases
+    )
+    far_cases = [case for case in final_cases if case["training_group"] == "far"]
+    assert far_cases
+    assert all(math.isinf(float(case["distance_mm"])) for case in far_cases)
+    assert all(case["candidate_id"] != "robustness_only_extreme" for case in far_cases)
 
 
 def test_partition_classification_respects_physical_y_order() -> None:

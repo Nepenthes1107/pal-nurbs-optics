@@ -98,3 +98,13 @@ corridor/near PAL 连续 OPD 对 BIOT NumPy 拟合的直接验证通过；完整
 `.venv\Scripts\python.exe -m pytest -q tests --basetemp=.pytest_tmp_v3_full` 为
 `189 passed`，py_compile 与 `git diff --check` 通过。本次未启动 V3 完整训练，
 不形成优化收益或运行时长结论。
+
+2026-08-31 V3 资格池最终 FPS 串组修复：420-case WFNO 池排除失败项后，
+最终 FPS 现在仅能在各自 `training_group` 的已合格源记录中选择，不再将
+共享物理分区的 `far/far_robustness` 或 `near/near_robustness/near_edge_astig`
+混合采样。该错误曾使 `far` 最终 case 继承 robustness 的 `D1000`，并被稳定键
+成员身份门禁正确拒绝。case-layout state schema 提升为 8；旧失败 run 不得直接
+`--resume`，但可在新 run identity 中显式导入身份匹配的完整 candidate-trace 和
+forward-qualification 进度。完整测试
+`.venv\Scripts\python.exe -m pytest tests -q --basetemp .tmp_pytest_group_pool_all` 为
+`190 passed`，无失败；本次未启动正式训练，不形成科学收益结论。
