@@ -9,6 +9,12 @@ from pathlib import Path
 import pytest
 import numpy as np
 
+from biot.e2e.pal_case_layout_plotter import (
+    PARTITION_PALETTE,
+    PARTITION_ORDER as PLOT_PARTITION_ORDER,
+    ZONE_COLORS as PLOT_ZONE_COLORS,
+)
+
 from biot.e2e.pal_case_layout import (
     PERIPHERAL_BAND_COUNTS,
     TRAINING_GROUP_COUNTS,
@@ -352,6 +358,13 @@ def test_preoptimization_artifacts_record_candidates_and_ten_groups(tmp_path) ->
             band["coverage_gate"]["passed"]
             for band in coverage["zones"][side]["peripheral_band_coverage"].values()
         )
+
+
+def test_partition_plot_palette_has_one_color_per_partition() -> None:
+    assert len(PARTITION_PALETTE) == len(PLOT_PARTITION_ORDER) + 1
+    assert PARTITION_PALETTE[1:] == tuple(
+        PLOT_ZONE_COLORS[zone] for zone in PLOT_PARTITION_ORDER
+    )
 
 
 def test_preoptimization_artifacts_accept_group_qualified_pool_candidate_reuse(

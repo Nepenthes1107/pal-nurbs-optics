@@ -138,3 +138,10 @@ membership 通过，coverage `overall_passed=true` 且失败门禁为空，phase
 完成 2 个 GPU batch、保存 16/109 rows；按用户要求在继续训练前停止，目标进程已
 确认不存在。`run_state.json` 因 Ctrl-C 仍为陈旧 `running/baseline_training_cases`，
 不能作为活进程或完成训练的证据；本次不形成优化收益结论。
+
+2026-08-31 V3 分区图例颜色修复：`partition_map.png` 的分区编号包含 6 个 zone，
+原绘图调色板只提供 5 个分区颜色，导致最后一个 `corridor_flank` 编号被 matplotlib
+截为 peripheral-right 橙色。绘图器现按 `PARTITION_ORDER` 从 `ZONE_COLORS` 生成
+“背景 + 6 分区”完整调色板；已用 `run_004/preoptimization` 重生成分区图及相关图，
+并新增颜色表长度/顺序回归测试。该修复只影响可视化，不改变 zones mask、候选点或训练
+case 数值数据。

@@ -35,6 +35,9 @@ ZONE_LABELS = {
     "peripheral_astig_left": "Peripheral-left",
     "peripheral_astig_right": "Peripheral-right",
 }
+PARTITION_PALETTE = ("#f5f5f5",) + tuple(
+    ZONE_COLORS[zone] for zone in PARTITION_ORDER
+)
 GROUP_STYLES = {
     "far": ("#174a7e", "o", "Far"),
     "far_robustness": ("#5b8db8", "o", "Far robustness"),
@@ -71,7 +74,10 @@ def _plot_base(ax, payload: dict[str, Any], title: str) -> None:
     labels = np.zeros((y.size, x.size), dtype=np.int16)
     for number, zone in enumerate(PARTITION_ORDER, 1):
         labels[masks[zone]] = number
-    palette = ["#f5f5f5", "#4c78a8", "#b279a2", "#59a14f", "#e15759", "#f28e2b"]
+    # labels are 0 for background and 1..N in PARTITION_ORDER.  Keep this
+    # generated from the same order as the legend; a missing entry silently
+    # clips the last zone to the previous color in matplotlib.
+    palette = PARTITION_PALETTE
     xx, yy = np.meshgrid(x, y)
     ax.pcolormesh(
         xx, yy, labels,
