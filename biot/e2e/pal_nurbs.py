@@ -100,7 +100,7 @@ class MinimalConfig:
     max_steps_19: int = 30
     early_stopping_patience: int = 7
     relative_improvement_threshold: float = 1.0e-3
-    max_extra_19_steps: int = 30
+    max_extra_terminal_stage_steps: int = 30
     max_backtracks: int = 8
     step_sag_limit_mm: float = 2.0e-3
     far_tolerance_D: float = 0.15
@@ -162,7 +162,12 @@ class MinimalConfig:
             raise ValueError("fft_size_px must be positive")
         if int(self.case_batch_size) <= 0:
             raise ValueError("case_batch_size must be a positive integer")
-        for name in ("max_steps_7", "max_steps_11", "max_steps_19", "max_extra_19_steps"):
+        for name in (
+            "max_steps_7",
+            "max_steps_11",
+            "max_steps_19",
+            "max_extra_terminal_stage_steps",
+        ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"{name} must be a non-negative integer")
@@ -179,11 +184,11 @@ class MinimalConfig:
             raise ValueError("relative_improvement_threshold must be finite and positive")
 
 
-RUN_IDENTITY_SCHEMA_VERSION = 7
+RUN_IDENTITY_SCHEMA_VERSION = 8
 CASE_LAYOUT_STATE_SCHEMA_VERSION = 10
 BASELINE_STATE_SCHEMA_VERSION = 6
 BASELINE_PROGRESS_SCHEMA_VERSION = 6
-STAGE_RESUME_SCHEMA_VERSION = 2
+STAGE_RESUME_SCHEMA_VERSION = 3
 RUN_STATE_SCHEMA_VERSION = 1
 STAGE_LADDER = (7, 11, 19)
 FORWARD_POOL_MULTIPLIER = 4
@@ -207,9 +212,39 @@ class MinimumTrainingBudgetError(RuntimeError):
     """Raised when the learning-rate floor prevents a mandatory stage budget."""
 
 
+def _training_stage_specs(
+    config: MinimalConfig,
+) -> tuple[tuple[int, int, int, bool], ...]:
+    """Return ``(control, minimum, maximum, is_terminal)`` for the NURBS ladder."""
+    minimum_by_control = {
+        7: int(config.max_steps_7),
+        11: int(config.max_steps_11),
+        19: int(config.max_steps_19),
+    }
+    active = [control for control in STAGE_LADDER if minimum_by_control[control] > 0]
+    if not active:
+        raise ValueError("--steps must contain at least one positive training budget")
+    terminal_control_count = active[-1]
+    return tuple(
+        (
+            control_count,
+            minimum_by_control[control_count],
+            minimum_by_control[control_count]
+            + (
+                int(config.max_extra_terminal_stage_steps)
+                if control_count == terminal_control_count
+                else 0
+            ),
+            control_count == terminal_control_count,
+        )
+        for control_count in STAGE_LADDER
+    )
+
+
 def _stage_boundary_stop_reason(
     *,
     control_count: int,
+    is_terminal_stage: bool,
     completed_step: int,
     minimum_steps: int,
     maximum_steps: int,
@@ -223,7 +258,7 @@ def _stage_boundary_stop_reason(
         if learning_rate < minimum_learning_rate:
             return "minimum_not_reached"
         return None
-    if control_count != 19:
+    if not is_terminal_stage:
         if completed_step != minimum_steps or maximum_steps != minimum_steps:
             raise ValueError("fixed stages must finish exactly at their minimum budget")
         return "minimum_completed"
@@ -2623,9 +2658,10 @@ def _make_stage_resume_payload(
     control_count: int,
     minimum_steps: int,
     maximum_steps: int,
+    terminal_control_count: int,
     early_stopping_patience: int,
     relative_improvement_threshold: float,
-    max_extra_19_steps: int,
+    max_extra_terminal_stage_steps: int,
     no_improvement_attempts: int,
     stop_reason: str | None,
     module: FixedWeightNURBSPerturbation,
@@ -2656,9 +2692,10 @@ def _make_stage_resume_payload(
         "control_count": int(control_count),
         "minimum_steps": int(minimum_steps),
         "maximum_steps": int(maximum_steps),
+        "terminal_control_count": int(terminal_control_count),
         "early_stopping_patience": int(early_stopping_patience),
         "relative_improvement_threshold": float(relative_improvement_threshold),
-        "max_extra_19_steps": int(max_extra_19_steps),
+        "max_extra_terminal_stage_steps": int(max_extra_terminal_stage_steps),
         "no_improvement_attempts": int(no_improvement_attempts),
         "stop_reason": stop_reason,
         "model_state": copy.deepcopy(module.state_dict()),
@@ -2686,9 +2723,10 @@ def _load_stage_resume_state(
     control_count: int,
     minimum_steps: int,
     maximum_steps: int,
+    terminal_control_count: int,
     early_stopping_patience: int,
     relative_improvement_threshold: float,
-    max_extra_19_steps: int,
+    max_extra_terminal_stage_steps: int,
     device: torch.device | str,
 ) -> dict[str, Any]:
     payload = _load_identity_bound_torch(
@@ -2702,8 +2740,9 @@ def _load_stage_resume_state(
     expected_contract = {
         "minimum_steps": int(minimum_steps),
         "maximum_steps": int(maximum_steps),
+        "terminal_control_count": int(terminal_control_count),
         "early_stopping_patience": int(early_stopping_patience),
-        "max_extra_19_steps": int(max_extra_19_steps),
+        "max_extra_terminal_stage_steps": int(max_extra_terminal_stage_steps),
     }
     for name, expected in expected_contract.items():
         if int(payload.get(name, -1)) != expected:
@@ -2732,7 +2771,8 @@ def _load_stage_resume_state(
     no_improvement_attempts = int(payload.get("no_improvement_attempts", -1))
     if no_improvement_attempts < 0:
         raise ValueError(f"stage patience counter is invalid: {path}")
-    if control_count == 19:
+    is_terminal_stage = int(control_count) == int(terminal_control_count)
+    if is_terminal_stage:
         expected_no_improvement = 0
         for row in history:
             if bool(row.get("significant_improvement", False)):
@@ -2751,7 +2791,7 @@ def _load_stage_resume_state(
     if status == "completed":
         allowed_reasons = (
             {"minimum_completed"}
-            if control_count != 19
+            if not is_terminal_stage
             else {"early_stopping", "learning_rate_floor", "max_extra_reached"}
         )
         if stop_reason not in allowed_reasons:
@@ -2974,16 +3014,22 @@ def _run_bound(
     )
 
     stage_summaries: list[dict[str, Any]] = []
-    stage_specs = (
-        (7, config.max_steps_7, config.max_steps_7),
-        (11, config.max_steps_11, config.max_steps_11),
-        (19, config.max_steps_19, config.max_steps_19 + config.max_extra_19_steps),
+    stage_specs = _training_stage_specs(config)
+    terminal_control_count = next(
+        control_count
+        for control_count, _, _, is_terminal_stage in stage_specs
+        if is_terminal_stage
     )
-    for stage_index, (control_count, minimum_steps, maximum_steps) in enumerate(stage_specs):
+    for stage_index, (
+        control_count,
+        minimum_steps,
+        maximum_steps,
+        is_terminal_stage,
+    ) in enumerate(stage_specs):
         resume_path = output / f"stage_{control_count}x{control_count}" / "resume.pt"
         later = [
             output / f"stage_{later_count}x{later_count}" / "resume.pt"
-            for later_count, _, _ in stage_specs[stage_index + 1 :]
+            for later_count, _, _, _ in stage_specs[stage_index + 1 :]
         ]
         if not resume_path.is_file():
             if any(path.is_file() for path in later):
@@ -3013,6 +3059,8 @@ def _run_bound(
                 **asdict(config),
                 "identity_sha256": identity_sha256,
                 "control_count": control_count,
+                "terminal_control_count": terminal_control_count,
+                "is_terminal_stage": is_terminal_stage,
                 "minimum_steps": minimum_steps,
                 "maximum_steps": maximum_steps,
             },
@@ -3026,9 +3074,10 @@ def _run_bound(
                 control_count=control_count,
                 minimum_steps=minimum_steps,
                 maximum_steps=maximum_steps,
+                terminal_control_count=terminal_control_count,
                 early_stopping_patience=config.early_stopping_patience,
                 relative_improvement_threshold=config.relative_improvement_threshold,
-                max_extra_19_steps=config.max_extra_19_steps,
+                max_extra_terminal_stage_steps=config.max_extra_terminal_stage_steps,
                 device=device,
             )
             module.load_state_dict(stage_state["model_state"])
@@ -3066,7 +3115,7 @@ def _run_bound(
                         f"{float(history[-1]['relative_best_improvement']) if history else 0.0:.3e} "
                         f"patience={no_improvement_attempts}/"
                         f"{config.early_stopping_patience}"
-                        if control_count == 19 else ""
+                        if is_terminal_stage else ""
                     )
                 )
                 continue
@@ -3123,9 +3172,10 @@ def _run_bound(
                     control_count=control_count,
                     minimum_steps=minimum_steps,
                     maximum_steps=maximum_steps,
+                    terminal_control_count=terminal_control_count,
                     early_stopping_patience=config.early_stopping_patience,
                     relative_improvement_threshold=config.relative_improvement_threshold,
-                    max_extra_19_steps=config.max_extra_19_steps,
+                    max_extra_terminal_stage_steps=config.max_extra_terminal_stage_steps,
                     no_improvement_attempts=no_improvement_attempts,
                     stop_reason=None,
                     module=module,
@@ -3140,7 +3190,7 @@ def _run_bound(
                     best_health=best_health,
                 ),
             )
-            minimum_log = f" minimum={minimum_steps}" if control_count == 19 else ""
+            minimum_log = f" minimum={minimum_steps}" if is_terminal_stage else ""
             log_progress(
                 f"stage={control_count}x{control_count} step=0/{maximum_steps}"
                 f"{minimum_log} batch=complete loss={stage_initial:.6g} "
@@ -3148,12 +3198,13 @@ def _run_bound(
                 + (
                     f" rel=0 patience={no_improvement_attempts}/"
                     f"{config.early_stopping_patience}"
-                    if control_count == 19 else ""
+                    if is_terminal_stage else ""
                 )
             )
 
         stop_reason = _stage_boundary_stop_reason(
             control_count=control_count,
+            is_terminal_stage=is_terminal_stage,
             completed_step=completed_step,
             minimum_steps=minimum_steps,
             maximum_steps=maximum_steps,
@@ -3184,10 +3235,10 @@ def _run_bound(
                 break
             if control_count == 19 and (not math.isfinite(best) or best <= 0.0):
                 raise RuntimeError("19x19 best objective must be finite and positive")
-            minimum_log = f" minimum={minimum_steps}" if control_count == 19 else ""
+            minimum_log = f" minimum={minimum_steps}" if is_terminal_stage else ""
             patience_log = (
                 f" patience={no_improvement_attempts}/{config.early_stopping_patience}"
-                if control_count == 19 else ""
+                if is_terminal_stage else ""
             )
             if stop_reason is None:
                 log_progress(
@@ -3330,7 +3381,7 @@ def _run_bound(
                     lr *= 0.5
 
                 best_before = best
-                if control_count == 19:
+                if is_terminal_stage:
                     (
                         best_refreshed,
                         relative_best_improvement,
@@ -3384,7 +3435,7 @@ def _run_bound(
                         "maximum_steps": maximum_steps,
                         "actual_steps": step,
                         "extra_steps": max(0, step - minimum_steps),
-                        "is_extra_step": bool(control_count == 19 and step > minimum_steps),
+                        "is_extra_step": bool(is_terminal_stage and step > minimum_steps),
                         "best_refreshed": best_refreshed,
                         "relative_best_improvement": relative_best_improvement,
                         "significant_improvement": significant_improvement,
@@ -3401,9 +3452,12 @@ def _run_bound(
                         control_count=control_count,
                         minimum_steps=minimum_steps,
                         maximum_steps=maximum_steps,
+                        terminal_control_count=terminal_control_count,
                         early_stopping_patience=config.early_stopping_patience,
                         relative_improvement_threshold=config.relative_improvement_threshold,
-                        max_extra_19_steps=config.max_extra_19_steps,
+                        max_extra_terminal_stage_steps=(
+                            config.max_extra_terminal_stage_steps
+                        ),
                         no_improvement_attempts=no_improvement_attempts,
                         stop_reason=None,
                         module=module,
@@ -3422,7 +3476,7 @@ def _run_bound(
                 rel_log = (
                     f" rel={relative_best_improvement:.3e} "
                     f"patience={no_improvement_attempts}/{config.early_stopping_patience}"
-                    if control_count == 19 else ""
+                    if is_terminal_stage else ""
                 )
                 log_progress(
                     f"stage={control_count}x{control_count} step={step}/{maximum_steps}"
@@ -3444,6 +3498,7 @@ def _run_bound(
                 )
                 stop_reason = _stage_boundary_stop_reason(
                     control_count=control_count,
+                    is_terminal_stage=is_terminal_stage,
                     completed_step=completed_step,
                     minimum_steps=minimum_steps,
                     maximum_steps=maximum_steps,
@@ -3479,7 +3534,7 @@ def _run_bound(
         if history and history[-1].get("stop_reason") != stop_reason:
             history[-1]["stop_reason"] = stop_reason
             _write_history(stage_dir / "history.csv", history)
-        if control_count == 19:
+        if is_terminal_stage:
             terminal_update = {
                 "early_stopping": "EARLY_STOPPING",
                 "learning_rate_floor": "LEARNING_RATE_FLOOR",
@@ -3489,7 +3544,8 @@ def _run_bound(
                 float(history[-1]["relative_best_improvement"]) if history else 0.0
             )
             log_progress(
-                f"stage=19x19 step={completed_step}/{maximum_steps} minimum={minimum_steps} "
+                f"stage={control_count}x{control_count} "
+                f"step={completed_step}/{maximum_steps} minimum={minimum_steps} "
                 f"batch=complete loss={best:.6g} update={terminal_update} lr={lr:.6g} "
                 f"rel={terminal_relative:.3e} "
                 f"patience={no_improvement_attempts}/{config.early_stopping_patience}"
@@ -3517,6 +3573,7 @@ def _run_bound(
         improvement = (stage_initial - best) / stage_initial
         stage_summary = {
             "control_count": control_count,
+            "is_terminal_stage": is_terminal_stage,
             "initial_J": stage_initial,
             "initial_groups": stage_initial_groups,
             "best_J": best,
@@ -3540,9 +3597,10 @@ def _run_bound(
                 control_count=control_count,
                 minimum_steps=minimum_steps,
                 maximum_steps=maximum_steps,
+                terminal_control_count=terminal_control_count,
                 early_stopping_patience=config.early_stopping_patience,
                 relative_improvement_threshold=config.relative_improvement_threshold,
-                max_extra_19_steps=config.max_extra_19_steps,
+                max_extra_terminal_stage_steps=config.max_extra_terminal_stage_steps,
                 no_improvement_attempts=no_improvement_attempts,
                 stop_reason=stop_reason,
                 module=module,
@@ -3573,7 +3631,7 @@ def _run_bound(
                 f" minimum={minimum_steps} rel="
                 f"{float(history[-1]['relative_best_improvement']) if history else 0.0:.3e} "
                 f"patience={no_improvement_attempts}/{config.early_stopping_patience}"
-                if control_count == 19 else ""
+                if is_terminal_stage else ""
             )
         )
 
@@ -3607,6 +3665,9 @@ def _run_bound(
         for name in metric_names
     }
     runtime_seconds = prior_elapsed + time.time() - session_start
+    terminal_stage_summary = next(
+        stage for stage in stage_summaries if bool(stage["is_terminal_stage"])
+    )
     summary = {
         "identity_sha256": identity_sha256,
         "baseline_J": baseline_value,
@@ -3624,11 +3685,12 @@ def _run_bound(
             config.max_steps_7 + config.max_steps_11 + config.max_steps_19
         ),
         "actual_training_steps": sum(int(stage["actual_steps"]) for stage in stage_summaries),
-        "extra_19_steps": int(stage_summaries[-1]["extra_steps"]),
-        "training_stop_reason": str(stage_summaries[-1]["stop_reason"]),
+        "terminal_control_count": terminal_control_count,
+        "extra_terminal_stage_steps": int(terminal_stage_summary["extra_steps"]),
+        "training_stop_reason": str(terminal_stage_summary["stop_reason"]),
         "early_stopping_patience": config.early_stopping_patience,
         "relative_improvement_threshold": config.relative_improvement_threshold,
-        "max_extra_19_steps": config.max_extra_19_steps,
+        "max_extra_terminal_stage_steps": config.max_extra_terminal_stage_steps,
         "final_J": final_value,
         "final_metrics": _joint_metric_fields(final_value, final_health),
         "improvement_percent": 100 * (1 - final_value / baseline_value),
@@ -3662,6 +3724,7 @@ def _run_bound(
 
 
 def run(config: MinimalConfig, *, resume: bool = False) -> Path:
+    _training_stage_specs(config)
     torch.manual_seed(config.seed)
     device = torch.device(config.device)
     if device.type == "cuda" and not torch.cuda.is_available():

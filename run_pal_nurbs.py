@@ -52,27 +52,27 @@ def main() -> int:
         "--steps", type=int, nargs=3, metavar=("S7", "S11", "S19"),
         default=(MinimalConfig.max_steps_7, MinimalConfig.max_steps_11, MinimalConfig.max_steps_19),
         help=(
-            "7x7/11x11 的固定 attempt 数与 19x19 的最低 attempt 数；"
-            "拒绝的 attempt 同样计数"
+            "三个参数化阶段的最低 attempt 数；最后一个非零阶段为 terminal stage，"
+            "此前阶段固定执行，拒绝的 attempt 同样计数"
         ),
     )
     parser.add_argument(
         "--early-stopping-patience",
         type=int,
         default=MinimalConfig.early_stopping_patience,
-        help="19x19 达到最低预算后允许停止的连续无显著改善 attempt 数",
+        help="terminal stage 达到最低预算后允许停止的连续无显著改善 attempt 数",
     )
     parser.add_argument(
         "--relative-improvement-threshold",
         type=float,
         default=MinimalConfig.relative_improvement_threshold,
-        help="19x19 刷新 best 时用于重置 patience 的严格相对改善阈值",
+        help="terminal stage 刷新 best 时用于重置 patience 的严格相对改善阈值",
     )
     parser.add_argument(
-        "--max-extra-19-steps",
+        "--max-extra-terminal-stage-steps",
         type=int,
-        default=MinimalConfig.max_extra_19_steps,
-        help="19x19 最低预算后允许的最大额外 attempt 数",
+        default=MinimalConfig.max_extra_terminal_stage_steps,
+        help="terminal stage 最低预算后允许的最大额外 attempt 数",
     )
     parser.add_argument(
         "--smooth-lambda",
@@ -99,7 +99,7 @@ def main() -> int:
         max_steps_11=args.steps[1], max_steps_19=args.steps[2],
         early_stopping_patience=args.early_stopping_patience,
         relative_improvement_threshold=args.relative_improvement_threshold,
-        max_extra_19_steps=args.max_extra_19_steps,
+        max_extra_terminal_stage_steps=args.max_extra_terminal_stage_steps,
         smooth_lambda=args.smooth_lambda,
         candidate_trace_import=args.candidate_trace_import,
         forward_qualification_import=args.forward_qualification_import,

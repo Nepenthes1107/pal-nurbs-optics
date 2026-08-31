@@ -52,11 +52,14 @@ python -m biot.gui
 
 - 仅优化 PAL 后表面 cubic NURBS/B-spline 的 `zp`；`xp/yp/weight` 固定，边界控制环固定为零。
 - 控制网格为 `7x7 -> 11x11 -> 19x19`，通过精确 knot refinement 晋级。
-- `--steps S7 S11 S19` 中，7×7 和 11×11 恰好各运行 `S7`、`S11`
-  个完整 attempt，19×19 至少运行 `S19` 个；拒绝的候选也消耗 attempt。
-  达到最低总预算 `S7+S11+S19` 后只在 19×19 继续训练。默认 `S19=30`，
-  连续 7 个 attempt 未使 best 相对改善严格超过 `1e-3` 时 early stop，
-  最多额外运行 30 个 attempt。最低 19×19 配额前只累计 patience，不允许 early stop。
+- `--steps S7 S11 S19` 定义三个阶段的最低完整 attempt 数，拒绝的候选也消耗
+  attempt；最后一个非零阶段是 terminal stage。terminal 之前的阶段严格执行各自
+  固定配额，terminal 达到最低配额后才允许 early stop，并可由
+  `--max-extra-terminal-stage-steps` 追加最多 30 个 attempt。默认 `10/10/30`
+  的 terminal 为 19×19；例如 `50/10/0` 的 terminal 为 11×11，19×19 只做
+  不改变物理面形的精确 knot refinement。patience 从 terminal 第一步累计，最低
+  配额前不允许 early stop；连续 7 个 attempt 未使 best 相对改善严格超过
+  `1e-3` 时停止。
 - 109 个 case 分为 10 组：Far 20、Far-robustness 8、Corridor upper/middle/lower 各 5、
   Near 20、Near-robustness 8、Near-edge-astig 8、Peripheral-left/right 各 15。
 - 420-case WFNO 合格池的最终固定数量选择保持各自 `training_group`，并在不改变
@@ -121,14 +124,16 @@ python run_pal_nurbs.py `
   --steps 10 10 30 `
   --early-stopping-patience 7 `
   --relative-improvement-threshold 1e-3 `
-  --max-extra-19-steps 30 `
+  --max-extra-terminal-stage-steps 30 `
   --smooth-lambda 0.05
 ```
 
-该示例最低训练 50 个 attempt，最多训练 80 个 attempt。19×19 每个 attempt
+该示例最低训练 50 个 attempt，最多训练 80 个 attempt。terminal stage 每个 attempt
 完成后先原子保存 resume/history，再按 early stopping、学习率下限和额外预算
 顺序判断；最低预算前若学习率跌破下限，则 run 失败且不写成功 `summary.json`。
-最终结果始终加载 19×19 best state 并完成 109-case 无梯度复核后才标记 complete。
+后续零预算阶段只做精确 refinement；最终 19×19 表示完成 109-case 无梯度复核后
+才标记 complete。`summary.json` 显式记录 terminal control count、terminal extra
+attempt 数及其停止原因。
 
 普通 `--resume` 只允许恢复同一运行目录中 identity、配置、输入哈希、实现闭包、
 最低/最大预算、patience 计数和终止规则完全一致的 checkpoint。本次 early

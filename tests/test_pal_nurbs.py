@@ -30,6 +30,7 @@ from biot.e2e.pal_nurbs import (
     _retain_training_cache,
     _restore_optimizer_state,
     _stage_boundary_stop_reason,
+    _training_stage_specs,
     _torch_save_atomic,
     _evaluate,
     load_pal,
@@ -131,7 +132,10 @@ def test_main_training_phase_contract_is_nonlegacy_raw_psf() -> None:
         ({"max_steps_7": True}, "max_steps_7"),
         ({"max_steps_11": -1}, "max_steps_11"),
         ({"max_steps_19": -1}, "max_steps_19"),
-        ({"max_extra_19_steps": -1}, "max_extra_19_steps"),
+        (
+            {"max_extra_terminal_stage_steps": -1},
+            "max_extra_terminal_stage_steps",
+        ),
         ({"early_stopping_patience": 0}, "early_stopping_patience"),
         ({"early_stopping_patience": -1}, "early_stopping_patience"),
         ({"early_stopping_patience": 1.5}, "early_stopping_patience"),
@@ -146,7 +150,7 @@ def test_training_budget_config_rejects_invalid_values(kwargs, message) -> None:
         MinimalConfig(device="cpu", **kwargs)
 
 
-def test_19x19_patience_counts_every_attempt_and_resets_only_on_strict_improvement() -> None:
+def test_terminal_stage_patience_counts_every_attempt_and_resets_only_on_strict_improvement() -> None:
     refreshed, relative, significant, counter = _early_stopping_observation(
         best_before=1.0,
         candidate=0.5,
@@ -192,9 +196,10 @@ def test_19x19_patience_counts_every_attempt_and_resets_only_on_strict_improveme
     assert counter == 1
 
 
-def test_19x19_stop_order_suppresses_early_stopping_until_minimum() -> None:
+def test_terminal_stage_stop_order_suppresses_early_stopping_until_minimum() -> None:
     common = {
         "control_count": 19,
+        "is_terminal_stage": True,
         "minimum_steps": 10,
         "maximum_steps": 60,
         "learning_rate": 2.0e-3,
@@ -216,6 +221,26 @@ def test_19x19_stop_order_suppresses_early_stopping_until_minimum() -> None:
         completed_step=60,
         **{**common, "no_improvement_attempts": 0},
     ) == "max_extra_reached"
+
+
+def test_extra_budget_binds_to_last_nonzero_training_stage() -> None:
+    config = MinimalConfig(
+        device="cpu",
+        max_steps_7=50,
+        max_steps_11=10,
+        max_steps_19=0,
+        max_extra_terminal_stage_steps=5,
+    )
+    assert _training_stage_specs(config) == (
+        (7, 50, 50, False),
+        (11, 10, 15, True),
+        (19, 0, 0, False),
+    )
+
+    with pytest.raises(ValueError, match="at least one positive"):
+        _training_stage_specs(
+            replace(config, max_steps_7=0, max_steps_11=0, max_steps_19=0)
+        )
 
 
 def test_m2_is_finite_nonnegative_and_centroid_relative() -> None:
@@ -663,9 +688,10 @@ def test_stage_resume_roundtrip_preserves_model_adam_lr_history_and_best(tmp_pat
         control_count=7,
         minimum_steps=10,
         maximum_steps=10,
+        terminal_control_count=19,
         early_stopping_patience=7,
         relative_improvement_threshold=1.0e-4,
-        max_extra_19_steps=50,
+        max_extra_terminal_stage_steps=50,
         no_improvement_attempts=0,
         stop_reason=None,
         module=module,
@@ -687,9 +713,10 @@ def test_stage_resume_roundtrip_preserves_model_adam_lr_history_and_best(tmp_pat
         control_count=7,
         minimum_steps=10,
         maximum_steps=10,
+        terminal_control_count=19,
         early_stopping_patience=7,
         relative_improvement_threshold=1.0e-4,
-        max_extra_19_steps=50,
+        max_extra_terminal_stage_steps=50,
         device="cpu",
     )
     restored_module = FixedWeightNURBSPerturbation(7, device="cpu", dtype=torch.float64)
@@ -721,7 +748,7 @@ def test_stage_resume_roundtrip_preserves_model_adam_lr_history_and_best(tmp_pat
     assert not list(tmp_path.glob(".resume.pt.*.tmp"))
 
     legacy = copy.deepcopy(payload)
-    legacy["schema_version"] = 1
+    legacy["schema_version"] = 2
     legacy_path = tmp_path / "legacy_resume.pt"
     _torch_save_atomic(legacy_path, legacy)
     with pytest.raises(ValueError, match="state schema mismatch"):
@@ -731,9 +758,10 @@ def test_stage_resume_roundtrip_preserves_model_adam_lr_history_and_best(tmp_pat
             control_count=7,
             minimum_steps=10,
             maximum_steps=10,
+            terminal_control_count=19,
             early_stopping_patience=7,
             relative_improvement_threshold=1.0e-4,
-            max_extra_19_steps=50,
+            max_extra_terminal_stage_steps=50,
             device="cpu",
         )
 
@@ -1207,7 +1235,7 @@ def test_interrupted_training_resume_matches_uninterrupted_adam_state(
         max_steps_19=2,
         early_stopping_patience=1,
         relative_improvement_threshold=1.0,
-        max_extra_19_steps=5,
+        max_extra_terminal_stage_steps=5,
     )
     with pytest.raises(RuntimeError, match="synthetic stage interruption"):
         run(interrupted_config)
@@ -1245,7 +1273,8 @@ def test_interrupted_training_resume_matches_uninterrupted_adam_state(
     assert [stage["actual_steps"] for stage in resumed_summary["stages"]] == [1, 1, 2]
     assert resumed_summary["minimum_training_steps"] == 4
     assert resumed_summary["actual_training_steps"] == 4
-    assert resumed_summary["extra_19_steps"] == 0
+    assert resumed_summary["terminal_control_count"] == 19
+    assert resumed_summary["extra_terminal_stage_steps"] == 0
     assert resumed_summary["training_stop_reason"] == "early_stopping"
     assert resumed_summary["stages"][-1]["no_improvement_attempts"] == 2
     resumed_log = (tmp_path / "interrupted" / "training.log").read_text(encoding="utf-8")
@@ -1263,15 +1292,15 @@ def test_interrupted_training_resume_matches_uninterrupted_adam_state(
         interrupted_config,
         output=str(tmp_path / "extra_interrupted"),
         max_steps_7=0,
-        max_steps_11=0,
-        max_steps_19=1,
+        max_steps_11=1,
+        max_steps_19=0,
         early_stopping_patience=10,
-        max_extra_19_steps=2,
+        max_extra_terminal_stage_steps=2,
     )
     with pytest.raises(RuntimeError, match="synthetic stage interruption"):
         run(extra_config)
     extra_active = torch.load(
-        tmp_path / "extra_interrupted" / "stage_19x19" / "resume.pt",
+        tmp_path / "extra_interrupted" / "stage_11x11" / "resume.pt",
         map_location="cpu",
     )
     assert extra_active["completed_step"] == 1
@@ -1284,15 +1313,23 @@ def test_interrupted_training_resume_matches_uninterrupted_adam_state(
     )
     run(extra_uninterrupted)
     assert (
-        tmp_path / "extra_interrupted" / "stage_19x19" / "history.csv"
+        tmp_path / "extra_interrupted" / "stage_11x11" / "history.csv"
     ).read_bytes() == (
-        tmp_path / "extra_uninterrupted" / "stage_19x19" / "history.csv"
+        tmp_path / "extra_uninterrupted" / "stage_11x11" / "history.csv"
     ).read_bytes()
     extra_summary = json.loads(
         (tmp_path / "extra_interrupted" / "summary.json").read_text(encoding="utf-8")
     )
-    assert extra_summary["stages"][-1]["actual_steps"] == 3
-    assert extra_summary["stages"][-1]["extra_steps"] == 2
+    terminal_summary = next(
+        stage for stage in extra_summary["stages"] if stage["is_terminal_stage"]
+    )
+    assert terminal_summary["control_count"] == 11
+    assert terminal_summary["actual_steps"] == 3
+    assert terminal_summary["extra_steps"] == 2
+    assert extra_summary["stages"][-1]["control_count"] == 19
+    assert extra_summary["stages"][-1]["actual_steps"] == 0
+    assert extra_summary["terminal_control_count"] == 11
+    assert extra_summary["extra_terminal_stage_steps"] == 2
     assert extra_summary["training_stop_reason"] == "max_extra_reached"
     assert "update=MAX_EXTRA_REACHED" in (
         tmp_path / "extra_interrupted" / "training.log"
@@ -1302,8 +1339,8 @@ def test_interrupted_training_resume_matches_uninterrupted_adam_state(
     floor_config = replace(
         extra_config,
         output=str(tmp_path / "minimum_not_reached"),
-        max_steps_19=2,
-        max_extra_19_steps=0,
+        max_steps_11=2,
+        max_extra_terminal_stage_steps=0,
         minimum_learning_rate=1.5e-3,
         max_backtracks=0,
         step_sag_limit_mm=0.0,
@@ -1323,7 +1360,7 @@ def test_interrupted_training_resume_matches_uninterrupted_adam_state(
     post_floor_config = replace(
         floor_config,
         output=str(tmp_path / "learning_rate_floor"),
-        max_steps_19=1,
+        max_steps_11=1,
     )
     run(post_floor_config)
     post_floor_summary = json.loads(

@@ -1,6 +1,6 @@
 # 当前工程状态
 
-更新时间：2026-08-30。
+更新时间：2026-08-31。
 
 ## 当前主线
 
@@ -18,13 +18,16 @@
   GPU tensor 真实追迹，30 个周边 case 仅用可微面形 A_D，不进入光线追迹。
   默认 `case_batch_size=8`、`requested_np=256`、FFT `512`，不做 OOM 自动降级。
 - `main` 的分阶段训练输出统一显示 `stage/step/batch/loss/update/lr`，并写入 run 根目录 `training.log`；各阶段 `history.csv` 和 resume checkpoint 继续作为结构化恢复依据。
-- `--steps S7 S11 S19` 现定义最低训练预算：7×7/11×11 严格完成各自
-  attempt 数，19×19 至少完成 `S19`，随后按默认 patience 7、严格相对改善
-  阈值 `1e-4` 继续，最多额外 50 个 attempt。19×19 patience 从第一步累计，
-  但最低配额前不允许 early stop；旧的 11×11 整阶段改善门槛已删除。
-- 19×19 每次 attempt 后先原子保存 resume/history，再依次判断 early stopping、
+- `--steps S7 S11 S19` 定义三个阶段的最低训练预算，最后一个非零阶段为 terminal
+  stage；此前阶段严格完成固定 attempt 数，terminal 才使用 patience、严格相对
+  改善阈值和 `--max-extra-terminal-stage-steps`。例如 `50/10/0` 在 11×11 上
+  追加 extra/early-stop，19×19 只做精确 refinement。terminal patience 从第一步
+  累计，但最低配额前不允许 early stop。
+- terminal 每次 attempt 后先原子保存 resume/history，再依次判断 early stopping、
   学习率下限和额外预算。最低预算前学习率跌破下限会将 run 标为 failed 且不写
-  成功 summary；完成后始终加载 19×19 best state，再做完整 109-case 无梯度复核。
+  成功 summary；完成后后续零预算阶段只做精确 refinement，再以最终 19×19 表示
+  做完整 109-case 无梯度复核。summary 显式记录 terminal control count、extra
+  attempt 数和 terminal 停止原因。
 - 新训练合同统一使用 `D500/D1000/Dinf`；已完成的旧 `run_001` 保持历史训练身份，不原位改写。
 - `main` 与多物距分支均显式固定 `legacy_pupil_phase=False`、`phase_reference="biot_reference_sphere"`、`remove_tilt=False`；相位/PSF 表示变化已提升 run、case-layout 和 baseline schema，旧 checkpoint 不可按新合同恢复。
 - `evaluate_pal_nurbs.py` 在 `<run>/evaluation` 生成独立评价身份；三物距×双状态
@@ -55,8 +58,9 @@
 - `best_feasible` 必须来自完整覆盖周期且所有工程与健康约束通过。
 - 当前为去 tilt、单波长结果，不能外推为色差、棱镜、真实视物位置或几何畸变合格。
 - 普通 `--resume` 仅在同一目录 identity、配置、输入哈希、实现闭包及训练预算/
-  patience/阈值/计数完全一致时有效。19×19 early-stopping 改造已提升 run
-  identity 和 stage-resume schema，旧 run/checkpoint 不可续接。
+  patience/阈值/计数完全一致时有效。terminal-stage 额外预算合同已将 run
+  identity schema 提升为 8、stage-resume schema 提升为 3，旧 run/checkpoint
+  不可续接。
 - 跨平台 training-state、parity fixture、cloud_run 和 migration 导出链已废弃并删除。
 
 ## 资源与恢复
@@ -167,3 +171,13 @@ GPU PSF batch 即时刷新 `[pal-eval]` 控制台进度，显示条件内与全�
 完整测试 `.venv\Scripts\python.exe -m pytest tests -q --basetemp
 .tmp_pytest_eval_progress_full` 为 `198 passed`；`py_compile` 与 `git diff --check`
 通过。本次未运行正式评价，不形成新的光学或性能结论。
+
+2026-08-31 PAL terminal-stage 预算合同验收：额外预算不再固定属于 19×19，而是
+绑定到 `--steps` 最后一个非零训练阶段；CLI 更名为
+`--max-extra-terminal-stage-steps`，不保留旧参数别名。`50/10/0` 因此在 11×11
+执行最低 10 个及最多额外指定数量的 attempt，19×19 只做精确 refinement。
+run identity schema 提升为 8、stage-resume schema 提升为 3，旧 checkpoint 不可
+续接。PAL 定向测试 `43 passed`，完整测试
+`.venv\Scripts\python.exe -m pytest tests -q --basetemp .tmp_pytest_terminal_stage_full`
+为 `199 passed`；`py_compile` 与 `git diff --check` 通过。本次未启动正式训练，
+不形成新的优化收益结论。
