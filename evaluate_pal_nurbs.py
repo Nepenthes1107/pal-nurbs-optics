@@ -53,6 +53,12 @@ CSF_P = 0.7786
 CSF_GAIN = 373.08
 
 
+def _progress(**fields: Any) -> None:
+    """Emit one immediately visible, machine-readable evaluation progress line."""
+    payload = " ".join(f"{key}={value}" for key, value in fields.items())
+    print(f"[pal-eval] {payload}", flush=True)
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -487,6 +493,10 @@ def _build_condition_database(
         if partial_path.exists():
             raise ValueError(f"both final and partial PSF databases exist for {label}/{state}")
         _validate_condition_file(final_path, contract, verify_render_contract=True)
+        _progress(
+            phase="psf_database", condition=f"{completed_conditions + 1}/6",
+            name=f"{label}_{state}", fields=f"{FIELD_COUNT}/{FIELD_COUNT}", status="SKIP",
+        )
         return final_path
     if partial_path.exists() and not resume:
         raise FileExistsError(f"partial PSF database exists; use --resume: {partial_path}")
@@ -502,7 +512,16 @@ def _build_condition_database(
                 _validate_database_node(handle, index, verify_render_contract=True)
                 continue
             pending_indices.append(index)
-        for start in range(0, len(pending_indices), int(psf_batch_size)):
+        completed_in_condition = FIELD_COUNT - len(pending_indices)
+        batch_count = math.ceil(len(pending_indices) / int(psf_batch_size))
+        _progress(
+            phase="psf_database", condition=f"{completed_conditions + 1}/6",
+            name=f"{label}_{state}", fields=f"{completed_in_condition}/{FIELD_COUNT}",
+            pending=len(pending_indices), batch_size=int(psf_batch_size), status="RUNNING",
+        )
+        for batch_number, start in enumerate(
+            range(0, len(pending_indices), int(psf_batch_size)), start=1
+        ):
             batch_indices = pending_indices[start : start + int(psf_batch_size)]
             batch_cases = [cases[index] for index in batch_indices]
             with torch.no_grad():
@@ -541,12 +560,24 @@ def _build_condition_database(
                     ),
                     current_condition=f"{label}_{state}",
                 )
+            completed_in_condition += len(batch_indices)
+            _progress(
+                phase="psf_database", condition=f"{completed_conditions + 1}/6",
+                name=f"{label}_{state}", batch=f"{batch_number}/{batch_count}",
+                fields=f"{completed_in_condition}/{FIELD_COUNT}",
+                total=f"{completed_conditions * FIELD_COUNT + completed_in_condition}/{6 * FIELD_COUNT}",
+                status="DONE",
+            )
         for index in range(FIELD_COUNT):
             _validate_database_node(handle, index, verify_render_contract=True)
         handle.attrs["status"] = "complete"
         handle.flush()
     os.replace(partial_path, final_path)
     _validate_condition_file(final_path, contract, verify_render_contract=True)
+    _progress(
+        phase="psf_database", condition=f"{completed_conditions + 1}/6",
+        name=f"{label}_{state}", fields=f"{FIELD_COUNT}/{FIELD_COUNT}", status="COMPLETE",
+    )
     return final_path
 
 
@@ -569,6 +600,10 @@ def _build_psf_database(
     state_path = root / "psf_database_state.json"
     if manifest_path.is_file():
         _validate_psf_database(evaluation, config=config, identity_sha256=identity_sha256)
+        _progress(
+            phase="psf_database", conditions="6/6",
+            fields=f"{6 * FIELD_COUNT}/{6 * FIELD_COUNT}", status="SKIP",
+        )
         return manifest_path
     if state_path.is_file() and not resume:
         raise FileExistsError(f"PSF database state exists; use --resume: {state_path}")
@@ -608,6 +643,10 @@ def _build_psf_database(
         completed_conditions=6, completed_nodes=6 * FIELD_COUNT, current_condition=None,
     )
     _validate_psf_database(evaluation, config=config, identity_sha256=identity_sha256)
+    _progress(
+        phase="psf_database", conditions="6/6",
+        fields=f"{6 * FIELD_COUNT}/{6 * FIELD_COUNT}", status="COMPLETE",
+    )
     return manifest_path
 
 
@@ -724,11 +763,17 @@ def _run_weighted_mtf(
     }
     manifest_path = output / "weighted_mtf_manifest.json"
     if _stage_is_complete(manifest_path, stage_config):
+        _progress(phase="weighted_mtf", conditions="6/6", status="SKIP")
         return
     files: list[Path] = []
+    completed = 0
     for label, _, _ in _distance_cases(config):
         maps: dict[str, np.ndarray] = {}
         for state in ("baseline", "optimized"):
+            _progress(
+                phase="weighted_mtf", condition=f"{completed + 1}/6",
+                name=f"{label}_{state}", fields=f"0/{FIELD_COUNT}", status="RUNNING",
+            )
             with h5py.File(_condition_path(evaluation, label, state), "r") as handle:
                 scores = [
                     _weighted_mtf(handle["raw_psf"][index],
@@ -736,6 +781,11 @@ def _run_weighted_mtf(
                     for index in range(FIELD_COUNT)
                 ]
             maps[state] = np.asarray(scores).reshape(len(FIELD_VALUES), len(FIELD_VALUES))[::-1]
+            completed += 1
+            _progress(
+                phase="weighted_mtf", condition=f"{completed}/6",
+                name=f"{label}_{state}", fields=f"{FIELD_COUNT}/{FIELD_COUNT}", status="DONE",
+            )
         maps["delta"] = maps["optimized"] - maps["baseline"]
         for state in ("baseline", "optimized", "delta"):
             numeric = output / f"{label}_{state}_mean_map.npz"
@@ -748,6 +798,7 @@ def _run_weighted_mtf(
                       symmetric=state == "delta")
             files.extend((numeric, image))
     _write_stage_manifest(manifest_path, config=stage_config, files=files)
+    _progress(phase="weighted_mtf", conditions="6/6", status="COMPLETE")
 
 
 def _normalize_display(image: np.ndarray) -> np.ndarray:
@@ -876,10 +927,16 @@ def _run_psf_stitches(
     }
     manifest_path = output / "psf_stitch_manifest.json"
     if _stage_is_complete(manifest_path, stage_config):
+        _progress(phase="psf_stitch", conditions="6/6", status="SKIP")
         return
     files: list[Path] = []
+    completed = 0
     for label, _, _ in _distance_cases(config):
         for state in ("baseline", "optimized"):
+            _progress(
+                phase="psf_stitch", condition=f"{completed + 1}/6",
+                name=f"{label}_{state}", status="RUNNING",
+            )
             with h5py.File(_condition_path(evaluation, label, state), "r") as handle:
                 canvas = _stitch_canvas(handle["render_psf"][:], handle["field_xy_deg"][:])
             numeric, image = (
@@ -889,7 +946,13 @@ def _run_psf_stitches(
             np.savez_compressed(numeric, image=canvas)
             _save_psf_stitch_figure(image, canvas)
             files.extend((numeric, image))
+            completed += 1
+            _progress(
+                phase="psf_stitch", condition=f"{completed}/6",
+                name=f"{label}_{state}", status="DONE",
+            )
     _write_stage_manifest(manifest_path, config=stage_config, files=files)
+    _progress(phase="psf_stitch", conditions="6/6", status="COMPLETE")
 
 
 def _chart_tile(chart: np.ndarray, render_psf: np.ndarray, blur_scale: float) -> np.ndarray:
@@ -930,10 +993,16 @@ def _run_chart_stitches(
     }
     manifest_path = output / "chart_stitch_manifest.json"
     if _stage_is_complete(manifest_path, stage_config):
+        _progress(phase="chart_stitch", conditions="6/6", status="SKIP")
         return
     files: list[Path] = []
+    completed = 0
     for label, _, _ in _distance_cases(config):
         for state in ("baseline", "optimized"):
+            _progress(
+                phase="chart_stitch", condition=f"{completed + 1}/6",
+                name=f"{label}_{state}", fields=f"0/{FIELD_COUNT}", status="RUNNING",
+            )
             with h5py.File(_condition_path(evaluation, label, state), "r") as handle:
                 render = np.asarray(handle["render_psf"][:])
                 fields = np.asarray(handle["field_xy_deg"][:])
@@ -947,7 +1016,13 @@ def _run_chart_stitches(
             np.savez_compressed(numeric, image=canvas, blur_scale=float(blur_scale))
             _save_chart_stitch_figure(image, canvas)
             files.extend((numeric, image))
+            completed += 1
+            _progress(
+                phase="chart_stitch", condition=f"{completed}/6",
+                name=f"{label}_{state}", fields=f"{FIELD_COUNT}/{FIELD_COUNT}", status="DONE",
+            )
     _write_stage_manifest(manifest_path, config=stage_config, files=files)
+    _progress(phase="chart_stitch", conditions="6/6", status="COMPLETE")
 
 
 def _write_evaluation_state(
@@ -1046,6 +1121,10 @@ def evaluate(
         raise ValueError("existing evaluation identity does not match current source/checkpoint")
     _write_json(identity_path, identity)
     identity_sha256 = str(identity["identity_sha256"])
+    _progress(
+        phase="startup", device=device_name, resume=resume,
+        psf_batch_size=int(psf_batch_size), status="COMPLETE",
+    )
     _write_evaluation_state(
         evaluation, identity_sha256=identity_sha256, status="running", phase="psf_database"
     )
@@ -1057,7 +1136,9 @@ def evaluate(
         config, device, None if hasattr(pal, "DISTANCE_SPECS") else control_count
     )
     _state_map(module_optimized, state_dict)
+    _progress(phase="sag_averfang", status="RUNNING")
     _save_sag_and_averfang(evaluation, base_sag, module_optimized, power_config)
+    _progress(phase="sag_averfang", status="COMPLETE")
     database_manifest_path = _build_psf_database(
         evaluation, config=config,
         modules={"baseline": module_baseline, "optimized": module_optimized},
@@ -1111,6 +1192,7 @@ def evaluate(
     _write_evaluation_state(
         evaluation, identity_sha256=identity_sha256, status="complete", phase="complete"
     )
+    _progress(phase="complete", output=evaluation, status="COMPLETE")
     return evaluation
 
 

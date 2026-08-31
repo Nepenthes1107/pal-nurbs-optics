@@ -57,7 +57,7 @@ def test_render_psf_rejects_insufficient_native_support(monkeypatch) -> None:
 
 
 def test_condition_hdf5_resumes_exact_nodes_and_fails_on_corruption(
-    tmp_path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.setattr(evaluator, "FIELD_VALUES", (-1.0, 1.0))
     monkeypatch.setattr(evaluator, "FIELD_COUNT", 4)
@@ -126,6 +126,10 @@ def test_condition_hdf5_resumes_exact_nodes_and_fails_on_corruption(
     assert first.batch_sizes == [3]
     assert resumed.calls == 1
     assert resumed.batch_sizes == [1]
+    progress = capsys.readouterr().out
+    assert "[pal-eval] phase=psf_database condition=1/6 name=D500_baseline" in progress
+    assert "batch=1/1 fields=4/4 total=4/24 status=DONE" in progress
+    assert "fields=4/4 status=COMPLETE" in progress
     assert final.name == "D500_baseline.h5"
     assert not partial.exists()
     with h5py.File(final, "r") as handle:

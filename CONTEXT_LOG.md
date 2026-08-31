@@ -32,6 +32,8 @@
   PSF及最小恢复信息。只有数据库整体 `complete` 后才运行 weighted-MTF Mean、
   PSF stitch 和 chart stitch；chart 的 `blur-scale` 默认 4且仅影响显示。
 - PSF 数据库默认通过 `raw_psf_batch()` 以 `psf_batch_size=8` 做原生 FFT PSF case 批量追迹；批大小纳入评价 identity。已完成 HDF5 节点仍逐个核验，未完成节点按小批量恢复；不自动缩批或串行回退。
+- `evaluate_pal_nurbs.py` 的控制台进度统一使用 `[pal-eval]`，显示当前阶段、条件、
+  PSF batch、条件内及全局场点完成数；恢复时显式报告已跳过的完整条件/阶段。
 
 ## 历史 r12
 
@@ -158,3 +160,10 @@ true-traceable 改为叉号、post-qualification eligible 改为空心圆。`cor
 forward WFNO、phase qualification、覆盖门禁和最终 case 几何/距离校验仍保持硬失败。
 历史 clearance 参数仅为旧配置和调用兼容保留，不再进入 candidate eligibility 或 coverage
 定义；方法名和 run identity schema 已更新，旧 candidate-trace 进度不能直接恢复。
+
+2026-08-31 PAL 评价进度输出验收：`evaluate_pal_nurbs.py` 现在按阶段、六个条件和
+GPU PSF batch 即时刷新 `[pal-eval]` 控制台进度，显示条件内与全局场点完成数；
+`--resume` 会显式报告完整条件/阶段的 `status=SKIP`。评价器定向测试 `9 passed`，
+完整测试 `.venv\Scripts\python.exe -m pytest tests -q --basetemp
+.tmp_pytest_eval_progress_full` 为 `198 passed`；`py_compile` 与 `git diff --check`
+通过。本次未运行正式评价，不形成新的光学或性能结论。
