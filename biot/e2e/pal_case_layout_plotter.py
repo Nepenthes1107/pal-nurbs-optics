@@ -15,14 +15,15 @@ import numpy as np
 from matplotlib.lines import Line2D
 
 
+# These are the five disjoint physical partitions used by case selection.
+# corridor_flank is a diagnostic submask wholly contained in corridor and is
+# deliberately rendered with the corridor color.
 PARTITION_ORDER = (
-    "far", "corridor", "corridor_flank", "near",
-    "peripheral_astig_left", "peripheral_astig_right",
+    "far", "corridor", "near", "peripheral_astig_left", "peripheral_astig_right",
 )
 ZONE_COLORS = {
     "far": "#4c78a8",
     "corridor": "#b279a2",
-    "corridor_flank": "#d4a6c8",
     "near": "#59a14f",
     "peripheral_astig_left": "#e15759",
     "peripheral_astig_right": "#f28e2b",
@@ -30,7 +31,6 @@ ZONE_COLORS = {
 ZONE_LABELS = {
     "far": "Far",
     "corridor": "Intermediate corridor",
-    "corridor_flank": "Corridor flank",
     "near": "Near",
     "peripheral_astig_left": "Peripheral-left",
     "peripheral_astig_right": "Peripheral-right",
@@ -38,6 +38,13 @@ ZONE_LABELS = {
 PARTITION_PALETTE = ("#f5f5f5",) + tuple(
     ZONE_COLORS[zone] for zone in PARTITION_ORDER
 )
+ZONE_REFERENCE_NAMES = {
+    "far": "far",
+    "corridor": "corridor",
+    "near": "near",
+    "peripheral_astig_left": "astig_left",
+    "peripheral_astig_right": "astig_right",
+}
 GROUP_STYLES = {
     "far": ("#174a7e", "o", "Far"),
     "far_robustness": ("#5b8db8", "o", "Far robustness"),
@@ -107,11 +114,18 @@ def _save(fig, path: Path) -> None:
     plt.close(fig)
 
 
-def render(*, zones_path: Path, candidates_path: Path, manifest_path: Path, output: Path) -> None:
+def render(
+    *, zones_path: Path, candidates_path: Path, manifest_path: Path,
+    dense_candidates_path: Path | None = None, output: Path,
+) -> None:
     zones = _read(zones_path)
     candidate_payload = _read(candidates_path)
     manifest = _read(manifest_path)
     candidates = list(candidate_payload["candidates"])
+    dense_candidates = candidates
+    if dense_candidates_path is not None:
+        dense_payload = _read(dense_candidates_path)
+        dense_candidates = list(dense_payload["candidates"])
     cases = list(manifest["cases"])
     total = len(cases)
     output.mkdir(parents=True, exist_ok=True)
@@ -137,17 +151,48 @@ def render(*, zones_path: Path, candidates_path: Path, manifest_path: Path, outp
     ax.scatter(
         [row["reference_lens_x_mm"] for row in traceable],
         [row["reference_lens_physical_y_mm"] for row in traceable],
-        s=3, c="#5f6368", alpha=0.20, linewidths=0,
+        s=16, c="#5f6368", alpha=0.45, linewidths=0.6, marker="x",
         label=f"True-traceable (n={len(traceable)})", zorder=3,
     )
     ax.scatter(
         [row["reference_lens_x_mm"] for row in eligible],
         [row["reference_lens_physical_y_mm"] for row in eligible],
-        s=5, c="#111111", alpha=0.38, linewidths=0,
+        s=26, facecolors="none", edgecolors="#111111", alpha=0.85,
+        linewidths=0.8, marker="o",
         label=f"Eligible after safety margin (n={len(eligible)})", zorder=4,
     )
     ax.legend(loc="upper right", fontsize=8)
     _save(fig, output / "candidate_reachability_on_lens.png")
+
+    fig, ax = plt.subplots(figsize=(8.4, 7.3))
+    dense_ok = sum(row.get("trace_status") == "ok" for row in dense_candidates)
+    dense_failed = len(dense_candidates) - dense_ok
+    _plot_base(
+        ax,
+        zones,
+        "Dense object-field grid mapped to PAL rear-surface coordinates "
+        f"(ok={dense_ok}, failed={dense_failed}; failed points omitted)",
+    )
+    dense_by_zone = {
+        zone: [
+            row for row in dense_candidates
+            if row.get("trace_status") == "ok"
+            and row.get("reference_partition_zone") == ZONE_REFERENCE_NAMES[zone]
+        ]
+        for zone in PARTITION_ORDER
+    }
+    for zone in PARTITION_ORDER:
+        rows = dense_by_zone[zone]
+        if not rows:
+            continue
+        ax.scatter(
+            [row["reference_lens_x_mm"] for row in rows],
+            [row["reference_lens_physical_y_mm"] for row in rows],
+            s=5, c=ZONE_COLORS[zone], alpha=0.55, linewidths=0,
+            label=f"{ZONE_LABELS[zone]} (n={len(rows)})", zorder=4,
+        )
+    ax.legend(loc="upper right", fontsize=8)
+    _save(fig, output / "dense_candidate_grid_on_lens.png")
 
     fig, ax = plt.subplots(figsize=(8.4, 7.3))
     _plot_base(ax, zones, f"{total} training cases over the reachable safe domain")
@@ -209,12 +254,14 @@ def main() -> int:
     parser.add_argument("--zones", type=Path, required=True)
     parser.add_argument("--candidates", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument("--dense-candidates", type=Path, default=None)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     render(
         zones_path=args.zones,
         candidates_path=args.candidates,
         manifest_path=args.manifest,
+        dense_candidates_path=args.dense_candidates,
         output=args.output,
     )
     return 0

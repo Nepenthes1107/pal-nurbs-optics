@@ -145,3 +145,10 @@ membership 通过，coverage `overall_passed=true` 且失败门禁为空，phase
 “背景 + 6 分区”完整调色板；已用 `run_004/preoptimization` 重生成分区图及相关图，
 并新增颜色表长度/顺序回归测试。该修复只影响可视化，不改变 zones mask、候选点或训练
 case 数值数据。
+
+2026-08-31 V3 预优化密集物理网格图：新增 `dense_candidate_fields.json` 与
+`dense_candidate_grid_on_lens.png`，显示全部物方 1° 密集场点经 Original PAL
+中心瞳孔光线追迹后的后表面物理坐标；与 qualified candidate 图分开，避免把 364
+个资格池点误认为 10,556 个密集场点。`candidate_reachability_on_lens.png` 中
+true-traceable 改为叉号、eligible 改为空心圆。`corridor_flank` 明确标为 corridor
+的诊断子 mask，不再作为独立训练分区。

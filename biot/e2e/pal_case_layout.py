@@ -823,13 +823,20 @@ def partition_audit(payload: Mapping[str, Any], cases: Sequence[Mapping[str, Any
     for zone in PARTITION_ORDER:
         final = int(np.count_nonzero(masks[zone]))
         source = int(dict(topology.get(zone, {})).get("source_pixel_count", final))
-        zones[zone] = {
+        audit = {
             "source_pixel_count": source, "final_pixel_count": final,
             "topology_removed_pixel_count": source - final,
             "topology_retained_fraction": final / source if source else None,
             "statistics": stats.get(zone),
             "training_case_count": sum(case.get("training_group") in zone_groups[zone] for case in cases),
         }
+        if zone == "corridor_flank":
+            audit.update({
+                "role": "diagnostic_submask",
+                "included_in_partition": "corridor",
+                "training_case_count": 0,
+            })
+        zones[zone] = audit
     return {"interpretation": "topology retention and physical zone extent are reported separately", "zones": zones}
 
 
@@ -1663,7 +1670,8 @@ def _validate_selected_candidate_membership(
 
 
 def _run_case_layout_plotter(
-    *, output: Path, zones_json: str | Path, candidate_json: Path, manifest_json: Path
+    *, output: Path, zones_json: str | Path, candidate_json: Path,
+    manifest_json: Path, dense_candidate_json: Path | None = None,
 ) -> None:
     """Render plots in a clean no-Torch process to avoid duplicate Windows OpenMP runtimes."""
     script = Path(__file__).with_name("pal_case_layout_plotter.py")
@@ -1675,6 +1683,8 @@ def _run_case_layout_plotter(
         "--manifest", str(manifest_json.resolve()),
         "--output", str(output.resolve()),
     ]
+    if dense_candidate_json is not None:
+        command.extend(["--dense-candidates", str(dense_candidate_json.resolve())])
     completed = subprocess.run(command, capture_output=True, text=True, check=False)
     if completed.returncode != 0:
         raise RuntimeError(
@@ -1688,6 +1698,7 @@ def write_preoptimization_artifacts(
     zones_json: str | Path, candidates: Sequence[Mapping[str, Any]],
     cases: Sequence[Mapping[str, Any]], reference_distance_mm: float,
     sampling_contract: Mapping[str, Any],
+    dense_candidates: Sequence[Mapping[str, Any]] | None = None,
 ) -> Path:
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
@@ -1720,6 +1731,29 @@ def write_preoptimization_artifacts(
     }
     candidate_json = output / "candidate_fields.json"
     candidate_json.write_text(json.dumps(candidate_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    dense_payload = list(candidates if dense_candidates is None else dense_candidates)
+    dense_candidate_json = output / "dense_candidate_fields.json"
+    dense_candidate_json.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "reference_distance_mm": reference_distance_mm,
+                "sampling_contract": dict(sampling_contract),
+                "candidate_record_count": len(dense_payload),
+                "trace_success_count": sum(
+                    row.get("trace_status") == "ok" for row in dense_payload
+                ),
+                "trace_failure_count": sum(
+                    row.get("trace_status") != "ok" for row in dense_payload
+                ),
+                "candidates": [dict(row) for row in dense_payload],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     reachability = coverage_audit(payload, candidates, cases)
     coverage_json = output / "coverage_audit.json"
     coverage_json.write_text(
@@ -1765,5 +1799,6 @@ def write_preoptimization_artifacts(
         zones_json=zones_json,
         candidate_json=candidate_json,
         manifest_json=manifest_json,
+        dense_candidate_json=dense_candidate_json,
     )
     return output

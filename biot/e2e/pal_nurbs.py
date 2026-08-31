@@ -1848,6 +1848,7 @@ def _prepare_case_layout(
         # domains after failed pool candidates have been excluded.
         candidates=qualified_pool,
         cases=training_cases,
+        dense_candidates=traced_candidates,
         reference_distance_mm=config.far_object_distance_mm,
         sampling_contract={
             "method": (

@@ -138,6 +138,13 @@ training-state/parity 导入。
 校验，镜片内容 SHA-256 与物理追迹参数也必须匹配；Linux/Windows checkout 的
 绝对路径不是物理身份字段。forward/final-phase 进度仍须严格匹配 pool identity。
 
+预优化产物还包括 `dense_candidate_fields.json` 与
+`dense_candidate_grid_on_lens.png`：前者保存全部物方密集场点经真实 PAL 追迹后
+映射到镜片后表面的物理坐标，后者用于与资格池候选点图比较。
+`candidate_reachability_on_lens.png` 使用叉号表示 true-traceable、空心圆表示
+safety-margin 后 eligible。`corridor_flank` 是 `corridor` 内部的诊断子 mask，
+不是独立训练分区或独立 loss；分区分类和训练 case 均纳入 `corridor`。
+
 ## 验证
 
 ```powershell

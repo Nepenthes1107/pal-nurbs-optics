@@ -337,6 +337,7 @@ def test_preoptimization_artifacts_record_candidates_and_ten_groups(tmp_path) ->
     )
     for name in (
         "candidate_fields.json", "case_manifest.json", "coverage_audit.json",
+        "dense_candidate_fields.json", "dense_candidate_grid_on_lens.png",
         "partition_map.png", "candidate_reachability_on_lens.png",
         "training_cases_on_lens.png",
         "training_cases_on_lens_assigned_distance.png",
