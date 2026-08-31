@@ -36,6 +36,7 @@ from .pal_case_layout import (
     _sha256_file,
     classify_partition_point,
     generate_dense_candidate_fields,
+    qualified_source_key,
     select_training_cases,
     trace_candidate_fields,
     write_preoptimization_artifacts,
@@ -177,7 +178,7 @@ class MinimalConfig:
 
 
 RUN_IDENTITY_SCHEMA_VERSION = 6
-CASE_LAYOUT_STATE_SCHEMA_VERSION = 8
+CASE_LAYOUT_STATE_SCHEMA_VERSION = 9
 BASELINE_STATE_SCHEMA_VERSION = 6
 BASELINE_PROGRESS_SCHEMA_VERSION = 6
 STAGE_RESUME_SCHEMA_VERSION = 2
@@ -1621,18 +1622,9 @@ def _prepare_case_layout(
         pool_identity_sha256=pool_identity,
         progress_name="final phase qualification progress",
     )
-    def pool_match_key(row: Mapping[str, Any]) -> tuple[str, str, float, float, float]:
-        return (
-            str(row["training_group"]),
-            str(row["candidate_id"]),
-            round(float(row["distance_mm"]), 9),
-            round(float(row["field_x_deg"]), 9),
-            round(float(row["field_y_deg"]), 9),
-        )
-
     qualified_pool_by_key: dict[tuple[str, str, float, float, float], dict[str, Any]] = {}
     for pool_row in qualified_pool:
-        key = pool_match_key(pool_row)
+        key = qualified_source_key(pool_row)
         if key in qualified_pool_by_key:
             raise ValueError(
                 "qualified pool contains duplicate stable case key: "
@@ -1642,7 +1634,7 @@ def _prepare_case_layout(
         qualified_pool_by_key[key] = pool_row
 
     def pool_case_for_final_case(case: Mapping[str, Any]) -> dict[str, Any]:
-        key = pool_match_key(case)
+        key = qualified_source_key(case)
         pool_case = qualified_pool_by_key.get(key)
         if pool_case is None:
             raise ValueError(
@@ -1671,7 +1663,7 @@ def _prepare_case_layout(
             if pool_case is None and attempt.get("training_group") is not None:
                 try:
                     pool_case = qualified_pool_by_key.get(
-                        pool_match_key({
+                        qualified_source_key({
                             "training_group": attempt["training_group"],
                             "candidate_id": attempt["candidate_id"],
                             "distance_mm": attempt["distance_mm"],

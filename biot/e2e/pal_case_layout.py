@@ -59,6 +59,67 @@ GROUP_TO_ZONE = {
 }
 
 
+def qualified_source_key(
+    row: Mapping[str, Any],
+) -> tuple[str, str, float, float, float]:
+    """Return the stable identity of one group-specific qualification record."""
+    return (
+        str(row["training_group"]),
+        str(row["candidate_id"]),
+        round(float(row["distance_mm"]), 9),
+        round(float(row["field_x_deg"]), 9),
+        round(float(row["field_y_deg"]), 9),
+    )
+
+
+def _candidate_physical_identity(
+    row: Mapping[str, Any],
+) -> tuple[str, float, float, str, float, float]:
+    """Identify the unique dense-field source represented by a pool record."""
+    return (
+        str(row["candidate_id"]),
+        round(float(row["field_x_deg"]), 9),
+        round(float(row["field_y_deg"]), 9),
+        str(row.get("reference_partition_zone")),
+        round(float(row["reference_lens_x_mm"]), 9),
+        round(float(row["reference_lens_physical_y_mm"]), 9),
+    )
+
+
+def _unique_physical_candidate_rows(
+    candidates: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Collapse legitimate cross-group reuse without hiding identity conflicts."""
+    unique: dict[str, dict[str, Any]] = {}
+    identities: dict[str, tuple[str, float, float, str, float, float]] = {}
+    for row in candidates:
+        candidate_id = str(row.get("candidate_id", ""))
+        if not candidate_id:
+            raise ValueError("candidate records must contain non-empty candidate ids")
+        identity = _candidate_physical_identity(row)
+        prior = identities.get(candidate_id)
+        if prior is not None and prior != identity:
+            raise ValueError(
+                f"candidate id {candidate_id} has conflicting physical source records"
+            )
+        if candidate_id in unique:
+            prior_status = unique[candidate_id].get("trace_status")
+            current_status = row.get("trace_status")
+            if prior_status != current_status:
+                raise ValueError(
+                    f"candidate id {candidate_id} has conflicting trace status records"
+                )
+            # Final phase qualification is group-specific.  A shared physical
+            # source remains in the combined spatial coverage domain when at
+            # least one of its group records is still eligible.
+            unique[candidate_id]["eligible"] = bool(
+                unique[candidate_id].get("eligible")
+            ) or bool(row.get("eligible"))
+        identities[candidate_id] = identity
+        unique.setdefault(candidate_id, dict(row))
+    return list(unique.values())
+
+
 def _read_json(path: str | Path) -> dict[str, Any]:
     payload = json.loads(Path(path).read_text(encoding="utf-8-sig"))
     if not isinstance(payload, dict):
@@ -869,6 +930,7 @@ def coverage_audit(
     cases: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
     """Quantify full masks, true-traceable candidates, safe candidates and FPS coverage."""
+    physical_candidates = _unique_physical_candidate_rows(candidates)
     x, y, masks = _zone_arrays(payload)
     pitch_x = float(np.median(abs(np.diff(x))))
     pitch_y = float(np.median(abs(np.diff(y))))
@@ -890,7 +952,7 @@ def coverage_audit(
     corridor_min, corridor_max = sorted(float(value) for value in corridor_range)
 
     safe_peripheral = [
-        row for row in candidates
+        row for row in physical_candidates
         if row.get("trace_status") == "ok"
         and bool(row.get("eligible"))
         and row.get("reference_partition_zone") in {"astig_left", "astig_right"}
@@ -904,7 +966,7 @@ def coverage_audit(
     zones: dict[str, Any] = {}
     for mask_name, (zone_name, group_names) in zone_specs.items():
         traceable = [
-            row for row in candidates
+            row for row in physical_candidates
             if row.get("trace_status") == "ok" and row.get("reference_partition_zone") == zone_name
         ]
         eligible = [row for row in traceable if bool(row.get("eligible"))]
@@ -1020,7 +1082,7 @@ def coverage_audit(
         if not bool(band["coverage_gate"]["passed"])
     )
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "interpretation": (
             "Coverage is contracted on zone intersection true-traceable candidates intersection safety margin; "
             "the complete raster mask can contain physically unreachable cells. Occupied-cell fractions count "
@@ -1028,12 +1090,18 @@ def coverage_audit(
             "values are selected/candidate envelopes only and are likewise not physical zone-area claims."
         ),
         "mask_grid_pitch_mm": {"x": pitch_x, "physical_y": pitch_y},
-        "candidate_count": len(candidates),
-        "trace_success_count": sum(row.get("trace_status") == "ok" for row in candidates),
-        "trace_failure_count": sum(row.get("trace_status") != "ok" for row in candidates),
+        "candidate_record_count": len(candidates),
+        "candidate_count": len(physical_candidates),
+        "candidate_reuse_count": len(candidates) - len(physical_candidates),
+        "trace_success_count": sum(
+            row.get("trace_status") == "ok" for row in physical_candidates
+        ),
+        "trace_failure_count": sum(
+            row.get("trace_status") != "ok" for row in physical_candidates
+        ),
         "unclassified_trace_success_count": sum(
             row.get("trace_status") == "ok" and row.get("reference_partition_zone") is None
-            for row in candidates
+            for row in physical_candidates
         ),
         "overall_passed": not failed_coverage,
         "failed_coverage_gates": failed_coverage,
@@ -1271,20 +1339,46 @@ def _validate_selected_candidate_membership(
     cases: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
     candidate_ids = [str(row.get("candidate_id", "")) for row in candidates]
-    if not all(candidate_ids) or len(set(candidate_ids)) != len(candidate_ids):
-        raise ValueError("candidate grid must contain unique non-empty candidate ids")
+    if not candidate_ids or not all(candidate_ids):
+        raise ValueError("candidate records must contain non-empty candidate ids")
+    tagged = [row.get("training_group") is not None for row in candidates]
+    if any(tagged) and not all(tagged):
+        raise ValueError(
+            "candidate records must either all omit training_group or all retain it"
+        )
+    group_qualified_pool = all(tagged)
+    physical_candidates = _unique_physical_candidate_rows(candidates)
+    if not group_qualified_pool and len(physical_candidates) != len(candidates):
+        raise ValueError("dense candidate grid must contain unique candidate ids")
     case_ids = [str(case.get("case_id", "")) for case in cases]
     selected_candidate_ids = [str(case.get("candidate_id", "")) for case in cases]
     if not all(case_ids) or len(set(case_ids)) != len(case_ids):
         raise ValueError("training cases must contain unique non-empty case ids")
     if not all(selected_candidate_ids):
         raise ValueError("training cases must select non-empty candidate ids")
-    lookup = {str(row["candidate_id"]): row for row in candidates}
+    if group_qualified_pool:
+        candidate_keys = [qualified_source_key(row) for row in candidates]
+        if len(set(candidate_keys)) != len(candidate_keys):
+            raise ValueError(
+                "qualified candidate pool contains duplicate stable source keys"
+            )
+        lookup: dict[Any, Mapping[str, Any]] = {
+            qualified_source_key(row): row for row in candidates
+        }
+    else:
+        lookup = {str(row["candidate_id"]): row for row in candidates}
     maximum_reference_retrace_error = 0.0
     for case in cases:
         candidate_id = str(case["candidate_id"])
-        candidate = lookup.get(candidate_id)
+        lookup_key: Any = (
+            qualified_source_key(case) if group_qualified_pool else candidate_id
+        )
+        candidate = lookup.get(lookup_key)
         if candidate is None:
+            if group_qualified_pool:
+                raise ValueError(
+                    f"training case selects unknown qualified source {lookup_key!r}"
+                )
             raise ValueError(f"training case selects unknown candidate {candidate_id}")
         if candidate.get("trace_status") != "ok" or not bool(candidate.get("eligible")):
             raise ValueError(f"training case selects non-eligible candidate {candidate_id}")
@@ -1311,6 +1405,11 @@ def _validate_selected_candidate_membership(
         )
     return {
         "passed": True,
+        "candidate_domain": (
+            "group_qualified_pool" if group_qualified_pool else "dense_candidate_grid"
+        ),
+        "candidate_record_count": len(candidates),
+        "unique_source_candidate_count": len(physical_candidates),
         "selected_candidate_count": len(selected_candidate_ids),
         "unique_case_id_count": len(set(case_ids)),
         "unique_candidate_id_count": len(set(selected_candidate_ids)),
@@ -1357,15 +1456,24 @@ def write_preoptimization_artifacts(
     if mismatches:
         raise ValueError("selected reference rays do not belong to declared partitions: " + ", ".join(mismatches))
     membership_audit = _validate_selected_candidate_membership(candidates, cases)
+    physical_candidates = _unique_physical_candidate_rows(candidates)
     geometry_audit = _validate_selected_case_geometry(
         payload, cases, candidates, sampling_contract
     )
     candidate_payload = {
-        "schema_version": 1, "reference_distance_mm": reference_distance_mm,
-        "sampling_contract": dict(sampling_contract), "candidate_count": len(candidates),
-        "trace_failure_count": sum(row.get("trace_status") != "ok" for row in candidates),
-        "eligible_count": sum(bool(row.get("eligible")) for row in candidates),
-        "candidates": [dict(row) for row in candidates],
+        "schema_version": 2,
+        "reference_distance_mm": reference_distance_mm,
+        "sampling_contract": dict(sampling_contract),
+        "candidate_record_count": len(candidates),
+        "candidate_count": len(physical_candidates),
+        "candidate_reuse_count": len(candidates) - len(physical_candidates),
+        "trace_failure_count": sum(
+            row.get("trace_status") != "ok" for row in physical_candidates
+        ),
+        "eligible_count": sum(
+            bool(row.get("eligible")) for row in physical_candidates
+        ),
+        "candidates": physical_candidates,
     }
     candidate_json = output / "candidate_fields.json"
     candidate_json.write_text(json.dumps(candidate_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -1381,7 +1489,7 @@ def write_preoptimization_artifacts(
         )
 
     manifest = {
-        "schema_version": 6,
+        "schema_version": 7,
         "purpose": f"pal_nurbs_dense_field_fps_{TOTAL_TRAINING_CASES}_case_contract",
         "source": {
             "excel": {"path": str(excel_path), "sha256": _sha256_file(excel_path)},

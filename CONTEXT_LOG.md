@@ -108,3 +108,15 @@ corridor/near PAL 连续 OPD 对 BIOT NumPy 拟合的直接验证通过；完整
 forward-qualification 进度。完整测试
 `.venv\Scripts\python.exe -m pytest tests -q --basetemp .tmp_pytest_group_pool_all` 为
 `190 passed`，无失败；本次未启动正式训练，不形成科学收益结论。
+
+2026-08-31 V3 合格池成员审计修复：最终相位门禁经多轮 FPS 排除后，
+preoptimization 审计不再错误要求组别合格池的 `candidate_id` 全局唯一。物理源候选
+仍以 candidate ID、视场和后表面坐标严格唯一；组别资格记录以
+`training_group/candidate_id/distance/field` 稳定键唯一。允许同一物理候选被
+多个目标组合法复用，但同 ID 的物理坐标冲突仍失败关闭。覆盖率审计先按物理源
+去重，防止跨组复用人为改变候选间距统计；组别资格不同时按至少一个组仍合格
+保留该物理覆盖点。case-layout state schema 提升为 9，
+case manifest/candidate-fields/coverage schema 分别提升为 7/2/4。PAL 定向测试
+`57 passed`；完整测试
+`.venv\Scripts\python.exe -m pytest tests -q --basetemp .tmp_pytest_membership_pool_all` 为
+`193 passed`，无失败。本次未启动正式训练，不形成科学收益结论。

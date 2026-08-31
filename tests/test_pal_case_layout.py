@@ -12,6 +12,8 @@ import numpy as np
 from biot.e2e.pal_case_layout import (
     PERIPHERAL_BAND_COUNTS,
     TRAINING_GROUP_COUNTS,
+    _unique_physical_candidate_rows,
+    _validate_selected_candidate_membership,
     classify_partition_point,
     generate_dense_candidate_fields,
     select_training_cases,
@@ -280,20 +282,103 @@ def test_preoptimization_artifacts_record_candidates_and_ten_groups(tmp_path) ->
     ):
         assert (output / name).is_file()
     manifest = json.loads((output / "case_manifest.json").read_text(encoding="utf-8"))
-    assert manifest["schema_version"] == 6
+    assert manifest["schema_version"] == 7
     assert "posthoc_cases_json" not in manifest["source"]
     assert manifest["group_counts"] == TRAINING_GROUP_COUNTS
     assert "group_weight" in manifest["objective_contract"]["J"]
     assert manifest["case_geometry_audit"]["passed"] is True
     assert manifest["coverage_audit"]["overall_passed"] is True
     coverage = json.loads((output / "coverage_audit.json").read_text(encoding="utf-8"))
-    assert coverage["schema_version"] == 3
+    assert coverage["schema_version"] == 4
     assert coverage["overall_passed"] is True
     for side in ("peripheral_astig_left", "peripheral_astig_right"):
         assert all(
             band["coverage_gate"]["passed"]
             for band in coverage["zones"][side]["peripheral_band_coverage"].values()
         )
+
+
+def test_preoptimization_artifacts_accept_group_qualified_pool_candidate_reuse(
+    tmp_path,
+) -> None:
+    zones = _zones_payload()
+    zones_path = tmp_path / "zones.json"
+    zones_path.write_text(json.dumps(zones), encoding="utf-8")
+    excel_path = tmp_path / "lens.xlsx"
+    excel_path.write_bytes(b"test lens identity")
+    qualified_pool = _selected_cases()
+    assert len({case["candidate_id"] for case in qualified_pool}) < len(
+        qualified_pool
+    )
+    cases = select_training_cases(
+        qualified_pool,
+        far_object_distance_mm=100000.0,
+        intermediate_object_distance_mm=2000.0,
+        near_object_distance_mm=500.0,
+        corridor_y_min_mm=-9.0,
+        corridor_y_max_mm=-3.0,
+        power_map=np.asarray(zones["maps"]["power_D"], dtype=np.float64),
+        pfar=1.0,
+        zones_payload=zones,
+    )
+    for case in cases:
+        case["case_lens_x_mm"] = case["reference_lens_x_mm"]
+        case["case_lens_physical_y_mm"] = case[
+            "reference_lens_physical_y_mm"
+        ]
+        case["case_position_partition_zone"] = case[
+            "reference_partition_zone"
+        ]
+
+    output = write_preoptimization_artifacts(
+        output_dir=tmp_path / "qualified_pool_preoptimization",
+        excel_path=excel_path,
+        zones_json=zones_path,
+        candidates=qualified_pool,
+        cases=cases,
+        reference_distance_mm=100000.0,
+        sampling_contract=_sampling_contract(),
+    )
+
+    manifest = json.loads(
+        (output / "case_manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["schema_version"] == 7
+    membership = manifest["candidate_membership_audit"]
+    assert membership["candidate_domain"] == "group_qualified_pool"
+    assert membership["candidate_record_count"] == len(qualified_pool)
+    assert membership["unique_source_candidate_count"] < len(qualified_pool)
+    coverage = json.loads(
+        (output / "coverage_audit.json").read_text(encoding="utf-8")
+    )
+    assert coverage["schema_version"] == 4
+    assert coverage["candidate_reuse_count"] > 0
+    assert coverage["overall_passed"] is True
+
+
+def test_group_qualified_pool_rejects_conflicting_physical_candidate_identity() -> None:
+    source = _selected_cases()[0]
+    conflict = dict(source)
+    conflict["field_x_deg"] = float(source["field_x_deg"]) + 1.0
+
+    with pytest.raises(ValueError, match="conflicting physical source records"):
+        _validate_selected_candidate_membership([source, conflict], [])
+
+
+def test_physical_candidate_coverage_aggregates_group_specific_eligibility() -> None:
+    candidates = _selected_cases()
+    by_id: dict[str, list[dict[str, object]]] = {}
+    for candidate in candidates:
+        by_id.setdefault(str(candidate["candidate_id"]), []).append(candidate)
+    reused = next(rows for rows in by_id.values() if len(rows) > 1)
+    records = [dict(row) for row in reused[:2]]
+    records[0]["eligible"] = False
+    records[1]["eligible"] = True
+
+    physical = _unique_physical_candidate_rows(records)
+
+    assert len(physical) == 1
+    assert physical[0]["eligible"] is True
 
 
 def test_preoptimization_artifacts_accept_physical_infinity_for_far_distance(
