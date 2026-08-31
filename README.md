@@ -142,7 +142,8 @@ training-state/parity 导入。
 `dense_candidate_grid_on_lens.png`：前者保存全部物方密集场点经真实 PAL 追迹后
 映射到镜片后表面的物理坐标，后者用于与资格池候选点图比较。
 `candidate_reachability_on_lens.png` 使用叉号表示 true-traceable、空心圆表示
-通过分区分类后的 eligible（不再应用 zone/aperture clearance 安全门槛）。
+通过后续 WFNO/phase qualification 的 eligible（不再应用 zone/aperture clearance
+安全门槛）；初始分区资格另记录为 `trace_eligible`。
 `corridor_flank` 是 `corridor` 内部的诊断子 mask，
 不是独立训练分区或独立 loss；分区分类和训练 case 均纳入 `corridor`。
 候选进入资格池后仍必须通过 forward WFNO、final-phase qualification 和覆盖门禁；

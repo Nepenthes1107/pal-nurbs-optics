@@ -159,7 +159,7 @@ def render(
         [row["reference_lens_physical_y_mm"] for row in eligible],
         s=26, facecolors="none", edgecolors="#111111", alpha=0.85,
         linewidths=0.8, marker="o",
-        label=f"Eligible (traceable + classified) (n={len(eligible)})", zorder=4,
+        label=f"Post-qualification eligible (n={len(eligible)})", zorder=4,
     )
     ax.legend(loc="upper right", fontsize=8)
     _save(fig, output / "candidate_reachability_on_lens.png")

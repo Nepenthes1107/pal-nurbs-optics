@@ -150,7 +150,7 @@ case 数值数据。
 `dense_candidate_grid_on_lens.png`，显示全部物方 1° 密集场点经 Original PAL
 中心瞳孔光线追迹后的后表面物理坐标；与 qualified candidate 图分开，避免把 364
 个资格池点误认为 10,556 个密集场点。`candidate_reachability_on_lens.png` 中
-true-traceable 改为叉号、classified eligible 改为空心圆。`corridor_flank` 明确标为 corridor
+true-traceable 改为叉号、post-qualification eligible 改为空心圆。`corridor_flank` 明确标为 corridor
 的诊断子 mask，不再作为独立训练分区。
 
 2026-08-31 V3 候选资格契约更新：删除 zone-boundary 和 aperture-edge clearance

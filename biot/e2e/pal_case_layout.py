@@ -116,6 +116,9 @@ def _unique_physical_candidate_rows(
             unique[candidate_id]["eligible"] = bool(
                 unique[candidate_id].get("eligible")
             ) or bool(row.get("eligible"))
+            unique[candidate_id]["trace_eligible"] = bool(
+                unique[candidate_id].get("trace_eligible")
+            ) or bool(row.get("trace_eligible"))
         identities[candidate_id] = identity
         unique.setdefault(candidate_id, dict(row))
     return list(unique.values())
@@ -355,7 +358,8 @@ def trace_candidate_fields(
                 "trace_status": "ok", "reference_lens_x_mm": float(x_mm),
                 "reference_lens_physical_y_mm": float(y_mm), "reference_partition_zone": zone,
             })
-            row["eligible"] = zone is not None
+            row["trace_eligible"] = zone is not None
+            row["eligible"] = row["trace_eligible"]
         except Exception as exc:
             diagnostic = diagnostic_stream.getvalue()
             row.update({
@@ -1627,9 +1631,15 @@ def write_preoptimization_artifacts(
         "trace_failure_count": sum(
             row.get("trace_status") != "ok" for row in physical_candidates
         ),
+        "trace_eligible_definition": (
+            "trace_status=ok and reference_partition_zone is classified"
+        ),
         "eligible_definition": (
-            "trace_status=ok and reference_partition_zone is classified; "
+            "trace-eligible candidates that pass subsequent qualification; "
             "zone/aperture clearance filters disabled"
+        ),
+        "trace_eligible_count": sum(
+            bool(row.get("trace_eligible")) for row in physical_candidates
         ),
         "eligible_count": sum(
             bool(row.get("eligible")) for row in physical_candidates

@@ -150,6 +150,7 @@ def test_candidate_trace_ignores_clearance_filter_arguments() -> None:
         )
         assert traced[0]["trace_status"] == "ok"
         assert traced[0]["reference_partition_zone"] == "far"
+        assert traced[0]["trace_eligible"] is True
         assert traced[0]["eligible"] is True
     assert calls == 3
 
