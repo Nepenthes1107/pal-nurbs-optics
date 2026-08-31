@@ -159,7 +159,7 @@ def render(
         [row["reference_lens_physical_y_mm"] for row in eligible],
         s=26, facecolors="none", edgecolors="#111111", alpha=0.85,
         linewidths=0.8, marker="o",
-        label=f"Eligible after safety margin (n={len(eligible)})", zorder=4,
+        label=f"Eligible (traceable + classified) (n={len(eligible)})", zorder=4,
     )
     ax.legend(loc="upper right", fontsize=8)
     _save(fig, output / "candidate_reachability_on_lens.png")
@@ -195,7 +195,7 @@ def render(
     _save(fig, output / "dense_candidate_grid_on_lens.png")
 
     fig, ax = plt.subplots(figsize=(8.4, 7.3))
-    _plot_base(ax, zones, f"{total} training cases over the reachable safe domain")
+    _plot_base(ax, zones, f"{total} training cases over the reachable eligible domain")
     ax.scatter(
         [row["reference_lens_x_mm"] for row in eligible],
         [row["reference_lens_physical_y_mm"] for row in eligible],

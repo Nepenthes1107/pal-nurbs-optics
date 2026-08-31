@@ -108,8 +108,9 @@ def _selected_cases(*, far_distance: float = 100000.0) -> list[dict[str, object]
 def _sampling_contract(*, far_distance: float = 100000.0) -> dict[str, object]:
     return {
         "method": "test dense-field FPS",
-        "zone_boundary_safety_mm": {"default": 1.5, "corridor": 1.0},
-        "aperture_edge_safety_mm": 1.5,
+        "candidate_eligibility": (
+            "trace_status=ok and reference_partition_zone is classified"
+        ),
         "object_distance_mm": {
             "far": far_distance, "intermediate": 2000.0, "near": 500.0,
         },
@@ -126,40 +127,31 @@ def test_dense_grid_is_deterministic_and_not_a_lens_plane_prescription() -> None
     assert "reference_lens_x_mm" not in fields[0]
 
 
-def test_candidate_trace_rejects_invalid_sampling_margins_before_tracing() -> None:
-    called = False
+def test_candidate_trace_ignores_clearance_filter_arguments() -> None:
+    calls = 0
 
     def trace_reference(_fx: float, _fy: float) -> tuple[float, float]:
-        nonlocal called
-        called = True
+        nonlocal calls
+        calls += 1
         return 0.0, 10.0
 
     candidate = [{"candidate_id": "c1", "field_x_deg": 0.0, "field_y_deg": 0.0}]
-    with pytest.raises(ValueError, match="finite and non-negative"):
-        trace_candidate_fields(
+    for zone_margin, aperture_margin in (
+        ({"default": float("nan")}, -1.0),
+        ({"corridor": 1.0}, float("nan")),
+        ({"default": -100.0}, 1.5),
+    ):
+        traced = trace_candidate_fields(
             candidate,
             trace_reference=trace_reference,
             zones_payload=_zones_payload(),
-            zone_boundary_safety_mm={"default": float("nan")},
-            aperture_edge_safety_mm=1.5,
+            zone_boundary_safety_mm=zone_margin,
+            aperture_edge_safety_mm=aperture_margin,
         )
-    with pytest.raises(ValueError, match="missing zone-boundary"):
-        trace_candidate_fields(
-            candidate,
-            trace_reference=trace_reference,
-            zones_payload=_zones_payload(),
-            zone_boundary_safety_mm={"corridor": 1.0},
-            aperture_edge_safety_mm=1.5,
-        )
-    with pytest.raises(ValueError, match="finite and non-negative"):
-        trace_candidate_fields(
-            candidate,
-            trace_reference=trace_reference,
-            zones_payload=_zones_payload(),
-            zone_boundary_safety_mm={"default": 1.5},
-            aperture_edge_safety_mm=-1.0,
-        )
-    assert called is False
+        assert traced[0]["trace_status"] == "ok"
+        assert traced[0]["reference_partition_zone"] == "far"
+        assert traced[0]["eligible"] is True
+    assert calls == 3
 
 
 def test_candidate_trace_progress_is_portable_across_checkout_paths(tmp_path) -> None:
@@ -352,7 +344,7 @@ def test_preoptimization_artifacts_record_candidates_and_ten_groups(tmp_path) ->
     assert manifest["case_geometry_audit"]["passed"] is True
     assert manifest["coverage_audit"]["overall_passed"] is True
     coverage = json.loads((output / "coverage_audit.json").read_text(encoding="utf-8"))
-    assert coverage["schema_version"] == 4
+    assert coverage["schema_version"] == 5
     assert coverage["overall_passed"] is True
     for side in ("peripheral_astig_left", "peripheral_astig_right"):
         assert all(
@@ -421,7 +413,7 @@ def test_preoptimization_artifacts_accept_group_qualified_pool_candidate_reuse(
     coverage = json.loads(
         (output / "coverage_audit.json").read_text(encoding="utf-8")
     )
-    assert coverage["schema_version"] == 4
+    assert coverage["schema_version"] == 5
     assert coverage["candidate_reuse_count"] > 0
     assert coverage["overall_passed"] is True
     far_cases = [
@@ -701,7 +693,7 @@ Path(sys.argv[6]).write_text(json.dumps(calls), encoding="utf-8")
 
     reference = next(
         call for call in calls
-        if call["title"] == "1 training cases over the reachable safe domain"
+        if call["title"] == "1 training cases over the reachable eligible domain"
         and call["label"] == "Far (n=1)"
     )
     assigned = next(

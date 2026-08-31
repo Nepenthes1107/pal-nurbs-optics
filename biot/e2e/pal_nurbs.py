@@ -58,7 +58,7 @@ from .system import (
 )
 
 
-METHOD_NAME = "pal_109case_stratified_corridor_csf_z4_smooth_v3zones"
+METHOD_NAME = "pal_109case_stratified_corridor_csf_z4_smooth_v3zones_no_clearance_filter"
 
 DEFAULT_GROUP_WEIGHTS = {
     "far": 0.22,
@@ -121,6 +121,8 @@ class MinimalConfig:
     # for old callers but are not used unless supplied.
     candidate_field_min_deg: float | None = None
     candidate_field_max_deg: float | None = None
+    # Retained for backward-compatible config loading; candidate eligibility
+    # no longer uses zone/aperture clearance safety filters.
     zone_boundary_safety_mm: float = 1.5
     corridor_zone_boundary_safety_mm: float = 1.0
     aperture_edge_safety_mm: float = 1.5
@@ -177,7 +179,7 @@ class MinimalConfig:
             raise ValueError("relative_improvement_threshold must be finite and positive")
 
 
-RUN_IDENTITY_SCHEMA_VERSION = 6
+RUN_IDENTITY_SCHEMA_VERSION = 7
 CASE_LAYOUT_STATE_SCHEMA_VERSION = 10
 BASELINE_STATE_SCHEMA_VERSION = 6
 BASELINE_PROGRESS_SCHEMA_VERSION = 6
@@ -1852,7 +1854,7 @@ def _prepare_case_layout(
         reference_distance_mm=config.far_object_distance_mm,
         sampling_contract={
             "method": (
-                "dense field -> Original PAL rear trace -> mask/clearance -> "
+                "dense field -> Original PAL rear trace -> classified partition -> "
                 "fixed region-wise lens-plane FPS pool -> exact aiming/WFNO qualification for functional cases -> "
                 "final group-preserving coverage-constrained selection -> 79-case complete "
                 "pre-FFT phase qualification; peripheral is surface-only"
@@ -1866,11 +1868,10 @@ def _prepare_case_layout(
                 "deprecated_square_min": config.candidate_field_min_deg,
                 "deprecated_square_max": config.candidate_field_max_deg,
             },
-            "zone_boundary_safety_mm": {
-                "default": config.zone_boundary_safety_mm,
-                "corridor": config.corridor_zone_boundary_safety_mm,
-            },
-            "aperture_edge_safety_mm": config.aperture_edge_safety_mm,
+            "candidate_eligibility": (
+                "trace_status=ok and reference_partition_zone is classified; "
+                "zone/aperture clearance filters disabled"
+            ),
             "object_distance_mm": {
                 "far": config.far_object_distance_mm,
                 "intermediate": config.intermediate_object_distance_mm,

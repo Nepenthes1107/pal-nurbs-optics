@@ -193,25 +193,6 @@ def classify_partition_point(
     }.get(active[0], active[0])
 
 
-def _mask_name(zone: str) -> str:
-    return {"astig_left": "peripheral_astig_left", "astig_right": "peripheral_astig_right"}.get(zone, zone)
-
-
-def _inside_clearance_mm(payload: Mapping[str, Any], mask_name: str, x_mm: float, y_mm: float) -> float:
-    """Conservative point-to-nearest-outside-cell clearance of a raster mask."""
-    x, y, masks = _zone_arrays(payload)
-    mask = masks[mask_name]
-    ix, iy = int(np.argmin(abs(x - x_mm))), int(np.argmin(abs(y - y_mm)))
-    if not bool(mask[iy, ix]):
-        return -math.inf
-    oy, ox = np.nonzero(~mask)
-    if ox.size == 0:
-        return math.inf
-    distance = np.hypot(x[ox] - x_mm, y[oy] - y_mm).min()
-    half_diagonal = 0.5 * math.hypot(float(np.median(abs(np.diff(x)))), float(np.median(abs(np.diff(y)))))
-    return max(0.0, float(distance) - half_diagonal)
-
-
 def _linspace_exact(minimum: float, maximum: float, step: float) -> np.ndarray:
     if step <= 0 or maximum <= minimum:
         raise ValueError("invalid dense candidate field grid")
@@ -267,51 +248,21 @@ def trace_candidate_fields(
     trace_identity: Mapping[str, Any] | None = None,
     progress_interval: int = 100,
 ) -> list[dict[str, Any]]:
-    """Trace every field through Original PAL with fail evidence and exact resume state."""
+    """Trace every field through Original PAL with fail evidence and exact resume state.
+
+    The two historical clearance arguments are retained for call compatibility,
+    but candidate eligibility is now based only on a successful trace that maps
+    to one of the declared physical partitions. Clearance values are no longer
+    a selection gate.
+    """
     if progress_interval <= 0:
         raise ValueError("progress_interval must be positive")
-    aperture_safety = float(aperture_edge_safety_mm)
-    if not math.isfinite(aperture_safety) or aperture_safety < 0.0:
-        raise ValueError("aperture-edge safety margin must be finite and non-negative")
-    partition_zones = {"far", "corridor", "near", "astig_left", "astig_right"}
-    if isinstance(zone_boundary_safety_mm, Mapping):
-        supplied_zone_safety = {
-            str(name): float(value) for name, value in zone_boundary_safety_mm.items()
-        }
-        missing = sorted(
-            zone for zone in partition_zones
-            if zone not in supplied_zone_safety and "default" not in supplied_zone_safety
-        )
-        if missing:
-            raise ValueError(
-                "missing zone-boundary safety margins for: " + ", ".join(missing)
-            )
-        resolved_zone_safety = {
-            zone: (
-                supplied_zone_safety[zone]
-                if zone in supplied_zone_safety
-                else supplied_zone_safety["default"]
-            )
-            for zone in partition_zones
-        }
-        identity_zone_safety: float | dict[str, float] = supplied_zone_safety
-    else:
-        shared_zone_safety = float(zone_boundary_safety_mm)
-        resolved_zone_safety = {
-            zone: shared_zone_safety for zone in partition_zones
-        }
-        identity_zone_safety = shared_zone_safety
-    if any(
-        not math.isfinite(value) or value < 0.0
-        for value in resolved_zone_safety.values()
-    ):
-        raise ValueError("zone-boundary safety margins must be finite and non-negative")
+    del zone_boundary_safety_mm, aperture_edge_safety_mm
     progress = None if progress_path is None else Path(progress_path)
     identity_payload = {
         "candidates": [dict(candidate) for candidate in candidates],
         "zones_sha256": _canonical_json_sha256(zones_payload),
-        "zone_boundary_safety_mm": identity_zone_safety,
-        "aperture_edge_safety_mm": aperture_safety,
+        "candidate_eligibility_contract": "trace_success_and_classified_partition_v2",
         "trace_identity": None if trace_identity is None else dict(trace_identity),
     }
     identity_sha256 = _canonical_json_sha256(identity_payload)
@@ -404,18 +355,7 @@ def trace_candidate_fields(
                 "trace_status": "ok", "reference_lens_x_mm": float(x_mm),
                 "reference_lens_physical_y_mm": float(y_mm), "reference_partition_zone": zone,
             })
-            if zone is None:
-                row.update({"zone_boundary_clearance_mm": None, "aperture_edge_clearance_mm": None, "eligible": False})
-            else:
-                zone_clearance = _inside_clearance_mm(zones_payload, _mask_name(zone), x_mm, y_mm)
-                aperture_clearance = _inside_clearance_mm(zones_payload, "monitored", x_mm, y_mm)
-                zone_safety = resolved_zone_safety[zone]
-                row.update({
-                    "zone_boundary_clearance_mm": zone_clearance,
-                    "aperture_edge_clearance_mm": aperture_clearance,
-                    "zone_boundary_safety_mm": zone_safety,
-                    "eligible": zone_clearance >= zone_safety and aperture_clearance >= aperture_safety,
-                })
+            row["eligible"] = zone is not None
         except Exception as exc:
             diagnostic = diagnostic_stream.getvalue()
             row.update({
@@ -976,7 +916,7 @@ def _coverage_gate(
     maximum_threshold = 1.25 * characteristic_spacing + candidate_scale
     nearest_passed = p95 <= p95_threshold and maximum <= maximum_threshold
     return {
-        "eligible_definition": "zone intersection true-traceable intersection safety margin",
+        "eligible_definition": "zone intersection trace-successful candidates",
         "candidate_nearest_neighbour_p95_mm": candidate_scale,
         "occupied_eligible_area_proxy_mm2": occupied_eligible_cells * cell_area_mm2,
         "selected_count": len(selected),
@@ -1179,7 +1119,7 @@ def coverage_audit(
     payload: Mapping[str, Any], candidates: Sequence[Mapping[str, Any]],
     cases: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
-    """Quantify full masks, true-traceable candidates, safe candidates and FPS coverage."""
+    """Quantify full masks, traceable/classified candidates and FPS coverage."""
     physical_candidates = _unique_physical_candidate_rows(candidates)
     x, y, masks = _zone_arrays(payload)
     pitch_x = float(np.median(abs(np.diff(x))))
@@ -1201,13 +1141,13 @@ def coverage_audit(
         raise ValueError("zones statistics must declare corridor physical_y_range_mm")
     corridor_min, corridor_max = sorted(float(value) for value in corridor_range)
 
-    safe_peripheral = [
+    eligible_peripheral = [
         row for row in physical_candidates
         if row.get("trace_status") == "ok"
         and bool(row.get("eligible"))
         and row.get("reference_partition_zone") in {"astig_left", "astig_right"}
     ]
-    peripheral_pairs = _peripheral_pairs(safe_peripheral)
+    peripheral_pairs = _peripheral_pairs(eligible_peripheral)
     pairable_by_zone = {
         "astig_left": [pair["left"] for pair in peripheral_pairs],
         "astig_right": [pair["right"] for pair in peripheral_pairs],
@@ -1247,10 +1187,6 @@ def coverage_audit(
         occupied_coverage_eligible = _occupied_mask_cells(
             payload, mask_name, coverage_eligible
         )
-        margins = sorted({
-            float(row["zone_boundary_safety_mm"])
-            for row in eligible if row.get("zone_boundary_safety_mm") is not None
-        })
         zones[mask_name] = {
             "full_mask_cell_count": full_cells,
             "full_mask_area_mm2": full_cells * cell_area,
@@ -1264,9 +1200,9 @@ def coverage_audit(
             "eligible_occupied_mask_cell_fraction": occupied_eligible / full_cells if full_cells else None,
             "eligible_bounds": _xy_bounds(eligible),
             "coverage_eligible_definition": (
-                "safe and exact field/rear-mirror pairable candidates"
+                "eligible and exact field/rear-mirror pairable candidates"
                 if zone_name in pairable_by_zone
-                else "safe candidates"
+                else "trace-successful candidates with a classified partition"
             ),
             "coverage_eligible_candidate_count": len(coverage_eligible),
             "coverage_eligible_occupied_mask_cell_count": occupied_coverage_eligible,
@@ -1281,7 +1217,6 @@ def coverage_audit(
                 "p95": p95_nearest,
                 "maximum_coverage_radius": max_nearest,
             },
-            "zone_boundary_safety_mm": margins,
             "coverage_gate": _coverage_gate(
                 coverage_eligible,
                 selected,
@@ -1332,9 +1267,9 @@ def coverage_audit(
         if not bool(band["coverage_gate"]["passed"])
     )
     return {
-        "schema_version": 4,
+        "schema_version": 5,
         "interpretation": (
-            "Coverage is contracted on zone intersection true-traceable candidates intersection safety margin; "
+            "Coverage is contracted on zone-intersection trace-successful candidates; "
             "the complete raster mask can contain physically unreachable cells. Occupied-cell fractions count "
             "only raster cells hit by the finite candidate grid and are not continuous-area claims. Convex-hull "
             "values are selected/candidate envelopes only and are likewise not physical zone-area claims."
@@ -1365,11 +1300,6 @@ def _validate_selected_case_geometry(
     candidates: Sequence[Mapping[str, Any]],
     sampling_contract: Mapping[str, Any],
 ) -> dict[str, Any]:
-    zone_margins = sampling_contract.get("zone_boundary_safety_mm")
-    if not isinstance(zone_margins, Mapping) or not {"default", "corridor"}.issubset(zone_margins):
-        raise ValueError("sampling contract must declare default and corridor zone margins")
-    if "aperture_edge_safety_mm" not in sampling_contract:
-        raise ValueError("sampling contract must declare aperture-edge safety margin")
     object_distances = sampling_contract.get("object_distance_mm")
     if not isinstance(object_distances, Mapping) or not {
         "far", "intermediate", "near"
@@ -1415,29 +1345,14 @@ def _validate_selected_case_geometry(
         raise ValueError(
             "surface-only peripheral cases must all retain the far reference distance"
         )
-    aperture_margin = float(sampling_contract["aperture_edge_safety_mm"])
-    resolved_zone_margins = {
-        "default": float(zone_margins["default"]),
-        "corridor": float(zone_margins["corridor"]),
-    }
-    if any(
-        not math.isfinite(value) or value < 0.0
-        for value in (*resolved_zone_margins.values(), aperture_margin)
-    ):
-        raise ValueError("zone and aperture safety margins must be finite and non-negative")
     corridor_range = dict(dict(payload.get("statistics", {})).get("corridor", {})).get("physical_y_range_mm")
     if not isinstance(corridor_range, list) or len(corridor_range) != 2:
         raise ValueError("zones statistics must declare corridor physical_y_range_mm")
     corridor_min, corridor_max = sorted(float(value) for value in corridor_range)
-    minimum_zone_clearance = math.inf
-    minimum_aperture_clearance = math.inf
     maximum_assigned_distance_retrace_error = 0.0
     for case in cases:
         group = str(case["training_group"])
         expected_zone = GROUP_TO_ZONE[group]
-        zone_margin = resolved_zone_margins[
-            "corridor" if expected_zone == "corridor" else "default"
-        ]
         for prefix, recorded_name, x_key, y_key in (
             ("reference", "reference_partition_zone", "reference_lens_x_mm", "reference_lens_physical_y_mm"),
             ("case", "case_position_partition_zone", "case_lens_x_mm", "case_lens_physical_y_mm"),
@@ -1446,16 +1361,6 @@ def _validate_selected_case_geometry(
             classified = classify_partition_point(payload, x_mm=x_mm, physical_y_mm=y_mm)
             if case.get(recorded_name) != classified or classified != expected_zone:
                 raise ValueError(f"{case['case_id']} {prefix} rear point is {classified!r}, expected {expected_zone!r}")
-            zone_clearance = _inside_clearance_mm(payload, _mask_name(expected_zone), x_mm, y_mm)
-            aperture_clearance = _inside_clearance_mm(payload, "monitored", x_mm, y_mm)
-            if zone_clearance < zone_margin or aperture_clearance < aperture_margin:
-                raise ValueError(
-                    f"{case['case_id']} {prefix} rear point violates safety margins: "
-                    f"zone={zone_clearance:.6g}/{zone_margin:.6g} mm, "
-                    f"aperture={aperture_clearance:.6g}/{aperture_margin:.6g} mm"
-                )
-            minimum_zone_clearance = min(minimum_zone_clearance, zone_clearance)
-            minimum_aperture_clearance = min(minimum_aperture_clearance, aperture_clearance)
         assigned_distance_retrace_error = max(
             abs(float(case["reference_lens_x_mm"]) - float(case["case_lens_x_mm"])),
             abs(
@@ -1571,8 +1476,6 @@ def _validate_selected_case_geometry(
         maximum_task_mirror_error = max(maximum_task_mirror_error, task_error)
     return {
         "passed": True,
-        "minimum_zone_clearance_mm": minimum_zone_clearance,
-        "minimum_aperture_clearance_mm": minimum_aperture_clearance,
         "maximum_assigned_distance_retrace_error_mm": (
             maximum_assigned_distance_retrace_error
         ),
@@ -1715,7 +1618,7 @@ def write_preoptimization_artifacts(
         payload, cases, candidates, sampling_contract
     )
     candidate_payload = {
-        "schema_version": 2,
+        "schema_version": 3,
         "reference_distance_mm": reference_distance_mm,
         "sampling_contract": dict(sampling_contract),
         "candidate_record_count": len(candidates),
@@ -1723,6 +1626,10 @@ def write_preoptimization_artifacts(
         "candidate_reuse_count": len(candidates) - len(physical_candidates),
         "trace_failure_count": sum(
             row.get("trace_status") != "ok" for row in physical_candidates
+        ),
+        "eligible_definition": (
+            "trace_status=ok and reference_partition_zone is classified; "
+            "zone/aperture clearance filters disabled"
         ),
         "eligible_count": sum(
             bool(row.get("eligible")) for row in physical_candidates
