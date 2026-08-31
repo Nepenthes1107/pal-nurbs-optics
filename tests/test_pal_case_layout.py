@@ -156,6 +156,62 @@ def test_candidate_trace_rejects_invalid_sampling_margins_before_tracing() -> No
     assert called is False
 
 
+def test_candidate_trace_progress_is_portable_across_checkout_paths(tmp_path) -> None:
+    candidates = [
+        {"candidate_id": "c1", "field_x_deg": 0.0, "field_y_deg": 0.0}
+    ]
+    progress = tmp_path / "candidate_trace_progress.json"
+    common = {
+        "candidates": candidates,
+        "trace_reference": lambda _fx, _fy: (0.0, 10.0),
+        "zones_payload": _zones_payload(),
+        "zone_boundary_safety_mm": {"default": 1.5, "corridor": 1.0},
+        "aperture_edge_safety_mm": 1.5,
+        "progress_path": progress,
+    }
+    first = trace_candidate_fields(
+        **common,
+        trace_identity={
+            "excel_path": "/root/cloud/repo/lens.xlsx",
+            "excel_sha256": "a" * 64,
+        },
+    )
+    second = trace_candidate_fields(
+        **common,
+        trace_identity={
+            "excel_path": r"D:\local\repo\lens.xlsx",
+            "excel_sha256": "a" * 64,
+        },
+    )
+
+    assert second == first
+
+
+def test_candidate_trace_progress_path_is_identity_without_content_hash(tmp_path) -> None:
+    candidates = [
+        {"candidate_id": "c1", "field_x_deg": 0.0, "field_y_deg": 0.0}
+    ]
+    progress = tmp_path / "candidate_trace_progress.json"
+    common = {
+        "candidates": candidates,
+        "trace_reference": lambda _fx, _fy: (0.0, 10.0),
+        "zones_payload": _zones_payload(),
+        "zone_boundary_safety_mm": {"default": 1.5, "corridor": 1.0},
+        "aperture_edge_safety_mm": 1.5,
+        "progress_path": progress,
+    }
+    trace_candidate_fields(
+        **common,
+        trace_identity={"excel_path": "/root/cloud/repo/lens.xlsx"},
+    )
+
+    with pytest.raises(ValueError, match="candidate progress identity mismatch"):
+        trace_candidate_fields(
+            **common,
+            trace_identity={"excel_path": r"D:\local\repo\lens.xlsx"},
+        )
+
+
 def test_selects_fixed_109_cases_with_stratified_corridor_and_mirrored_peripheral() -> None:
     cases = _selected_cases()
     counts = {group: sum(case["training_group"] == group for case in cases) for group in TRAINING_GROUP_COUNTS}
@@ -354,6 +410,14 @@ def test_preoptimization_artifacts_accept_group_qualified_pool_candidate_reuse(
     assert coverage["schema_version"] == 4
     assert coverage["candidate_reuse_count"] > 0
     assert coverage["overall_passed"] is True
+    far_cases = [
+        case for case in cases
+        if case["training_group"] in {"far", "far_robustness"}
+    ]
+    assert far_cases
+    selection_audit = far_cases[0]["coverage_selection_audit"]
+    assert selection_audit["method"] == "group_fps_then_deterministic_coverage_swap"
+    assert selection_audit["coverage_gate"]["passed"] is True
 
 
 def test_group_qualified_pool_rejects_conflicting_physical_candidate_identity() -> None:

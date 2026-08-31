@@ -120,3 +120,21 @@ case manifest/candidate-fields/coverage schema 分别提升为 7/2/4。PAL 定�
 `57 passed`；完整测试
 `.venv\Scripts\python.exe -m pytest tests -q --basetemp .tmp_pytest_membership_pool_all` 为
 `193 passed`，无失败。本次未启动正式训练，不形成科学收益结论。
+
+2026-08-31 V3 最终覆盖选择与跨平台 candidate-trace 导入修复：最终 qualified
+pool 不再用普通 FPS 后等待 coverage audit 才报错；在各组数量、已有覆盖公式和
+门槛完全不变的条件下，far/far-robustness 使用组内确定性交换，周边 upper/middle/
+lower 使用固定镜像对数量的确定性精确组合搜索，找不到合格子集时仍失败关闭。
+final-phase 历史状态优先按 `training_group/candidate_id/distance/field` 稳定键匹配，
+避免多轮选择重新编号的 `case_id` 串接错误。candidate-trace 导入先验证原 identity
+自哈希，再按镜片 SHA-256 和物理参数匹配；仅忽略 Linux/Windows checkout 的绝对
+Excel 路径。case-layout state schema 提升为 10。
+
+本地证据 `results/optimization/v3_branch/local_validation_run_002` 使用 run_003 的
+三份完整进度、真实 Infinity、requested_np 256、FFT 512、batch 8 和验证预算
+0/1/0；prepare 在 2626.36 s 后完成。manifest 为 109 cases/10 组，qualified-pool
+membership 通过，coverage `overall_passed=true` 且失败门禁为空，phase 进度累计
+235 次尝试。随后 startup autograd gradient check 通过，Original PAL baseline
+完成 2 个 GPU batch、保存 16/109 rows；按用户要求在继续训练前停止，目标进程已
+确认不存在。`run_state.json` 因 Ctrl-C 仍为陈旧 `running/baseline_training_cases`，
+不能作为活进程或完成训练的证据；本次不形成优化收益结论。

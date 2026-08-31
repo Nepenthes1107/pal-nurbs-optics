@@ -178,7 +178,7 @@ class MinimalConfig:
 
 
 RUN_IDENTITY_SCHEMA_VERSION = 6
-CASE_LAYOUT_STATE_SCHEMA_VERSION = 9
+CASE_LAYOUT_STATE_SCHEMA_VERSION = 10
 BASELINE_STATE_SCHEMA_VERSION = 6
 BASELINE_PROGRESS_SCHEMA_VERSION = 6
 STAGE_RESUME_SCHEMA_VERSION = 2
@@ -1432,6 +1432,34 @@ def _write_run_config(output: Path, config: MinimalConfig) -> None:
     _write_json_atomic(output / "config.json", asdict(config))
 
 
+def _qualified_pool_case_for_saved_attempt(
+    attempt: Mapping[str, Any],
+    qualified_pool: Sequence[dict[str, Any]],
+    qualified_pool_by_key: Mapping[
+        tuple[str, str, float, float, float], dict[str, Any]
+    ],
+) -> dict[str, Any] | None:
+    """Resolve current progress by stable source identity, with legacy-only fallbacks."""
+    if attempt.get("training_group") is not None:
+        try:
+            return qualified_pool_by_key.get(qualified_source_key(attempt))
+        except KeyError:
+            return None
+    exact_case_id = str(attempt.get("case_id", ""))
+    for row in qualified_pool:
+        if str(row.get("case_id")) == exact_case_id:
+            return row
+    if attempt.get("candidate_id") is not None:
+        prefix_matches = [
+            row for row in qualified_pool
+            if str(row.get("candidate_id")) == str(attempt["candidate_id"])
+            and exact_case_id.startswith(str(row.get("training_group")) + "_")
+        ]
+        if len(prefix_matches) == 1:
+            return prefix_matches[0]
+    return None
+
+
 def _prepare_case_layout(
     config: MinimalConfig, output: Path, model: MinimalOpticalModel
 ) -> list[dict[str, Any]]:
@@ -1487,7 +1515,6 @@ def _prepare_case_layout(
         aperture_edge_safety_mm=config.aperture_edge_safety_mm,
         progress_path=candidate_progress_path,
         trace_identity={
-            "excel_path": str(Path(config.excel).resolve()),
             "excel_sha256": _sha256_file(config.excel),
             "reference_distance_mm": config.far_object_distance_mm,
             "wavelength_nm": config.wavelength_nm,
@@ -1654,36 +1681,10 @@ def _prepare_case_layout(
             raise ValueError("final phase qualification progress rows are malformed")
         forward_attempts = [dict(row) for row in rows]
         for attempt in forward_attempts:
-            pool_case = None
             exact_case_id = str(attempt.get("case_id", ""))
-            for row in qualified_pool:
-                if str(row.get("case_id")) == exact_case_id:
-                    pool_case = row
-                    break
-            if pool_case is None and attempt.get("training_group") is not None:
-                try:
-                    pool_case = qualified_pool_by_key.get(
-                        qualified_source_key({
-                            "training_group": attempt["training_group"],
-                            "candidate_id": attempt["candidate_id"],
-                            "distance_mm": attempt["distance_mm"],
-                            "field_x_deg": attempt["field_x_deg"],
-                            "field_y_deg": attempt["field_y_deg"],
-                        })
-                    )
-                except KeyError:
-                    pool_case = None
-            if pool_case is None and attempt.get("candidate_id") is not None:
-                # Compatibility with older progress files: candidate IDs are
-                # unique within a training group, while the same candidate may
-                # legitimately be reused by different groups.
-                prefix_matches = [
-                    row for row in qualified_pool
-                    if str(row.get("candidate_id")) == str(attempt["candidate_id"])
-                    and exact_case_id.startswith(str(row.get("training_group")) + "_")
-                ]
-                if len(prefix_matches) == 1:
-                    pool_case = prefix_matches[0]
+            pool_case = _qualified_pool_case_for_saved_attempt(
+                attempt, qualified_pool, qualified_pool_by_key
+            )
             if pool_case is None:
                 raise ValueError(
                     "final phase qualification progress references a foreign or "
@@ -1821,7 +1822,8 @@ def _prepare_case_layout(
             "contract": (
                 f"fixed {sum(FORWARD_POOL_GROUP_COUNTS.values())}-case regional FPS pool + "
                 "exact BIOT_vis field-dependent WFNO for traced functional cases + "
-                "surface-only peripheral qualification + final regional FPS + "
+                "surface-only peripheral qualification + final group-preserving "
+                "coverage-constrained selection + "
                 "complete pre-FFT phase trace for 79 functional cases"
             ),
             "pool_group_counts": FORWARD_POOL_GROUP_COUNTS,
@@ -1851,7 +1853,8 @@ def _prepare_case_layout(
             "method": (
                 "dense field -> Original PAL rear trace -> mask/clearance -> "
                 "fixed region-wise lens-plane FPS pool -> exact aiming/WFNO qualification for functional cases -> "
-                "final region-wise FPS -> 79-case complete pre-FFT phase qualification; peripheral is surface-only"
+                "final group-preserving coverage-constrained selection -> 79-case complete "
+                "pre-FFT phase qualification; peripheral is surface-only"
             ),
             "field_grid_deg": {
                 "x_min": config.candidate_field_x_min_deg,

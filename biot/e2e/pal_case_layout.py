@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import contextlib
 import io
+import itertools
 import json
 import math
 import subprocess
@@ -317,7 +318,41 @@ def trace_candidate_fields(
     traced: list[dict[str, Any]] = []
     if progress is not None and progress.exists():
         saved = _read_json(progress)
-        if saved.get("schema_version") != 1 or saved.get("identity_sha256") != identity_sha256:
+        saved_identity = saved.get("identity")
+        saved_identity_valid = bool(
+            isinstance(saved_identity, Mapping)
+            and saved.get("identity_sha256")
+            == _canonical_json_sha256(saved_identity)
+        )
+
+        def portable_identity(payload: Mapping[str, Any]) -> dict[str, Any]:
+            normalized = dict(payload)
+            trace = normalized.get("trace_identity")
+            if isinstance(trace, Mapping):
+                portable_trace = dict(trace)
+                # The content hash is physical evidence; an absolute checkout
+                # path is host-specific provenance and must not prevent a
+                # verified Linux artifact from being imported on Windows.
+                excel_sha256 = portable_trace.get("excel_sha256")
+                has_content_identity = bool(
+                    isinstance(excel_sha256, str)
+                    and len(excel_sha256) == 64
+                    and all(
+                        character in "0123456789abcdefABCDEF"
+                        for character in excel_sha256
+                    )
+                )
+                if has_content_identity:
+                    portable_trace.pop("excel_path", None)
+                normalized["trace_identity"] = portable_trace
+            return normalized
+
+        saved_identity_matches = bool(
+            saved_identity_valid
+            and _canonical_json_sha256(portable_identity(saved_identity))
+            == _canonical_json_sha256(portable_identity(identity_payload))
+        )
+        if saved.get("schema_version") != 1 or not saved_identity_matches:
             raise ValueError(f"candidate progress identity mismatch: {progress}")
         saved_rows = saved.get("rows")
         if not isinstance(saved_rows, list):
@@ -574,6 +609,8 @@ def _select_peripheral(
     rows: Sequence[Mapping[str, Any]], corridor_y_min_mm: float,
     corridor_y_max_mm: float, *,
     band_counts: Mapping[str, int] = PERIPHERAL_BAND_COUNTS,
+    zones_payload: Mapping[str, Any] | None = None,
+    coverage_constrained: bool = False,
 ) -> list[dict[str, Any]]:
     pairs = _peripheral_pairs(rows)
     specs = (
@@ -585,7 +622,18 @@ def _select_peripheral(
     for band, count, predicate in specs:
         members = [pair for pair in pairs if predicate(float(pair["pair_y_mm"]))]
         points = np.asarray([[pair["pair_x_mm"], pair["pair_y_mm"]] for pair in members], dtype=np.float64)
-        if band == "upper":
+        if coverage_constrained:
+            if zones_payload is None:
+                raise ValueError(
+                    "coverage-constrained peripheral selection requires zones_payload"
+                )
+            indices = _coverage_constrained_peripheral_indices(
+                members,
+                count,
+                band=band,
+                zones_payload=zones_payload,
+            )
+        elif band == "upper":
             # Three-point maximin coverage already spans inner-x and both y
             # limits on the audited domain; add the outer-x physical anchor as
             # the smallest evidence-driven correction to its sole failed bound.
@@ -699,6 +747,8 @@ def select_training_cases(
     pairs = _select_peripheral(
         peripheral, corridor_y_min_mm, corridor_y_max_mm,
         band_counts=resolved_band_counts,
+        zones_payload=zones_payload,
+        coverage_constrained=retain_source_groups,
     )
     band_distance = {name: far_object_distance_mm for name in PERIPHERAL_BAND_COUNTS}
     for pair_index, pair in enumerate(pairs, 1):
@@ -707,6 +757,17 @@ def select_training_cases(
                 **pair[side], "peripheral_pair_id": f"peripheral_pair_{pair_index:02d}",
                 "peripheral_band": pair["peripheral_band"], "distance_mm": float(band_distance[pair["peripheral_band"]]),
             })
+    if retain_source_groups:
+        _refine_group_union_coverage(
+            groups,
+            source_groups={
+                "far": far_rows,
+                "far_robustness": far_robustness_rows,
+            },
+            group_names=("far", "far_robustness"),
+            mask_name="far",
+            zones_payload=zones_payload,
+        )
     group_distance = {
         "far": far_object_distance_mm,
         "far_robustness": intermediate_object_distance_mm,
@@ -923,6 +984,188 @@ def _coverage_gate(
         },
         "passed": bounds_passed and nearest_passed,
     }
+
+
+def _coverage_gate_rank(gate: Mapping[str, Any]) -> tuple[float, ...]:
+    """Rank unchanged hard-gate results for deterministic selection refinement."""
+    nearest = gate.get("nearest_distance_mm")
+    bounds = gate.get("bounds")
+    if not isinstance(nearest, Mapping) or not isinstance(bounds, Mapping):
+        return (math.inf, math.inf, math.inf, math.inf, math.inf, math.inf)
+    p95_threshold = float(nearest["p95_threshold"])
+    maximum_threshold = float(nearest["maximum_threshold"])
+    if p95_threshold <= 0.0 or maximum_threshold <= 0.0:
+        return (math.inf, math.inf, math.inf, math.inf, math.inf, math.inf)
+    p95_ratio = float(nearest["p95"]) / p95_threshold
+    maximum_ratio = float(nearest["maximum"]) / maximum_threshold
+    failed_bounds = float(sum(not bool(axis["passed"]) for axis in bounds.values()))
+    return (
+        failed_bounds,
+        max(p95_ratio, maximum_ratio),
+        maximum_ratio,
+        p95_ratio,
+        float(nearest["maximum"]),
+        float(nearest["p95"]),
+    )
+
+
+def _coverage_constrained_peripheral_indices(
+    members: Sequence[Mapping[str, Any]],
+    count: int,
+    *,
+    band: str,
+    zones_payload: Mapping[str, Any],
+) -> list[int]:
+    """Select an exact mirrored subset that satisfies the existing coverage gates."""
+    if count <= 0 or len(members) < count:
+        raise ValueError(
+            f"peripheral {band} coverage selection needs {count} of {len(members)} pairs"
+        )
+    combination_count = math.comb(len(members), count)
+    if combination_count > 100_000:
+        raise ValueError(
+            f"peripheral {band} exact coverage search is unexpectedly large: "
+            f"C({len(members)},{count})={combination_count}"
+        )
+    x_mm, y_mm, _ = _zone_arrays(zones_payload)
+    cell_area_mm2 = float(np.median(abs(np.diff(x_mm)))) * float(
+        np.median(abs(np.diff(y_mm)))
+    )
+    eligible_by_side = {
+        "left": [dict(pair["left"]) for pair in members],
+        "right": [dict(pair["right"]) for pair in members],
+    }
+    occupied_by_side = {
+        "left": _occupied_mask_cells(
+            zones_payload, "peripheral_astig_left", eligible_by_side["left"]
+        ),
+        "right": _occupied_mask_cells(
+            zones_payload, "peripheral_astig_right", eligible_by_side["right"]
+        ),
+    }
+    best_passing: tuple[tuple[Any, ...], tuple[int, ...]] | None = None
+    best_any: tuple[tuple[Any, ...], tuple[int, ...], dict[str, Any]] | None = None
+    for combination in itertools.combinations(range(len(members)), count):
+        gates = {
+            side: _coverage_gate(
+                eligible_by_side[side],
+                [members[index][side] for index in combination],
+                occupied_eligible_cells=occupied_by_side[side],
+                cell_area_mm2=cell_area_mm2,
+            )
+            for side in ("left", "right")
+        }
+        side_ranks = [_coverage_gate_rank(gates[side]) for side in ("left", "right")]
+        rank: tuple[Any, ...] = (
+            sum(item[0] for item in side_ranks),
+            max(item[1] for item in side_ranks),
+            max(item[2] for item in side_ranks),
+            max(item[3] for item in side_ranks),
+            max(item[4] for item in side_ranks),
+            max(item[5] for item in side_ranks),
+            combination,
+        )
+        candidate_any = (rank, combination, gates)
+        if best_any is None or candidate_any[0] < best_any[0]:
+            best_any = candidate_any
+        if all(bool(gate["passed"]) for gate in gates.values()):
+            candidate_passing = (rank, combination)
+            if best_passing is None or candidate_passing[0] < best_passing[0]:
+                best_passing = candidate_passing
+    if best_passing is None:
+        assert best_any is not None
+        raise ValueError(
+            f"peripheral {band} has no {count}-pair subset satisfying the unchanged "
+            f"coverage gates; best_rank={best_any[0][:-1]!r}"
+        )
+    return list(best_passing[1])
+
+
+def _refine_group_union_coverage(
+    groups: dict[str, list[dict[str, Any]]],
+    *,
+    source_groups: Mapping[str, Sequence[Mapping[str, Any]]],
+    group_names: Sequence[str],
+    mask_name: str,
+    zones_payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Use deterministic within-group swaps to satisfy an unchanged zone gate."""
+    x_mm, y_mm, _ = _zone_arrays(zones_payload)
+    cell_area_mm2 = float(np.median(abs(np.diff(x_mm)))) * float(
+        np.median(abs(np.diff(y_mm)))
+    )
+    eligible = _unique_physical_candidate_rows(
+        [row for group in group_names for row in source_groups[group]]
+    )
+    occupied = _occupied_mask_cells(zones_payload, mask_name, eligible)
+    selected = {group: list(groups[group]) for group in group_names}
+
+    def evaluate(selection: Mapping[str, Sequence[Mapping[str, Any]]]) -> dict[str, Any]:
+        return _coverage_gate(
+            eligible,
+            [row for group in group_names for row in selection[group]],
+            occupied_eligible_cells=occupied,
+            cell_area_mm2=cell_area_mm2,
+        )
+
+    gate = evaluate(selected)
+    swaps: list[dict[str, str]] = []
+    maximum_swaps = sum(len(selected[group]) for group in group_names)
+    while not bool(gate["passed"]) and len(swaps) < maximum_swaps:
+        current_rank = _coverage_gate_rank(gate)
+        best: tuple[
+            tuple[Any, ...], str, int, Mapping[str, Any], Mapping[str, Any],
+            dict[str, list[dict[str, Any]]], dict[str, Any]
+        ] | None = None
+        for group in group_names:
+            selected_keys = {qualified_source_key(row) for row in selected[group]}
+            unselected = [
+                row for row in source_groups[group]
+                if qualified_source_key(row) not in selected_keys
+            ]
+            for selected_index, old in enumerate(selected[group]):
+                for new in unselected:
+                    trial = {name: list(rows) for name, rows in selected.items()}
+                    trial[group][selected_index] = dict(new)
+                    trial_gate = evaluate(trial)
+                    rank: tuple[Any, ...] = (
+                        *_coverage_gate_rank(trial_gate),
+                        group,
+                        qualified_source_key(old),
+                        qualified_source_key(new),
+                    )
+                    candidate = (
+                        rank, group, selected_index, old, new, trial, trial_gate
+                    )
+                    if best is None or candidate[0] < best[0]:
+                        best = candidate
+        if best is None or best[0][: len(current_rank)] >= current_rank:
+            break
+        _, group, _, old, new, selected, gate = best
+        swaps.append({
+            "training_group": group,
+            "removed_candidate_id": str(old["candidate_id"]),
+            "added_candidate_id": str(new["candidate_id"]),
+        })
+    if not bool(gate["passed"]):
+        raise ValueError(
+            f"{mask_name} final group-wise selection cannot satisfy the unchanged "
+            f"coverage gate by deterministic within-group swaps; "
+            f"rank={_coverage_gate_rank(gate)!r}"
+        )
+    selection_audit = {
+        "method": "group_fps_then_deterministic_coverage_swap",
+        "mask_name": mask_name,
+        "swap_count": len(swaps),
+        "swaps": swaps,
+        "coverage_gate": gate,
+    }
+    for group in group_names:
+        groups[group] = [
+            {**dict(row), "coverage_selection_audit": selection_audit}
+            for row in selected[group]
+        ]
+    return selection_audit
 
 
 def coverage_audit(

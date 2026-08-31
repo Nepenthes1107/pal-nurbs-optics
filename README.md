@@ -59,6 +59,10 @@ python -m biot.gui
   最多额外运行 30 个 attempt。最低 19×19 配额前只累计 patience，不允许 early stop。
 - 109 个 case 分为 10 组：Far 20、Far-robustness 8、Corridor upper/middle/lower 各 5、
   Near 20、Near-robustness 8、Near-edge-astig 8、Peripheral-left/right 各 15。
+- 420-case WFNO 合格池的最终固定数量选择保持各自 `training_group`，并在不改变
+  覆盖门槛和各组数量的前提下做 coverage-constrained 选择；确定性选择无法通过时失败关闭。
+  phase 进度使用 `training_group/candidate_id/distance/field` 稳定源键，不依赖每轮
+  重新编号的 `case_id`。
 - Far 使用真实 `Dinf`，robustness 使用 `D1000`，Near 使用 `D500`；
   corridor 从 Original PAL 中心带局部 ADD 逐行计算 `distance_mm=1000/ADD_D`。
 - 使用真实可微追迹、GRIN3 固定步长 RK4、连续参考球 OPL 和 FFT PSF；
@@ -129,6 +133,10 @@ python run_pal_nurbs.py `
 stopping 改造提升了 run identity 与 stage-resume schema；旧 run/checkpoint
 保持只读，不可按新方法恢复，必须使用新输出目录。当前项目不再支持跨平台
 training-state/parity 导入。
+
+完整 `candidate-trace` 进度可显式导入新 run：保存的原身份必须先通过自身哈希
+校验，镜片内容 SHA-256 与物理追迹参数也必须匹配；Linux/Windows checkout 的
+绝对路径不是物理身份字段。forward/final-phase 进度仍须严格匹配 pool identity。
 
 ## 验证
 

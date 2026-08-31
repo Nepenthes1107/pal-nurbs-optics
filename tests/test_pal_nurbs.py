@@ -25,6 +25,7 @@ from biot.e2e.pal_nurbs import (
     _open_run_directory,
     _evaluate_original_training_baseline_with_resume,
     _prepare_case_layout,
+    _qualified_pool_case_for_saved_attempt,
     _release_inactive_case_cuda_cache,
     _retain_training_cache,
     _restore_optimizer_state,
@@ -48,6 +49,65 @@ def _ten_group_cases() -> list[dict[str, object]]:
             start=1,
         )
     ]
+
+
+def test_current_phase_progress_uses_stable_source_key_before_renumbered_case_id() -> None:
+    qualified_pool = [
+        {
+            "case_id": "far_01_D1000",
+            "training_group": "far",
+            "candidate_id": "cand_a",
+            "distance_mm": 1000.0,
+            "field_x_deg": -9.0,
+            "field_y_deg": 1.0,
+        },
+        {
+            "case_id": "far_02_D1000",
+            "training_group": "far",
+            "candidate_id": "cand_b",
+            "distance_mm": 1000.0,
+            "field_x_deg": -8.0,
+            "field_y_deg": 2.0,
+        },
+    ]
+    by_key = {
+        pal_nurbs.qualified_source_key(row): row for row in qualified_pool
+    }
+    saved_attempt = {
+        **qualified_pool[1],
+        # A prior regional-FPS round assigned this now-colliding ordinal ID.
+        "case_id": "far_01_D1000",
+    }
+
+    resolved = _qualified_pool_case_for_saved_attempt(
+        saved_attempt, qualified_pool, by_key
+    )
+
+    assert resolved is qualified_pool[1]
+
+
+def test_current_phase_progress_does_not_fall_back_from_foreign_stable_key() -> None:
+    qualified_pool = [
+        {
+            "case_id": "far_01_D1000",
+            "training_group": "far",
+            "candidate_id": "cand_a",
+            "distance_mm": 1000.0,
+            "field_x_deg": -9.0,
+            "field_y_deg": 1.0,
+        }
+    ]
+    by_key = {
+        pal_nurbs.qualified_source_key(row): row for row in qualified_pool
+    }
+    foreign_attempt = {
+        **qualified_pool[0],
+        "candidate_id": "foreign",
+    }
+
+    assert _qualified_pool_case_for_saved_attempt(
+        foreign_attempt, qualified_pool, by_key
+    ) is None
 
 
 def test_main_training_phase_contract_is_nonlegacy_raw_psf() -> None:
