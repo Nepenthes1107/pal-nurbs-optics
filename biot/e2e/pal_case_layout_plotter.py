@@ -47,7 +47,6 @@ ZONE_REFERENCE_NAMES = {
 }
 GROUP_STYLES = {
     "far": ("#174a7e", "o", "Far"),
-    "far_robustness": ("#5b8db8", "o", "Far robustness"),
     "corridor_upper": ("#9467bd", "s", "Corridor upper"),
     "corridor_middle": ("#6f3b74", "s", "Corridor middle"),
     "corridor_lower": ("#b279a2", "s", "Corridor lower"),

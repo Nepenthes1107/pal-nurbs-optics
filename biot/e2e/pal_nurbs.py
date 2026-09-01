@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
+import scipy
 import torch
 import torch.nn.functional as F
 
@@ -56,13 +57,13 @@ from .system import (
     trace_system_to_image_with_phase,
     _snell,
 )
+from .weighted_mtf import weighted_mtf_mean_torch_batch
 
 
-METHOD_NAME = "pal_109case_stratified_corridor_csf_z4_smooth_v3zones_no_clearance_filter"
+METHOD_NAME = "pal_109case_9group_dinf_ahumada_z4_astig_fixed_tolerance_v4"
 
 DEFAULT_GROUP_WEIGHTS = {
-    "far": 0.22,
-    "far_robustness": 0.02,
+    "far": 0.24,
     "corridor_upper": 0.07,
     "corridor_middle": 0.10,
     "corridor_lower": 0.11,
@@ -130,6 +131,9 @@ class MinimalConfig:
         default_factory=lambda: dict(DEFAULT_GROUP_WEIGHTS)
     )
     near_edge_astig_A_weight: float = 0.10
+    weighted_mtf_loss_tolerance: float = 0.10
+    z4_rms_tolerance_mm: float = 1.0e-4
+    astigmatism_tolerance_D: float = 0.80
     smooth_lambda: float = 0.05
     candidate_trace_import: str | None = None
     forward_qualification_import: str | None = None
@@ -149,13 +153,21 @@ class MinimalConfig:
             raise ValueError("requested_np must be positive")
         weights = {str(name): float(value) for name, value in self.group_weights.items()}
         if set(weights) != set(TRAINING_GROUP_COUNTS):
-            raise ValueError("group_weights must define exactly the ten training groups")
+            raise ValueError("group_weights must define exactly the nine training groups")
         if any(not math.isfinite(value) or value <= 0.0 for value in weights.values()):
             raise ValueError("group_weights must be finite and positive")
         if not math.isclose(sum(weights.values()), 1.0, rel_tol=0.0, abs_tol=1.0e-12):
             raise ValueError("group_weights must sum to 1")
         if not 0.0 <= float(self.near_edge_astig_A_weight) <= 1.0:
             raise ValueError("near_edge_astig_A_weight must be in [0,1]")
+        for name in (
+            "weighted_mtf_loss_tolerance",
+            "z4_rms_tolerance_mm",
+            "astigmatism_tolerance_D",
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and positive")
         if not math.isfinite(float(self.smooth_lambda)) or float(self.smooth_lambda) < 0.0:
             raise ValueError("smooth_lambda must be finite and non-negative")
         if (self.candidate_field_min_deg is None) != (self.candidate_field_max_deg is None):
@@ -213,12 +225,12 @@ class MinimalConfig:
             raise ValueError("relative_improvement_threshold must be finite and positive")
 
 
-RUN_IDENTITY_SCHEMA_VERSION = 9
-PARENT_RUN_IDENTITY_SCHEMA_VERSIONS = (8, 9)
-CASE_LAYOUT_STATE_SCHEMA_VERSION = 10
-BASELINE_STATE_SCHEMA_VERSION = 6
-BASELINE_PROGRESS_SCHEMA_VERSION = 6
-STAGE_RESUME_SCHEMA_VERSION = 3
+RUN_IDENTITY_SCHEMA_VERSION = 10
+PARENT_RUN_IDENTITY_SCHEMA_VERSIONS = (10,)
+CASE_LAYOUT_STATE_SCHEMA_VERSION = 11
+BASELINE_STATE_SCHEMA_VERSION = 7
+BASELINE_PROGRESS_SCHEMA_VERSION = 7
+STAGE_RESUME_SCHEMA_VERSION = 4
 RUN_STATE_SCHEMA_VERSION = 1
 STAGE_LADDER = (7, 11, 19)
 FORWARD_POOL_MULTIPLIER = 4
@@ -428,6 +440,7 @@ def _implementation_closure_paths() -> list[Path]:
         "biot/e2e/surfaces.py",
         "biot/e2e/system.py",
         "biot/e2e/validation.py",
+        "biot/e2e/weighted_mtf.py",
     ]
     paths = [root / name for name in relative]
     missing = [str(path) for path in paths if not path.is_file()]
@@ -502,6 +515,7 @@ def _build_run_identity(config: MinimalConfig) -> dict[str, Any]:
             "torch": str(torch.__version__),
             "torch_cuda": None if torch.version.cuda is None else str(torch.version.cuda),
             "numpy": str(np.__version__),
+            "scipy": str(scipy.__version__),
             "platform": sys.platform,
         },
     }
@@ -822,86 +836,6 @@ def psf_second_moment_mm2_batch(
     cx = (normalized * xx_mm).sum(dim=(-2, -1), keepdim=True)
     cy = (normalized * yy_mm).sum(dim=(-2, -1), keepdim=True)
     return (normalized * ((xx_mm - cx).square() + (yy_mm - cy).square())).sum(dim=(-2, -1))
-
-
-def csf_weighted_mtf_loss_batch(
-    psf_kernel: torch.Tensor,
-    *,
-    pixel_pitch_mm: torch.Tensor,
-    maximum_frequency_lpmm: float = 30.0,
-    frequency_sample_count: int = 60,
-    angular_sample_count: int = 72,
-) -> torch.Tensor:
-    """Return differentiable Mannos-Sakrison CSF-weighted MTF losses."""
-    if psf_kernel.ndim != 3:
-        raise ValueError("batched CSF-MTF requires PSF shape [B,H,W]")
-    if pixel_pitch_mm.shape != (int(psf_kernel.shape[0]),):
-        raise ValueError("pixel_pitch_mm must have one value per PSF case")
-    if not bool(torch.isfinite(psf_kernel).all()) or bool((psf_kernel < 0.0).any()):
-        raise ValueError("CSF-MTF PSF must be finite and non-negative")
-    if not bool(torch.isfinite(pixel_pitch_mm).all()) or bool((pixel_pitch_mm <= 0.0).any()):
-        raise ValueError("CSF-MTF pixel pitch must be finite and positive")
-    h, w = int(psf_kernel.shape[-2]), int(psf_kernel.shape[-1])
-    otf = torch.fft.fftshift(
-        torch.fft.fft2(psf_kernel, dim=(-2, -1)), dim=(-2, -1)
-    )
-    magnitude = torch.abs(otf)
-    dc = magnitude[:, h // 2, w // 2]
-    if not bool(torch.isfinite(dc).all()) or bool((dc <= 0.0).any()):
-        raise ValueError("CSF-MTF OTF DC must be finite and positive")
-    mtf = magnitude / dc[:, None, None]
-    targets = torch.linspace(
-        0.0,
-        float(maximum_frequency_lpmm),
-        int(frequency_sample_count),
-        device=psf_kernel.device,
-        dtype=psf_kernel.dtype,
-    )
-    if int(targets.numel()) < 2:
-        raise ValueError("frequency_sample_count must be at least two")
-    if int(angular_sample_count) < 8:
-        raise ValueError("angular_sample_count must be at least eight")
-    angles = torch.arange(
-        int(angular_sample_count), device=psf_kernel.device, dtype=psf_kernel.dtype
-    ) * (2.0 * math.pi / int(angular_sample_count))
-    radial_profiles: list[torch.Tensor] = []
-    for case_index in range(int(psf_kernel.shape[0])):
-        pitch = float(pixel_pitch_mm[case_index].detach().cpu())
-        nyquist = 0.5 / pitch
-        if float(maximum_frequency_lpmm) > nyquist + 1.0e-12:
-            raise ValueError(
-                "CSF-MTF maximum frequency exceeds the PSF sampling Nyquist limit"
-            )
-        # Sample the 2-D MTF on concentric circles with bilinear interpolation.
-        # This avoids empty hard radial bins while keeping the complete loss in
-        # Torch/autograd. fftshift DC lies at (w//2, h//2), including even sizes.
-        frequency_x = targets[:, None] * torch.cos(angles)[None, :]
-        frequency_y = targets[:, None] * torch.sin(angles)[None, :]
-        index_x = frequency_x * (w * pitch) + float(w // 2)
-        index_y = frequency_y * (h * pitch) + float(h // 2)
-        grid_x = 2.0 * index_x / float(w - 1) - 1.0
-        grid_y = 2.0 * index_y / float(h - 1) - 1.0
-        grid = torch.stack((grid_x, grid_y), dim=-1).unsqueeze(0)
-        samples = F.grid_sample(
-            mtf[case_index][None, None],
-            grid,
-            mode="bilinear",
-            padding_mode="zeros",
-            align_corners=True,
-        )[0, 0]
-        radial_profiles.append(samples.mean(dim=-1))
-    radial = torch.stack(radial_profiles, dim=0)
-    frequency_cpd = targets * 0.291
-    csf = (
-        2.6
-        * (0.0192 + 0.114 * frequency_cpd)
-        * torch.exp(-torch.pow(0.114 * frequency_cpd, 1.1))
-    )
-    csf = csf / csf.sum()
-    loss = 1.0 - (radial * csf.unsqueeze(0)).sum(dim=-1)
-    if not bool(torch.isfinite(loss).all()) or bool((loss < -1.0e-12).any()):
-        raise ValueError("CSF-weighted MTF loss is invalid")
-    return loss.clamp_min(0.0)
 
 
 def laplacian_regularizer(
@@ -2085,31 +2019,57 @@ def prepare_only(config: MinimalConfig, *, resume: bool = False) -> Path:
 
 def _summarize_training_baseline(
     rows: Sequence[Mapping[str, Any]],
+    *,
+    group_weights: Mapping[str, float] = DEFAULT_GROUP_WEIGHTS,
 ) -> tuple[float, dict[str, Any]]:
     required = set(FUNCTIONAL_GROUPS + PERIPHERAL_GROUPS)
     actual = {str(row.get("training_group")) for row in rows}
     if actual != required:
-        raise ValueError(f"baseline rows do not contain exactly the ten groups: {sorted(actual)}")
+        raise ValueError(f"baseline rows do not contain exactly the nine groups: {sorted(actual)}")
+    weights = {str(name): float(value) for name, value in group_weights.items()}
+    if set(weights) != required or not math.isclose(
+        sum(weights.values()), 1.0, rel_tol=0.0, abs_tol=1.0e-12
+    ):
+        raise ValueError("baseline group weights must define the nine groups and sum to 1")
+    group_losses = {
+        name: sum(
+            float(row["score"])
+            for row in rows
+            if str(row["training_group"]) == name
+        )
+        / sum(str(row["training_group"]) == name for row in rows)
+        for name in FUNCTIONAL_GROUPS + PERIPHERAL_GROUPS
+    }
     maximum_edge = max(float(row["edge_fraction"]) for row in rows)
+    group_summary = {f"J_{name}": float(value) for name, value in group_losses.items()}
+    group_summary["J_mid"] = sum(
+        group_losses[name]
+        for name in ("corridor_upper", "corridor_middle", "corridor_lower")
+    ) / 3.0
+    functional_weight = sum(weights[name] for name in FUNCTIONAL_GROUPS)
+    peripheral_weight = sum(weights[name] for name in PERIPHERAL_GROUPS)
+    group_summary["J_functional"] = sum(
+        weights[name] * group_losses[name] for name in FUNCTIONAL_GROUPS
+    ) / functional_weight
+    group_summary["J_peripheral"] = sum(
+        weights[name] * group_losses[name] for name in PERIPHERAL_GROUPS
+    ) / peripheral_weight
+    objective_value = sum(
+        weights[name] * group_losses[name]
+        for name in FUNCTIONAL_GROUPS + PERIPHERAL_GROUPS
+    )
+    group_summary["J_total"] = objective_value
     health: dict[str, Any] = {
         "minimum_valid_fraction_ratio": 1.0,
         "maximum_edge_fraction": maximum_edge,
         "objective_name": (
-            "J=sum(group_weight*mean(normalized routed metric)); "
-            "far=CSF-MTF loss, corridor/near=Z4 OPD mm^2, peripheral=surface A_D"
+            "J=sum(group_weight*mean(fixed-tolerance normalized routed metric)); "
+            "far=Ahumada weighted-MTF loss, corridor/near=Z4 OPD mm^2, "
+            "peripheral=surface A_D"
         ),
+        **group_summary,
     }
-    for name in FUNCTIONAL_GROUPS + PERIPHERAL_GROUPS:
-        health[f"J_{name}"] = 1.0
-    health.update(
-        {
-            "J_mid": 1.0,
-            "J_functional": 1.0,
-            "J_peripheral": 1.0,
-            "J_total": 1.0,
-        }
-    )
-    return 1.0, health
+    return float(objective_value), health
 
 
 def _validate_baseline_progress_prefix(
@@ -2170,7 +2130,8 @@ def _batch_rows(
     scores: torch.Tensor,
     *,
     z4_defocus_mm2: torch.Tensor,
-    csf_mtf_loss: torch.Tensor,
+    weighted_mtf_loss: torch.Tensor,
+    weighted_mtf_score: torch.Tensor,
     astig_A_D: torch.Tensor,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
@@ -2182,7 +2143,8 @@ def _batch_rows(
             "m2_mm2": float(moments[index].detach().cpu()),
             "astig_A_D": float(astig_A_D[index].detach().cpu()),
             "z4_defocus_mm2": float(z4_defocus_mm2[index].detach().cpu()),
-            "csf_mtf_loss": float(csf_mtf_loss[index].detach().cpu()),
+            "weighted_mtf_loss": float(weighted_mtf_loss[index].detach().cpu()),
+            "weighted_mtf_score": float(weighted_mtf_score[index].detach().cpu()),
             "loss_metric": float(loss_metrics[index].detach().cpu()),
             "loss_metric_name": loss_metric_names[index],
             "score": float(scores[index].detach().cpu()),
@@ -2198,14 +2160,36 @@ def _loss_metrics_for_batch(
     cases: Sequence[Mapping[str, Any]],
     result: BatchFieldResult,
     moments: torch.Tensor,
-) -> tuple[torch.Tensor, list[str], torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[
+    torch.Tensor, list[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
     if result.z4_defocus_mm2 is None:
         raise RuntimeError("traced batch is missing continuous-OPD Z4 coefficients")
     z4_values = result.z4_defocus_mm2.reshape(-1)
     if z4_values.shape != moments.shape:
         raise ValueError("Z4 batch shape does not match traced cases")
-    csf_values = csf_weighted_mtf_loss_batch(
-        result.kernels, pixel_pitch_mm=result.pixel_pitch_mm
+    far_indices = [
+        index for index, case in enumerate(cases)
+        if str(case["training_group"]) == "far"
+    ]
+    weighted_scores = torch.zeros_like(z4_values)
+    if far_indices:
+        index_tensor = torch.as_tensor(
+            far_indices, device=result.kernels.device, dtype=torch.long
+        )
+        selected_scores = weighted_mtf_mean_torch_batch(
+            result.kernels.index_select(0, index_tensor),
+            pixel_pitch_mm=result.pixel_pitch_mm.index_select(0, index_tensor),
+        )
+        weighted_scores = weighted_scores.index_copy(0, index_tensor, selected_scores)
+    weighted_losses = torch.where(
+        torch.as_tensor(
+            [str(case["training_group"]) == "far" for case in cases],
+            device=z4_values.device,
+            dtype=torch.bool,
+        ),
+        1.0 - weighted_scores,
+        torch.zeros_like(weighted_scores),
     )
     needs_astig = any(str(case["training_group"]) == "near_edge_astig" for case in cases)
     astig_by_zone = model.astig_A_by_zone() if needs_astig else {}
@@ -2214,9 +2198,9 @@ def _loss_metrics_for_batch(
     astig_values: list[torch.Tensor] = []
     for index, case in enumerate(cases):
         group = str(case["training_group"])
-        if group in {"far", "far_robustness"}:
-            metrics.append(csf_values[index])
-            names.append("csf_mtf_loss")
+        if group == "far":
+            metrics.append(weighted_losses[index])
+            names.append("ahumada_weighted_mtf_loss")
             astig_values.append(torch.zeros_like(metrics[-1]))
         elif group == "near_edge_astig":
             metrics.append(z4_values[index])
@@ -2231,7 +2215,59 @@ def _loss_metrics_for_batch(
         names,
         torch.stack(astig_values),
         z4_values,
-        csf_values,
+        weighted_losses,
+        weighted_scores,
+    )
+
+
+def _normalized_scores_for_batch(
+    model: MinimalOpticalModel,
+    cases: Sequence[Mapping[str, Any]],
+    result: BatchFieldResult,
+    moments: torch.Tensor,
+    *,
+    weighted_mtf_loss_tolerance: float,
+    z4_rms_tolerance_mm: float,
+    astigmatism_tolerance_D: float,
+    near_edge_astig_A_weight: float,
+) -> tuple[
+    torch.Tensor, torch.Tensor, list[str], torch.Tensor, torch.Tensor,
+    torch.Tensor, torch.Tensor,
+]:
+    (
+        loss_metrics,
+        loss_metric_names,
+        astig_values,
+        z4_values,
+        weighted_losses,
+        weighted_scores,
+    ) = _loss_metrics_for_batch(model, cases, result, moments)
+    normalized: list[torch.Tensor] = []
+    z4_denominator = float(z4_rms_tolerance_mm) ** 2
+    for index, case in enumerate(cases):
+        group = str(case["training_group"])
+        if group == "far":
+            value = weighted_losses[index] / float(weighted_mtf_loss_tolerance)
+        else:
+            value = z4_values[index] / z4_denominator
+            if group == "near_edge_astig":
+                blend = float(near_edge_astig_A_weight)
+                value = (
+                    (1.0 - blend) * value
+                    + blend * astig_values[index] / float(astigmatism_tolerance_D)
+                )
+        normalized.append(value)
+    scores = torch.stack(normalized)
+    if not bool(torch.isfinite(scores).all()):
+        raise ValueError("fixed-tolerance normalized training score is non-finite")
+    return (
+        scores,
+        loss_metrics,
+        loss_metric_names,
+        astig_values,
+        z4_values,
+        weighted_losses,
+        weighted_scores,
     )
 
 
@@ -2241,6 +2277,11 @@ def _evaluate_original_training_baseline_with_resume(
     *,
     progress_path: str | Path,
     identity_sha256: str,
+    group_weights: Mapping[str, float] = DEFAULT_GROUP_WEIGHTS,
+    near_edge_astig_A_weight: float = 0.10,
+    weighted_mtf_loss_tolerance: float = 0.10,
+    z4_rms_tolerance_mm: float = 1.0e-4,
+    astigmatism_tolerance_D: float = 0.80,
 ) -> tuple[float, list[dict[str, Any]], dict[str, Any]]:
     path = Path(progress_path)
     training_ids = [str(case["case_id"]) for case in training_cases]
@@ -2332,21 +2373,32 @@ def _evaluate_original_training_baseline_with_resume(
                 result.kernels, pixel_pitch_mm=result.pixel_pitch_mm,
             )
             (
+                scores,
                 loss_metrics,
                 loss_metric_names,
                 astig_values,
                 z4_values,
-                csf_values,
-            ) = _loss_metrics_for_batch(model, batch, result, moments)
-            scores = torch.ones_like(loss_metrics)
+                weighted_losses,
+                weighted_scores,
+            ) = _normalized_scores_for_batch(
+                model,
+                batch,
+                result,
+                moments,
+                weighted_mtf_loss_tolerance=weighted_mtf_loss_tolerance,
+                z4_rms_tolerance_mm=z4_rms_tolerance_mm,
+                astigmatism_tolerance_D=astigmatism_tolerance_D,
+                near_edge_astig_A_weight=near_edge_astig_A_weight,
+            )
         batch_rows = _batch_rows(
             batch, result, moments, loss_metrics, loss_metric_names, None, scores,
             z4_defocus_mm2=z4_values,
-            csf_mtf_loss=csf_values,
+            weighted_mtf_loss=weighted_losses,
+            weighted_mtf_score=weighted_scores,
             astig_A_D=astig_values,
         )
         for row in batch_rows:
-            row["group_loss"] = 1.0
+            row["group_loss"] = float(row["score"])
         training_rows.extend(batch_rows)
         save_progress("training" if len(training_rows) < len(training_cases) else "complete")
         print(
@@ -2369,18 +2421,21 @@ def _evaluate_original_training_baseline_with_resume(
                 "m2_mm2": 0.0,
                 "astig_A_D": float(value.detach().cpu()),
                 "z4_defocus_mm2": 0.0,
-                "csf_mtf_loss": 0.0,
+                "weighted_mtf_loss": 0.0,
+                "weighted_mtf_score": 0.0,
                 "loss_metric": float(value.detach().cpu()),
                 "loss_metric_name": "astig_A_D",
-                "score": 1.0,
+                "score": float(value.detach().cpu()) / float(astigmatism_tolerance_D),
                 "valid_fraction": 1.0,
                 "valid_fraction_ratio": 1.0,
                 "edge_fraction": 0.0,
-                "group_loss": 1.0,
+                "group_loss": float(value.detach().cpu()) / float(astigmatism_tolerance_D),
             })
         save_progress("complete")
     save_progress("complete")
-    baseline_value, baseline_health = _summarize_training_baseline(training_rows)
+    baseline_value, baseline_health = _summarize_training_baseline(
+        training_rows, group_weights=group_weights
+    )
     return baseline_value, training_rows, baseline_health
 
 
@@ -2389,6 +2444,9 @@ def _evaluate(
     *, with_grad: bool, baseline_valid: Mapping[str, float] | None = None,
     group_weights: Mapping[str, float] = DEFAULT_GROUP_WEIGHTS,
     near_edge_astig_A_weight: float = 0.10,
+    weighted_mtf_loss_tolerance: float = 0.10,
+    z4_rms_tolerance_mm: float = 1.0e-4,
+    astigmatism_tolerance_D: float = 0.80,
     progress_stage: str | None = None,
     progress_step: str | None = None,
     progress_learning_rate: float | None = None,
@@ -2409,14 +2467,14 @@ def _evaluate(
     actual = set(group_counts)
     if actual != required or any(group_counts[name] <= 0 for name in required):
         raise ValueError(
-            "grouped training schema must contain exactly the ten groups "
+            "grouped training schema must contain exactly the nine groups "
             f"{sorted(required)}, got {sorted(actual)}"
         )
     weights = {str(name): float(value) for name, value in group_weights.items()}
     if set(weights) != required or not math.isclose(
         sum(weights.values()), 1.0, rel_tol=0.0, abs_tol=1.0e-12
     ):
-        raise ValueError("group_weights must define the ten groups and sum to 1")
+        raise ValueError("group_weights must define the nine groups and sum to 1")
     minimum_ratio, maximum_edge = math.inf, 0.0
     batch_size = int(getattr(getattr(model, "config", None), "case_batch_size", 1))
     traced_cases = [
@@ -2438,39 +2496,23 @@ def _evaluate(
                 raise ValueError("evaluation batch contains a non-unit PSF energy")
             moments = psf_second_moment_mm2_batch(result.kernels, pixel_pitch_mm=result.pixel_pitch_mm)
             (
+                scores,
                 loss_metrics,
                 loss_metric_names,
                 astig_values,
                 z4_values,
-                csf_values,
-            ) = _loss_metrics_for_batch(model, batch, result, moments)
-            if baseline is None:
-                scores = torch.ones_like(loss_metrics)
-            else:
-                score_values: list[torch.Tensor] = []
-                for index, case in enumerate(batch):
-                    group = str(case["training_group"])
-                    denominator = float(baseline[str(case["case_id"])]["loss_metric"])
-                    if not math.isfinite(denominator) or denominator <= 0.0:
-                        raise ValueError(
-                            f"invalid Original PAL loss denominator for {case['case_id']}: {denominator}"
-                        )
-                    primary = loss_metrics[index] / denominator
-                    if group == "near_edge_astig":
-                        astig_denominator = float(
-                            baseline[str(case["case_id"])]["astig_A_D"]
-                        )
-                        if not math.isfinite(astig_denominator) or astig_denominator <= 0.0:
-                            raise ValueError(
-                                f"invalid Original PAL astig denominator for {case['case_id']}"
-                            )
-                        blend = float(near_edge_astig_A_weight)
-                        primary = (
-                            (1.0 - blend) * primary
-                            + blend * astig_values[index] / astig_denominator
-                        )
-                    score_values.append(primary)
-                scores = torch.stack(score_values)
+                weighted_losses,
+                weighted_scores,
+            ) = _normalized_scores_for_batch(
+                model,
+                batch,
+                result,
+                moments,
+                weighted_mtf_loss_tolerance=weighted_mtf_loss_tolerance,
+                z4_rms_tolerance_mm=z4_rms_tolerance_mm,
+                astigmatism_tolerance_D=astigmatism_tolerance_D,
+                near_edge_astig_A_weight=near_edge_astig_A_weight,
+            )
             coefficients = torch.as_tensor(
                 [
                     weights[str(case["training_group"])]
@@ -2502,7 +2544,8 @@ def _evaluate(
                 baseline_valid,
                 scores,
                 z4_defocus_mm2=z4_values,
-                csf_mtf_loss=csf_values,
+                weighted_mtf_loss=weighted_losses,
+                weighted_mtf_score=weighted_scores,
                 astig_A_D=astig_values,
             )
         )
@@ -2534,15 +2577,7 @@ def _evaluate(
         for case in peripheral_cases:
             group = str(case["training_group"])
             raw = astig_by_zone[GROUP_TO_ZONE[group]]
-            if baseline is None:
-                score = torch.ones_like(raw)
-            else:
-                denominator = float(baseline[str(case["case_id"])]["loss_metric"])
-                if not math.isfinite(denominator) or denominator <= 0.0:
-                    raise ValueError(
-                        f"invalid Original PAL loss denominator for {case['case_id']}: {denominator}"
-                    )
-                score = raw / denominator
+            score = raw / float(astigmatism_tolerance_D)
             weighted = score * (weights[group] / group_counts[group])
             peripheral_loss = weighted if peripheral_loss is None else peripheral_loss + weighted
             value = float(score.detach().cpu())
@@ -2552,7 +2587,8 @@ def _evaluate(
                 "m2_mm2": 0.0,
                 "astig_A_D": float(raw.detach().cpu()),
                 "z4_defocus_mm2": 0.0,
-                "csf_mtf_loss": 0.0,
+                "weighted_mtf_loss": 0.0,
+                "weighted_mtf_score": 0.0,
                 "loss_metric": float(raw.detach().cpu()),
                 "loss_metric_name": "astig_A_D",
                 "score": value,
@@ -2595,8 +2631,9 @@ def _evaluate(
         "J_total": float(objective_value),
     })
     objective_name = (
-        "J=sum(group_weight*mean(normalized routed metric)); "
-        "far=CSF-MTF loss, corridor/near=Z4 OPD mm^2, peripheral=surface A_D"
+        "J=sum(group_weight*mean(fixed-tolerance normalized routed metric)); "
+        "far=Ahumada weighted-MTF loss, corridor/near=Z4 OPD mm^2, "
+        "peripheral=surface A_D"
     )
     return float(objective_value), rows, {
         "minimum_valid_fraction_ratio": minimum_ratio,
@@ -2610,6 +2647,294 @@ def _save_checkpoint(path: Path, module: FixedWeightNURBSPerturbation, **metadat
     _torch_save_atomic(
         path,
         {"control_count": module.control_shape[0], "state_dict": module.state_dict(), **metadata},
+    )
+
+
+GRADIENT_DIAGNOSTIC_SCHEMA_VERSION = 1
+
+
+def _group_gradient_for_diagnostic(
+    model: MinimalOpticalModel,
+    module: FixedWeightNURBSPerturbation,
+    cases: Sequence[Mapping[str, Any]],
+    group: str,
+    *,
+    near_edge_astig_A_weight: float,
+    weighted_mtf_loss_tolerance: float,
+    z4_rms_tolerance_mm: float,
+    astigmatism_tolerance_D: float,
+) -> tuple[float, torch.Tensor]:
+    members = [case for case in cases if str(case["training_group"]) == group]
+    if not members:
+        raise ValueError(f"gradient diagnostic group is empty: {group}")
+    accumulated = torch.zeros_like(module.inner_q)
+    loss_value = 0.0
+    if group in PERIPHERAL_GROUPS:
+        raw = model.astig_A_by_zone()[GROUP_TO_ZONE[group]]
+        group_loss = raw / float(astigmatism_tolerance_D)
+        gradient = torch.autograd.grad(group_loss, module.inner_q)[0]
+        accumulated.add_(gradient.detach())
+        loss_value = float(group_loss.detach().cpu())
+        return loss_value, accumulated
+
+    batch_size = int(getattr(getattr(model, "config", None), "case_batch_size", 1))
+    for batch in _case_batches(members, batch_size):
+        result = _field_batch(model, batch)
+        energy = result.kernels.sum(dim=(-2, -1))
+        if not bool(torch.isfinite(result.kernels).all()) or bool((result.kernels < 0).any()):
+            raise ValueError("gradient diagnostic contains an invalid physical PSF")
+        if bool((energy - 1.0).abs().max() > 1.0e-10):
+            raise ValueError("gradient diagnostic contains a non-unit PSF energy")
+        moments = psf_second_moment_mm2_batch(
+            result.kernels, pixel_pitch_mm=result.pixel_pitch_mm
+        )
+        scores, *_ = _normalized_scores_for_batch(
+            model,
+            batch,
+            result,
+            moments,
+            weighted_mtf_loss_tolerance=weighted_mtf_loss_tolerance,
+            z4_rms_tolerance_mm=z4_rms_tolerance_mm,
+            astigmatism_tolerance_D=astigmatism_tolerance_D,
+            near_edge_astig_A_weight=near_edge_astig_A_weight,
+        )
+        contribution = scores.sum() / len(members)
+        gradient = torch.autograd.grad(contribution, module.inner_q)[0]
+        if not bool(torch.isfinite(gradient).all()):
+            raise RuntimeError(f"non-finite gradient diagnostic for group {group}")
+        accumulated.add_(gradient.detach())
+        loss_value += float(contribution.detach().cpu())
+        result_device = result.kernels.device
+        del result, energy, moments, scores, contribution, gradient
+        _release_inactive_case_cuda_cache(result_device)
+    return loss_value, accumulated
+
+
+def _gradient_cosine(left: torch.Tensor, right: torch.Tensor) -> float | None:
+    left_norm = torch.linalg.vector_norm(left)
+    right_norm = torch.linalg.vector_norm(right)
+    if float(left_norm.detach().cpu()) == 0.0 or float(right_norm.detach().cpu()) == 0.0:
+        return None
+    value = torch.dot(left.reshape(-1), right.reshape(-1)) / (left_norm * right_norm)
+    result = float(value.detach().cpu())
+    if not math.isfinite(result):
+        raise RuntimeError("gradient diagnostic cosine is non-finite")
+    return max(-1.0, min(1.0, result))
+
+
+def _build_gradient_diagnostic(
+    model: MinimalOpticalModel,
+    module: FixedWeightNURBSPerturbation,
+    cases: Sequence[Mapping[str, Any]],
+    *,
+    label: str,
+    identity_sha256: str,
+    checkpoint_sha256: str,
+    group_weights: Mapping[str, float],
+    near_edge_astig_A_weight: float,
+    weighted_mtf_loss_tolerance: float,
+    z4_rms_tolerance_mm: float,
+    astigmatism_tolerance_D: float,
+) -> dict[str, Any]:
+    groups = FUNCTIONAL_GROUPS + PERIPHERAL_GROUPS
+    before_state = {
+        name: value.detach().clone() for name, value in module.state_dict().items()
+    }
+    before_grad = (
+        None if module.inner_q.grad is None else module.inner_q.grad.detach().clone()
+    )
+    rng_state = _capture_rng_state()
+    gradients: dict[str, torch.Tensor] = {}
+    losses: dict[str, float] = {}
+    try:
+        for group in groups:
+            loss, gradient = _group_gradient_for_diagnostic(
+                model,
+                module,
+                cases,
+                group,
+                near_edge_astig_A_weight=near_edge_astig_A_weight,
+                weighted_mtf_loss_tolerance=weighted_mtf_loss_tolerance,
+                z4_rms_tolerance_mm=z4_rms_tolerance_mm,
+                astigmatism_tolerance_D=astigmatism_tolerance_D,
+            )
+            if not math.isfinite(loss) or not bool(torch.isfinite(gradient).all()):
+                raise RuntimeError(f"invalid gradient diagnostic result for group {group}")
+            losses[group] = loss
+            gradients[group] = gradient.detach().clone()
+    finally:
+        _restore_rng_state(rng_state)
+        if before_grad is None:
+            module.inner_q.grad = None
+        else:
+            module.inner_q.grad = before_grad
+    for name, before in before_state.items():
+        after = module.state_dict()[name]
+        if not torch.equal(before, after):
+            raise RuntimeError(f"gradient diagnostic changed model parameter {name}")
+
+    total_gradient = sum(
+        (float(group_weights[group]) * gradients[group] for group in groups),
+        torch.zeros_like(module.inner_q),
+    )
+    total_norm = float(torch.linalg.vector_norm(total_gradient).detach().cpu())
+    if not math.isfinite(total_norm):
+        raise RuntimeError("total gradient diagnostic norm is non-finite")
+    group_payload: dict[str, Any] = {}
+    for group in groups:
+        gradient = gradients[group]
+        norm = float(torch.linalg.vector_norm(gradient).detach().cpu())
+        linf = float(gradient.abs().max().detach().cpu())
+        nonzero = int(torch.count_nonzero(gradient).detach().cpu())
+        group_payload[group] = {
+            "loss": losses[group],
+            "gradient_l2": norm,
+            "gradient_linf": linf,
+            "weighted_gradient_l2": float(group_weights[group]) * norm,
+            "finite_element_count": int(torch.isfinite(gradient).sum().detach().cpu()),
+            "nonzero_element_count": nonzero,
+            "zero_norm": norm == 0.0,
+            "cosine_with_total": _gradient_cosine(gradient, total_gradient),
+        }
+    cosine_matrix = {
+        left: {
+            right: _gradient_cosine(gradients[left], gradients[right])
+            for right in groups
+        }
+        for left in groups
+    }
+    body = {
+        "schema_version": GRADIENT_DIAGNOSTIC_SCHEMA_VERSION,
+        "identity_sha256": identity_sha256,
+        "label": label,
+        "checkpoint_sha256": checkpoint_sha256,
+        "control_count": int(module.control_shape[0]),
+        "parameter": "inner_q",
+        "parameter_shape": list(module.inner_q.shape),
+        "group_order": list(groups),
+        "group_weights": {name: float(group_weights[name]) for name in groups},
+        "tolerances": {
+            "weighted_mtf_loss": float(weighted_mtf_loss_tolerance),
+            "z4_rms_mm": float(z4_rms_tolerance_mm),
+            "astigmatism_D": float(astigmatism_tolerance_D),
+        },
+        "near_edge_astig_A_weight": float(near_edge_astig_A_weight),
+        "total_gradient_l2": total_norm,
+        "groups": group_payload,
+        "cosine_matrix": cosine_matrix,
+    }
+    return {**body, "diagnostic_sha256": _canonical_json_sha256(body)}
+
+
+def _ensure_gradient_diagnostic(
+    model: MinimalOpticalModel,
+    module: FixedWeightNURBSPerturbation,
+    cases: Sequence[Mapping[str, Any]],
+    *,
+    output: Path,
+    label: str,
+    checkpoint_path: Path,
+    identity_sha256: str,
+    group_weights: Mapping[str, float],
+    near_edge_astig_A_weight: float,
+    weighted_mtf_loss_tolerance: float,
+    z4_rms_tolerance_mm: float,
+    astigmatism_tolerance_D: float,
+) -> Path:
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"gradient diagnostic checkpoint is missing: {checkpoint_path}")
+    checkpoint = _load_torch_mapping(
+        checkpoint_path, map_location=module.inner_q.device
+    )
+    checkpoint_state = checkpoint.get(
+        "model_state" if label == "baseline_7x7" else "state_dict"
+    )
+    if not isinstance(checkpoint_state, dict):
+        raise ValueError(f"gradient diagnostic checkpoint state is malformed: {checkpoint_path}")
+    if int(checkpoint.get("control_count", -1)) != int(module.control_shape[0]):
+        raise ValueError(f"gradient diagnostic checkpoint control count mismatch: {checkpoint_path}")
+    _assert_state_dict_equal(
+        checkpoint_state,
+        module.state_dict(),
+        context=f"gradient diagnostic {label} checkpoint/model",
+    )
+    checkpoint_sha256 = _sha256_file(checkpoint_path)
+    directory = output / "gradient_diagnostics"
+    path = directory / f"{label}.json"
+    if path.is_file():
+        payload = _read_json(path)
+        claimed = str(payload.pop("diagnostic_sha256", ""))
+        if not claimed or claimed != _canonical_json_sha256(payload):
+            raise ValueError(f"gradient diagnostic self-hash mismatch: {path}")
+        if (
+            int(payload.get("schema_version", -1)) != GRADIENT_DIAGNOSTIC_SCHEMA_VERSION
+            or payload.get("identity_sha256") != identity_sha256
+            or payload.get("checkpoint_sha256") != checkpoint_sha256
+            or payload.get("label") != label
+        ):
+            raise ValueError(f"gradient diagnostic identity mismatch: {path}")
+    else:
+        payload = _build_gradient_diagnostic(
+            model,
+            module,
+            cases,
+            label=label,
+            identity_sha256=identity_sha256,
+            checkpoint_sha256=checkpoint_sha256,
+            group_weights=group_weights,
+            near_edge_astig_A_weight=near_edge_astig_A_weight,
+            weighted_mtf_loss_tolerance=weighted_mtf_loss_tolerance,
+            z4_rms_tolerance_mm=z4_rms_tolerance_mm,
+            astigmatism_tolerance_D=astigmatism_tolerance_D,
+        )
+        _write_json_atomic(path, payload)
+
+    records = []
+    for name in ("baseline_7x7", "stage_7x7_final"):
+        artifact = directory / f"{name}.json"
+        if artifact.is_file():
+            records.append(
+                {"label": name, "path": artifact.name, "sha256": _sha256_file(artifact)}
+            )
+    manifest_body = {
+        "schema_version": GRADIENT_DIAGNOSTIC_SCHEMA_VERSION,
+        "identity_sha256": identity_sha256,
+        "artifacts": records,
+    }
+    _write_json_atomic(
+        directory / "manifest.json",
+        {**manifest_body, "manifest_sha256": _canonical_json_sha256(manifest_body)},
+    )
+    return path
+
+
+def _write_inherited_gradient_diagnostic_manifest(
+    *, output: Path, identity_sha256: str, parent_context: Mapping[str, Any]
+) -> None:
+    parent_identity = str(parent_context["identity_sha256"])
+    artifact_paths = dict(parent_context["artifact_paths"])
+    records = [
+        {
+            "label": label,
+            "source": "parent_run",
+            "parent_identity_sha256": parent_identity,
+            "sha256": _sha256_file(Path(artifact_paths[key])),
+        }
+        for label, key in (
+            ("baseline_7x7", "gradient_diagnostic_baseline"),
+            ("stage_7x7_final", "gradient_diagnostic_stage_7"),
+        )
+    ]
+    body = {
+        "schema_version": GRADIENT_DIAGNOSTIC_SCHEMA_VERSION,
+        "identity_sha256": identity_sha256,
+        "source": "validated_parent_lineage",
+        "parent_identity_sha256": parent_identity,
+        "artifacts": records,
+    }
+    _write_json_atomic(
+        output / "gradient_diagnostics" / "manifest.json",
+        {**body, "manifest_sha256": _canonical_json_sha256(body)},
     )
 
 
@@ -2950,6 +3275,15 @@ def _validate_parent_run_source(
         "forward_qualification_progress": parent / "forward_qualification_progress.json",
         "final_phase_qualification_progress": parent / "final_phase_qualification_progress.json",
         "baseline_state": parent / "baseline_state.pt",
+        "gradient_diagnostic_baseline": (
+            parent / "gradient_diagnostics" / "baseline_7x7.json"
+        ),
+        "gradient_diagnostic_stage_7": (
+            parent / "gradient_diagnostics" / "stage_7x7_final.json"
+        ),
+        "gradient_diagnostic_manifest": (
+            parent / "gradient_diagnostics" / "manifest.json"
+        ),
     }
     missing = [f"{name}={path}" for name, path in base_paths.items() if not path.is_file()]
     if missing:
@@ -3206,6 +3540,23 @@ def _validate_parent_run_source(
         raise ValueError("parent baseline state schema mismatch")
     if str(baseline_state.get("identity_sha256", "")) != parent_identity_sha256:
         raise ValueError("parent baseline state identity mismatch")
+    for name in ("gradient_diagnostic_baseline", "gradient_diagnostic_stage_7"):
+        diagnostic = _read_json(base_paths[name])
+        claimed = str(diagnostic.pop("diagnostic_sha256", ""))
+        if not claimed or claimed != _canonical_json_sha256(diagnostic):
+            raise ValueError(f"parent {name} self-hash mismatch")
+        if (
+            int(diagnostic.get("schema_version", -1))
+            != GRADIENT_DIAGNOSTIC_SCHEMA_VERSION
+            or diagnostic.get("identity_sha256") != parent_identity_sha256
+        ):
+            raise ValueError(f"parent {name} identity mismatch")
+    diagnostic_manifest = _read_json(base_paths["gradient_diagnostic_manifest"])
+    manifest_claim = str(diagnostic_manifest.pop("manifest_sha256", ""))
+    if not manifest_claim or manifest_claim != _canonical_json_sha256(diagnostic_manifest):
+        raise ValueError("parent gradient diagnostic manifest self-hash mismatch")
+    if diagnostic_manifest.get("identity_sha256") != parent_identity_sha256:
+        raise ValueError("parent gradient diagnostic manifest identity mismatch")
 
     artifact_paths = {
         **base_paths,
@@ -3350,6 +3701,9 @@ def _run_bound(
     objective_options = {
         "group_weights": config.group_weights,
         "near_edge_astig_A_weight": config.near_edge_astig_A_weight,
+        "weighted_mtf_loss_tolerance": config.weighted_mtf_loss_tolerance,
+        "z4_rms_tolerance_mm": config.z4_rms_tolerance_mm,
+        "astigmatism_tolerance_D": config.astigmatism_tolerance_D,
     }
 
     baseline_state_path = output / "baseline_state.pt"
@@ -3394,6 +3748,8 @@ def _run_bound(
         baseline_value = float(baseline_state["baseline_value"])
         baseline_rows = [dict(row) for row in baseline_state["baseline_rows"]]
         baseline_health = dict(baseline_state["baseline_health"])
+        if baseline_state.get("objective_config") != objective_options:
+            raise ValueError("baseline state fixed-tolerance objective config mismatch")
         baseline_power = {
             "P_far_D": float(baseline_state["baseline_power"]["P_far_D"]),
             "ADD_D": float(baseline_state["baseline_power"]["ADD_D"]),
@@ -3433,6 +3789,7 @@ def _run_bound(
             training_cases,
             progress_path=output / "baseline_progress.pt",
             identity_sha256=identity_sha256,
+            **objective_options,
         )
         baseline_state = {
             "schema_version": BASELINE_STATE_SCHEMA_VERSION,
@@ -3443,6 +3800,7 @@ def _run_bound(
             "baseline_value": float(baseline_value),
             "baseline_rows": baseline_rows,
             "baseline_health": baseline_health,
+            "objective_config": objective_options,
             "baseline_power": baseline_power,
             "rng_state": _capture_rng_state(),
         }
@@ -3461,6 +3819,24 @@ def _run_bound(
             "ADD_D": float(baseline_power["ADD_D"]),
         },
     )
+    write_state("baseline_gradient_diagnostic")
+    if parent_context is None:
+        _ensure_gradient_diagnostic(
+            model,
+            module,
+            training_cases,
+            output=output,
+            label="baseline_7x7",
+            checkpoint_path=baseline_state_path,
+            identity_sha256=identity_sha256,
+            **objective_options,
+        )
+    else:
+        _write_inherited_gradient_diagnostic_manifest(
+            output=output,
+            identity_sha256=identity_sha256,
+            parent_context=parent_context,
+        )
     cache_audit = _retain_training_cache(model, training_cases)
     write_state("baseline_complete", cache_audit=cache_audit)
     log_progress(
@@ -3600,16 +3976,10 @@ def _run_bound(
             write_state("stage_initialize", control_count=control_count, completed_step=0)
             if control_count == 7 and parent_context is None:
                 # The 7x7 module is verified above to be the exact zero-residual
-                # Original PAL state. Every case denominator is that same physical
-                # baseline, so all group objectives and J are exactly 1 without an
-                # additional 109-case evaluation pass.
+                # Original PAL state.  Its fixed-tolerance group objectives were
+                # already measured above, so no duplicate 109-case pass is needed.
                 current = float(baseline_value)
                 health = dict(baseline_health)
-                if abs(current - 1.0) > 1.0e-15 or any(
-                    abs(float(health[f"J_{name}"]) - 1.0) > 1.0e-15
-                    for name in FUNCTIONAL_GROUPS + PERIPHERAL_GROUPS
-                ):
-                    raise ValueError("Original PAL baseline is not the exact 7x7 initial objective")
             else:
                 current, _, health = _evaluate(
                     model,
@@ -4039,6 +4409,18 @@ def _run_bound(
             **_joint_metric_fields(best, best_health),
             step=len(history),
         )
+        if control_count == 7:
+            write_state("stage_7x7_gradient_diagnostic")
+            _ensure_gradient_diagnostic(
+                model,
+                module,
+                training_cases,
+                output=output,
+                label="stage_7x7_final",
+                checkpoint_path=stage_dir / "final.pt",
+                identity_sha256=identity_sha256,
+                **objective_options,
+            )
         if not (stage_dir / "best.pt").exists():
             _save_checkpoint(
                 stage_dir / "best.pt",
@@ -4137,8 +4519,25 @@ def _run_bound(
     final_add_D = float(final_power["ADD_D"])
     max_abs_sag_delta_mm = float(delta.abs().max())
     metric_names = ("far", "mid", "near", "peripheral", "functional")
+    invalid_improvement_baselines = [
+        name
+        for name in metric_names
+        if not math.isfinite(float(baseline_health[f"J_{name}"]))
+        or float(baseline_health[f"J_{name}"]) <= 0.0
+    ]
+    if invalid_improvement_baselines:
+        raise ValueError(
+            "baseline group objective is invalid for relative improvement: "
+            + ", ".join(invalid_improvement_baselines)
+        )
+    if not math.isfinite(float(baseline_value)) or float(baseline_value) <= 0.0:
+        raise ValueError("baseline total objective is invalid for relative improvement")
     improvement_by_group = {
-        name: 100.0 * (1.0 - float(final_health[f"J_{name}"]))
+        name: 100.0 * (
+            1.0
+            - float(final_health[f"J_{name}"])
+            / float(baseline_health[f"J_{name}"])
+        )
         for name in metric_names
     }
     runtime_seconds = prior_elapsed + time.time() - session_start
@@ -4151,6 +4550,9 @@ def _run_bound(
         "objective_name": final_health["objective_name"],
         "group_weights": dict(config.group_weights),
         "near_edge_astig_A_weight": config.near_edge_astig_A_weight,
+        "weighted_mtf_loss_tolerance": config.weighted_mtf_loss_tolerance,
+        "z4_rms_tolerance_mm": config.z4_rms_tolerance_mm,
+        "astigmatism_tolerance_D": config.astigmatism_tolerance_D,
         "smooth_lambda": config.smooth_lambda,
         "training_case_count": len(training_cases),
         "training_groups": {
@@ -4172,6 +4574,12 @@ def _run_bound(
         "final_metrics": _joint_metric_fields(final_value, final_health),
         "improvement_percent": 100 * (1 - final_value / baseline_value),
         "improvement_percent_by_group": improvement_by_group,
+        "gradient_diagnostics": {
+            "manifest": "gradient_diagnostics/manifest.json",
+            "manifest_sha256": _sha256_file(
+                output / "gradient_diagnostics" / "manifest.json"
+            ),
+        },
         "final_control_count": module.control_shape[0],
         "P_far_D": final_p_far_D,
         "ADD_D": final_add_D,

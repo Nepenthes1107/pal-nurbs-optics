@@ -14,7 +14,8 @@
 - 新实验输出：`results/optimization/run_001`、`run_002`，依次递增。
 - 历史证据：`results/archive/`，不进入 Git，也不参与新实验身份。
 - 当前入口：`run_pal_nurbs.py`；PAL 实现位于 `biot/e2e/pal_nurbs.py` 和 `biot/e2e/pal_case_layout.py`。
-- 当前分支将训练布局提升为 10 组 109 case；其中 79 个功能 case 使用
+- 当前分支使用 9 组 109 case：Far 28、Corridor 三组各 5、Near 20、
+  Near-robustness 8、Near-edge-astig 8、Peripheral 左右各 15；其中 79 个功能 case 使用
   GPU tensor 真实追迹，30 个周边 case 仅用可微面形 A_D，不进入光线追迹。
   默认 `case_batch_size=8`、`requested_np=256`、FFT `512`，不做 OOM 自动降级。
 - `main` 的分阶段训练输出统一显示 `stage/step/batch/loss/update/lr`，并写入 run 根目录 `training.log`；各阶段 `history.csv` 和 resume checkpoint 继续作为结构化恢复依据。
@@ -34,9 +35,10 @@
   forward/final-phase qualification、baseline 及从 terminal 到起点的逐级
   zero-budget refinement 必须通过身份、checkpoint 和 `1e-10` 面形/导数审计；
   不存在重算或导入父 Adam 的兜底。父目录保持只读，child 只能在自身
-  目录 `--resume`。新 child 使用 run identity schema 9；已完成 schema 8
-  run 只获得父源导入兼容，不获得原目录新 schema resume 兼容。
-- 新训练合同统一使用 `D500/D1000/Dinf`；已完成的旧 `run_001` 保持历史训练身份，不原位改写。
+  目录 `--resume`。新训练与 child 使用 run identity schema 10，父源也必须是
+  同方法的 schema 10；旧 schema 8/9 run 不获得 resume 或 parent 兼容性。
+- Far 训练只使用 28 个 `Dinf` case，不再包含 Far-robustness/D1000 Far 组；
+  Near-robustness 仍使用 D1000。已完成旧 run 保持历史训练身份，不原位改写。
 - `main` 与多物距分支均显式固定 `legacy_pupil_phase=False`、`phase_reference="biot_reference_sphere"`、`remove_tilt=False`；相位/PSF 表示变化已提升 run、case-layout 和 baseline schema，旧 checkpoint 不可按新合同恢复。
 - `evaluate_pal_nurbs.py` 在 `<run>/evaluation` 生成独立评价身份；三物距×双状态
   分别保存为六个 HDF5，每个文件含 81 个场点的原始 FFT PSF、130×130 渲染
@@ -68,9 +70,21 @@
 
 ## 有效合同与限制
 
-- 训练 case 数量固定为 20/8/5/5/5/20/8/8/15/15，显式分组权重和为 1。
-  Far 使用 CSF-MTF，corridor/near 使用连续 OPD 拟合的 OSA/ANSI Z4²，
-  near-edge 小权重合入 near A_D，周边使用面形 A_D。
+- 训练 case 数量固定为 28/5/5/5/20/8/8/15/15，权重为
+  0.24/0.07/0.10/0.11/0.18/0.02/0.04/0.12/0.12。
+  Far 使用与评价一致的 Ahumada weighted-MTF；corridor/near 使用连续 OPD
+  OSA/ANSI Z4²；near-edge 为 90% Z4² + 10% near A_D；周边使用面形 A_D。
+- 逐 case baseline 归一化已删除。weighted-MTF loss、Z4 RMS、A_D 分别用固定
+  0.10、1e-4 mm、0.80 D 容差；baseline 保存实际目标值，只用于健康比例、改善率和审计。
+- Original PAL 7×7 与 7×7 final 分别输出九组梯度范数/余弦 JSON 和哈希 manifest；
+  不新增 D1000 Far 门禁、区域统计或诊断图。正式评价器三物距六 HDF5 及所有
+  D1000 weighted-MTF/PSF/chart 产物保持原合同。
+- 本次最小成本验证：case-layout 定向文件 `20 passed`，评价器定向文件
+  `16 passed`；PAL 定向文件首次为 `58 passed, 1 failed`，唯一失败是旧测试仍要求
+  baseline 目标恒等于 1，删除该旧假设后该恢复测试单独通过。随后 512×512
+  weighted-MTF 数值/梯度、三项容差校验和九组梯度诊断共 `5 passed`；
+  Dinf 稳定键与合格池重选另有 `3 passed`；
+  `py_compile`、CLI `--help` 与 `git diff --check` 通过。未运行完整测试套件或正式训练。
 - Z4 执行层使用 Torch reduced-QR/三角求解保持 autograd；BIOT NumPy 拟合仅用于
   detached 对比验证，不从 PSF 逆变换恢复相位，也不保留 M2 训练回退。
 - 处方门禁除 `P_far`/`ADD` 外，对 lower-edge guard 检查 candidate 相对

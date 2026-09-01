@@ -42,7 +42,7 @@ from biot.e2e.pal_nurbs import (
 from biot.e2e.regional_nurbs import FixedWeightNURBSPerturbation
 
 
-def _ten_group_cases() -> list[dict[str, object]]:
+def _nine_group_cases() -> list[dict[str, object]]:
     return [
         {"case_id": f"case_{index:02d}", "training_group": group, "scale": float(index)}
         for index, group in enumerate(
@@ -68,7 +68,7 @@ def _make_completed_parent_fixture(
         max_extra_terminal_stage_steps=0,
     )
     identity_body = {
-        "schema_version": 8,
+        "schema_version": pal_nurbs.RUN_IDENTITY_SCHEMA_VERSION,
         "method": pal_nurbs.METHOD_NAME,
         "fixture": "completed-parent",
     }
@@ -190,7 +190,7 @@ def _make_completed_parent_fixture(
         parent / "final_phase_qualification_progress.json", {"status": "complete"}
     )
     zero = FixedWeightNURBSPerturbation(7, device="cpu", dtype=torch.float64)
-    baseline_cases = _ten_group_cases()
+    baseline_cases = _nine_group_cases()
     baseline_rows = [
         {
             **case,
@@ -225,8 +225,46 @@ def _make_completed_parent_fixture(
             "baseline_value": 1.0,
             "baseline_rows": baseline_rows,
             "baseline_health": baseline_health,
+            "objective_config": {
+                "group_weights": config.group_weights,
+                "near_edge_astig_A_weight": config.near_edge_astig_A_weight,
+                "weighted_mtf_loss_tolerance": config.weighted_mtf_loss_tolerance,
+                "z4_rms_tolerance_mm": config.z4_rms_tolerance_mm,
+                "astigmatism_tolerance_D": config.astigmatism_tolerance_D,
+            },
             "baseline_power": {"P_far_D": 0.0, "ADD_D": 0.0},
             "rng_state": pal_nurbs._capture_rng_state(),
+        },
+    )
+    diagnostics = parent / "gradient_diagnostics"
+    diagnostic_records = []
+    for label, checkpoint in (
+        ("baseline_7x7", parent / "baseline_state.pt"),
+        ("stage_7x7_final", parent / "stage_7x7" / "final.pt"),
+    ):
+        body = {
+            "schema_version": pal_nurbs.GRADIENT_DIAGNOSTIC_SCHEMA_VERSION,
+            "identity_sha256": identity_sha256,
+            "label": label,
+            "checkpoint_sha256": pal_nurbs._sha256_file(checkpoint),
+        }
+        path = diagnostics / f"{label}.json"
+        _write_json_fixture(
+            path, {**body, "diagnostic_sha256": pal_nurbs._canonical_json_sha256(body)}
+        )
+        diagnostic_records.append(
+            {"label": label, "path": path.name, "sha256": pal_nurbs._sha256_file(path)}
+        )
+    manifest_body = {
+        "schema_version": pal_nurbs.GRADIENT_DIAGNOSTIC_SCHEMA_VERSION,
+        "identity_sha256": identity_sha256,
+        "artifacts": diagnostic_records,
+    }
+    _write_json_fixture(
+        diagnostics / "manifest.json",
+        {
+            **manifest_body,
+            "manifest_sha256": pal_nurbs._canonical_json_sha256(manifest_body),
         },
     )
     return parent, config, modules
@@ -235,18 +273,18 @@ def _make_completed_parent_fixture(
 def test_current_phase_progress_uses_stable_source_key_before_renumbered_case_id() -> None:
     qualified_pool = [
         {
-            "case_id": "far_01_D1000",
+            "case_id": "far_01_Dinf",
             "training_group": "far",
             "candidate_id": "cand_a",
-            "distance_mm": 1000.0,
+            "distance_mm": float("inf"),
             "field_x_deg": -9.0,
             "field_y_deg": 1.0,
         },
         {
-            "case_id": "far_02_D1000",
+            "case_id": "far_02_Dinf",
             "training_group": "far",
             "candidate_id": "cand_b",
-            "distance_mm": 1000.0,
+            "distance_mm": float("inf"),
             "field_x_deg": -8.0,
             "field_y_deg": 2.0,
         },
@@ -257,7 +295,7 @@ def test_current_phase_progress_uses_stable_source_key_before_renumbered_case_id
     saved_attempt = {
         **qualified_pool[1],
         # A prior regional-FPS round assigned this now-colliding ordinal ID.
-        "case_id": "far_01_D1000",
+        "case_id": "far_01_Dinf",
     }
 
     resolved = _qualified_pool_case_for_saved_attempt(
@@ -270,10 +308,10 @@ def test_current_phase_progress_uses_stable_source_key_before_renumbered_case_id
 def test_current_phase_progress_does_not_fall_back_from_foreign_stable_key() -> None:
     qualified_pool = [
         {
-            "case_id": "far_01_D1000",
+            "case_id": "far_01_Dinf",
             "training_group": "far",
             "candidate_id": "cand_a",
-            "distance_mm": 1000.0,
+            "distance_mm": float("inf"),
             "field_x_deg": -9.0,
             "field_y_deg": 1.0,
         }
@@ -487,7 +525,7 @@ def test_parent_fork_run_uses_parent_best_and_preserves_parent(
     tmp_path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     parent, _, _ = _make_completed_parent_fixture(tmp_path, steps=(1, 1, 0))
-    training_cases = _ten_group_cases()
+    training_cases = _nine_group_cases()
     for index, case in enumerate(training_cases):
         case.update({
             "distance_mm": 500.0 + 100.0 * index,
@@ -962,7 +1000,25 @@ def test_inactive_case_cuda_cache_is_released_only_for_cuda(
     assert calls == ["empty"]
 
 
-def test_joint_loss_uses_explicit_ten_group_weights_and_routed_metrics() -> None:
+@pytest.mark.parametrize(
+    "field_name,bad_value",
+    [
+        ("weighted_mtf_loss_tolerance", 0.0),
+        ("z4_rms_tolerance_mm", float("nan")),
+        ("astigmatism_tolerance_D", -0.1),
+    ],
+)
+def test_fixed_metric_tolerances_must_be_finite_and_positive(
+    field_name: str, bad_value: float,
+) -> None:
+    with pytest.raises(ValueError, match=f"{field_name} must be finite and positive"):
+        MinimalConfig(**{field_name: bad_value})
+    assert len(pal_nurbs.DEFAULT_GROUP_WEIGHTS) == 9
+    assert pal_nurbs.DEFAULT_GROUP_WEIGHTS["far"] == 0.24
+    assert sum(pal_nurbs.DEFAULT_GROUP_WEIGHTS.values()) == pytest.approx(1.0)
+
+
+def test_joint_loss_uses_explicit_nine_group_weights_and_routed_metrics() -> None:
     parameter = torch.nn.Parameter(torch.tensor(-0.5, dtype=torch.float64))
 
     class Model:
@@ -984,18 +1040,18 @@ def test_joint_loss_uses_explicit_ten_group_weights_and_routed_metrics() -> None
                 "near": torch.sigmoid(parameter * 1.5),
             }
 
-    cases = _ten_group_cases()
+    cases = _nine_group_cases()
     baseline = {
         str(case["case_id"]): {"loss_metric": 0.25, "astig_A_D": 0.2}
         for case in cases
     }
     value, rows, health = _evaluate(Model(), cases, baseline, with_grad=True)
     metrics = {str(row["training_group"]): str(row["loss_metric_name"]) for row in rows}
-    assert all(metrics[group] == "csf_mtf_loss" for group in ("far", "far_robustness"))
+    assert metrics["far"] == "ahumada_weighted_mtf_loss"
     assert all(
         metrics[group].startswith("z4_defocus_mm2")
         for group in pal_nurbs.FUNCTIONAL_GROUPS
-        if group not in {"far", "far_robustness"}
+        if group != "far"
     )
     assert all(
         metrics[group] == "astig_A_D"
@@ -1006,9 +1062,91 @@ def test_joint_loss_uses_explicit_ten_group_weights_and_routed_metrics() -> None
         for group in pal_nurbs.FUNCTIONAL_GROUPS + pal_nurbs.PERIPHERAL_GROUPS
     )
     assert abs(value - expected) < 1e-15
+    by_group = {str(row["training_group"]): row for row in rows}
+    assert by_group["far"]["score"] == pytest.approx(
+        by_group["far"]["weighted_mtf_loss"] / 0.10
+    )
+    assert by_group["corridor_upper"]["score"] == pytest.approx(
+        by_group["corridor_upper"]["z4_defocus_mm2"] / (1.0e-4 ** 2)
+    )
+    assert by_group["near_edge_astig"]["score"] == pytest.approx(
+        0.9 * by_group["near_edge_astig"]["z4_defocus_mm2"] / (1.0e-4 ** 2)
+        + 0.1 * by_group["near_edge_astig"]["astig_A_D"] / 0.80
+    )
+    assert by_group["peripheral_left"]["score"] == pytest.approx(
+        by_group["peripheral_left"]["astig_A_D"] / 0.80
+    )
+    different_baseline = {
+        str(case["case_id"]): {"loss_metric": 1.0e9, "astig_A_D": 1.0e-9}
+        for case in cases
+    }
+    repeated, _, _ = _evaluate(Model(), cases, different_baseline, with_grad=False)
+    assert repeated == pytest.approx(value)
     assert parameter.grad is not None
     assert torch.isfinite(parameter.grad)
     assert float(parameter.grad) != 0.0
+
+
+def test_group_gradient_diagnostic_reports_norms_cosines_and_preserves_state() -> None:
+    module = FixedWeightNURBSPerturbation(7, device="cpu", dtype=torch.float64)
+
+    class Model:
+        config = MinimalConfig(device="cpu", case_batch_size=2, kernel_size_px=9)
+
+        def field_batch(self, batch: list[dict[str, object]]) -> BatchFieldResult:
+            scales = torch.as_tensor(
+                [float(case["scale"]) for case in batch], dtype=torch.float64
+            )
+            edge = torch.sigmoid(module.inner_q.mean() * scales - 0.5)
+            kernels = torch.zeros((len(batch), 9, 9), dtype=torch.float64)
+            kernels[:, 4, 4] = 1.0 - edge
+            kernels[:, 4, 5] = edge
+            return BatchFieldResult(
+                kernels=kernels,
+                valid_fraction=torch.ones_like(edge),
+                pixel_pitch_mm=torch.full_like(edge, 1.0e-3),
+                edge_fraction=torch.zeros_like(edge),
+                z4_defocus_mm2=edge.square(),
+            )
+
+        def astig_A_by_zone(self) -> dict[str, torch.Tensor]:
+            value = torch.sigmoid(module.inner_q.mean() - 0.25)
+            return {"astig_left": value, "astig_right": value * 1.1, "near": value * 0.5}
+
+    module.inner_q.grad = torch.ones_like(module.inner_q)
+    before_state = {name: value.clone() for name, value in module.state_dict().items()}
+    payload = pal_nurbs._build_gradient_diagnostic(
+        Model(),
+        module,
+        _nine_group_cases(),
+        label="test",
+        identity_sha256="identity",
+        checkpoint_sha256="checkpoint",
+        group_weights=pal_nurbs.DEFAULT_GROUP_WEIGHTS,
+        near_edge_astig_A_weight=0.10,
+        weighted_mtf_loss_tolerance=0.10,
+        z4_rms_tolerance_mm=1.0e-4,
+        astigmatism_tolerance_D=0.80,
+    )
+    assert payload["group_order"] == list(
+        pal_nurbs.FUNCTIONAL_GROUPS + pal_nurbs.PERIPHERAL_GROUPS
+    )
+    assert len(payload["groups"]) == 9
+    assert len(payload["cosine_matrix"]) == 9
+    assert math.isfinite(payload["total_gradient_l2"])
+    assert all(
+        math.isfinite(record["gradient_l2"])
+        for record in payload["groups"].values()
+    )
+    assert pal_nurbs._gradient_cosine(
+        torch.zeros(2, dtype=torch.float64), torch.ones(2, dtype=torch.float64)
+    ) is None
+    assert module.inner_q.grad is not None
+    assert torch.equal(module.inner_q.grad, torch.ones_like(module.inner_q))
+    assert all(
+        torch.equal(before_state[name], value)
+        for name, value in module.state_dict().items()
+    )
 
 
 def test_evaluate_uses_one_backward_per_partial_case_batch(
@@ -1053,7 +1191,7 @@ def test_evaluate_uses_one_backward_per_partial_case_batch(
                 "near": torch.sigmoid(parameter * 3.5),
             }
 
-    cases = _ten_group_cases()
+    cases = _nine_group_cases()
     baseline = {
         str(case["case_id"]): {"loss_metric": 1.0, "astig_A_D": 1.0}
         for case in cases
@@ -1069,7 +1207,7 @@ def test_evaluate_uses_one_backward_per_partial_case_batch(
         progress_learning_rate=2.0e-3,
     )
     assert len(model.batch_calls) == 4
-    assert model.batch_calls[-1] == ["case_07", "case_08"]
+    assert model.batch_calls[-1] == ["case_07"]
     assert len(rows) == len(cases)
     assert math.isfinite(value)
     assert math.isfinite(health["J_total"])
@@ -1094,12 +1232,12 @@ def test_joint_loss_rejects_incomplete_extra_or_mixed_training_groups() -> None:
             kernel[1, 1] = 1.0
             return FieldResult(kernel, torch.tensor(1.0), 1.0, torch.tensor(0.0))
 
-    complete = _ten_group_cases()
+    complete = _nine_group_cases()
     baseline = {str(case["case_id"]): {"loss_metric": 1.0} for case in complete}
-    with pytest.raises(ValueError, match="exactly the ten groups"):
+    with pytest.raises(ValueError, match="exactly the nine groups"):
         _evaluate(Model(), complete[:-1], baseline, with_grad=False)
     extra = complete + [{"case_id": "x", "training_group": "other"}]
-    with pytest.raises(ValueError, match="exactly the ten groups"):
+    with pytest.raises(ValueError, match="exactly the nine groups"):
         _evaluate(
             Model(), extra, {**baseline, "x": {"loss_metric": 1.0}}, with_grad=False
         )
@@ -1562,7 +1700,7 @@ def test_complete_pool_progress_import_rejects_foreign_pool(tmp_path) -> None:
 
 
 def test_original_training_baseline_progress_resumes_at_the_exact_next_case(tmp_path) -> None:
-    training_cases = _ten_group_cases()
+    training_cases = _nine_group_cases()
     class Model:
         device = torch.device("cpu")
 
@@ -1611,11 +1749,11 @@ def test_original_training_baseline_progress_resumes_at_the_exact_next_case(tmp_
         progress_path=path,
         identity_sha256="identity",
     )
-    assert resumed.calls == [f"case_{index:02d}" for index in range(3, 9)]
-    assert [row["case_id"] for row in rows] == [f"case_{index:02d}" for index in range(1, 11)]
-    assert value == 1.0
-    assert health["J_functional"] == 1.0
-    assert health["J_peripheral"] == 1.0
+    assert resumed.calls == [f"case_{index:02d}" for index in range(3, 8)]
+    assert [row["case_id"] for row in rows] == [f"case_{index:02d}" for index in range(1, 10)]
+    assert math.isfinite(value) and value != 1.0
+    assert health["J_functional"] != 1.0
+    assert health["J_peripheral"] == pytest.approx((0.2 + 0.3) / (2.0 * 0.8))
 
     with pytest.raises(ValueError, match="case order/IDs changed"):
         _evaluate_original_training_baseline_with_resume(
@@ -1644,7 +1782,7 @@ def test_interrupted_training_resume_matches_uninterrupted_adam_state(
         lambda: [implementation],
     )
 
-    training_cases = _ten_group_cases()
+    training_cases = _nine_group_cases()
     for index, case in enumerate(training_cases):
         group = str(case["training_group"])
         case.update({
@@ -1901,7 +2039,7 @@ def test_joint_loss_fails_closed_when_a_case_is_detached_from_nurbs() -> None:
                 "near": torch.tensor(0.25, dtype=torch.float64),
             }
 
-    cases = _ten_group_cases()
+    cases = _nine_group_cases()
     baseline = {
         str(case["case_id"]): {"loss_metric": 0.25, "astig_A_D": 0.25}
         for case in cases

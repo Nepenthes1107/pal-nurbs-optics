@@ -25,12 +25,15 @@ import numpy as np
 import pandas as pd
 import scipy
 import torch
-from scipy.interpolate import CubicSpline, RegularGridInterpolator
+from scipy.interpolate import RegularGridInterpolator
 from scipy.ndimage import gaussian_filter, zoom
 from scipy.signal import fftconvolve
 
-from optics import compute_dc_normalized_mtf
 from biot.e2e import pal_nurbs as pal
+from biot.e2e.weighted_mtf import (
+    COMMON_FREQ_LPMM,
+    weighted_mtf_numpy,
+)
 
 
 EVAL_SCHEMA = 3
@@ -46,13 +49,7 @@ PSF_DISPLAY_SMOOTH_SIGMA = 2.0
 FIGURE_DPI = 160
 WEIGHTED_MTF_INTERPOLATED_RESOLUTION = 200
 WEIGHTED_MTF_FIELD_INTERPOLATION = "cubic"
-COMMON_FREQ = np.linspace(0.0, 100.0, 1000, dtype=np.float64)
-CSF_MM_PER_DEG = 0.291
-CSF_F0 = 4.1726
-CSF_F1 = 1.3625
-CSF_A = 0.8493
-CSF_P = 0.7786
-CSF_GAIN = 373.08
+COMMON_FREQ = COMMON_FREQ_LPMM
 
 
 def _progress(**fields: Any) -> None:
@@ -880,38 +877,8 @@ def _validate_psf_database(
 
 
 def _weighted_mtf(psf: np.ndarray, pitch_mm: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    psf = _normalize_physical_psf("weighted-MTF PSF", psf)
-    mtf = np.asarray(compute_dc_normalized_mtf(psf), dtype=np.float64)
-    size, center = int(mtf.shape[0]), int(mtf.shape[0]) // 2
-    frequency = (1.0 / ((size + 1) * float(pitch_mm))) * np.arange(center + 1)
-    sagittal = mtf[center, center : center + center + 1]
-    tangential = mtf[center : center + center + 1, center]
-    count = min(frequency.size, sagittal.size, tangential.size)
-    frequency = np.asarray(frequency[:count], dtype=np.float64)
-    sagittal = np.clip(np.asarray(sagittal[:count], dtype=np.float64), 0.0, 1.0)
-    tangential = np.clip(np.asarray(tangential[:count], dtype=np.float64), 0.0, 1.0)
-    if frequency[-1] < 100.0:
-        raise ValueError(f"native MTF support ends at {frequency[-1]:g} cycles/mm, below 100")
-    sagittal_common = CubicSpline(frequency, sagittal, extrapolate=False)(COMMON_FREQ)
-    tangential_common = CubicSpline(frequency, tangential, extrapolate=False)(COMMON_FREQ)
-    if not np.isfinite(sagittal_common).all() or not np.isfinite(tangential_common).all():
-        raise ValueError("MTF interpolation produced non-finite values")
-    cycles_per_degree = COMMON_FREQ * CSF_MM_PER_DEG
-    sech = lambda value: 1.0 / np.cosh(value)
-    weight = np.maximum(
-        CSF_GAIN * (sech((cycles_per_degree / CSF_F0) ** CSF_P)
-                    - CSF_A * sech(cycles_per_degree / CSF_F1)), 0.0,
-    )
-    normalization = float(np.trapz(weight, COMMON_FREQ))
-    if not math.isfinite(normalization) or normalization <= 0.0:
-        raise ValueError("Ahumada CSF normalization is invalid")
-    sagittal_score = float(np.trapz(weight * sagittal_common, COMMON_FREQ) / normalization)
-    tangential_score = float(np.trapz(weight * tangential_common, COMMON_FREQ) / normalization)
-    return (
-        np.asarray([sagittal_score, tangential_score,
-                    0.5 * (sagittal_score + tangential_score)]),
-        sagittal_common, tangential_common,
-    )
+    normalized = _normalize_physical_psf("weighted-MTF PSF", psf)
+    return weighted_mtf_numpy(normalized, float(pitch_mm))
 
 
 def _stage_is_complete(path: Path, config: Mapping[str, Any]) -> bool:

@@ -76,7 +76,7 @@ def _traced_candidates() -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for zone, y0 in (("far", 20.0), ("near", -22.0)):
         for iy, y in enumerate((y0 - 6, y0 - 2, y0 + 2, y0 + 6)):
-            for ix, x in enumerate((-12.0, -6.0, 0.0, 6.0, 12.0)):
+            for ix, x in enumerate((-12.0, -8.0, -4.0, 0.0, 4.0, 8.0, 12.0)):
                 rows.append(_candidate(f"{zone}_{iy}_{ix}", zone, x, y, x, y))
     for iy, y in enumerate((-10.0, -6.0, -2.0)):
         for x in (-8.0, -4.0, 0.0, 4.0, 8.0):
@@ -245,6 +245,24 @@ def test_select_training_cases_serializes_infinite_distance_without_overflow() -
     far_cases = [case for case in cases if case["training_group"] == "far"]
     assert far_cases
     assert all(case["case_id"].endswith("_Dinf") for case in far_cases)
+    zones = _zones_payload()
+    reselected = select_training_cases(
+        cases,
+        far_object_distance_mm=float("inf"),
+        intermediate_object_distance_mm=2000.0,
+        near_object_distance_mm=500.0,
+        corridor_y_min_mm=-9.0,
+        corridor_y_max_mm=-3.0,
+        power_map=np.asarray(zones["maps"]["power_D"], dtype=np.float64),
+        pfar=1.0,
+        zones_payload=zones,
+    )
+    assert sum(case["training_group"] == "far" for case in reselected) == 28
+    assert all(
+        math.isinf(float(case["distance_mm"]))
+        for case in reselected
+        if case["training_group"] == "far"
+    )
 
 
 def test_final_fps_retains_each_qualified_pool_training_group() -> None:
@@ -253,12 +271,12 @@ def test_final_fps_retains_each_qualified_pool_training_group() -> None:
     rogue = next(
         dict(case)
         for case in qualified_pool
-        if case["training_group"] == "far_robustness"
+        if case["training_group"] == "near_robustness"
     )
     rogue.update(
         {
             "candidate_id": "robustness_only_extreme",
-            "case_id": "far_robustness_pool_extreme_D2000",
+            "case_id": "near_robustness_pool_extreme_D2000",
             "field_x_deg": 99.0,
             "reference_lens_x_mm": 100.0,
             "distance_mm": 2000.0,
@@ -312,7 +330,7 @@ def test_partition_classification_respects_physical_y_order() -> None:
     assert classify_partition_point(payload, x_mm=0.0, physical_y_mm=-20.0) == "near"
 
 
-def test_preoptimization_artifacts_record_candidates_and_ten_groups(tmp_path) -> None:
+def test_preoptimization_artifacts_record_candidates_and_nine_groups(tmp_path) -> None:
     zones_path = tmp_path / "zones.json"
     zones_path.write_text(json.dumps(_zones_payload()), encoding="utf-8")
     excel_path = tmp_path / "lens.xlsx"
@@ -338,14 +356,14 @@ def test_preoptimization_artifacts_record_candidates_and_ten_groups(tmp_path) ->
     ):
         assert (output / name).is_file()
     manifest = json.loads((output / "case_manifest.json").read_text(encoding="utf-8"))
-    assert manifest["schema_version"] == 7
+    assert manifest["schema_version"] == 8
     assert "posthoc_cases_json" not in manifest["source"]
     assert manifest["group_counts"] == TRAINING_GROUP_COUNTS
     assert "group_weight" in manifest["objective_contract"]["J"]
     assert manifest["case_geometry_audit"]["passed"] is True
     assert manifest["coverage_audit"]["overall_passed"] is True
     coverage = json.loads((output / "coverage_audit.json").read_text(encoding="utf-8"))
-    assert coverage["schema_version"] == 5
+    assert coverage["schema_version"] == 6
     assert coverage["overall_passed"] is True
     for side in ("peripheral_astig_left", "peripheral_astig_right"):
         assert all(
@@ -406,7 +424,7 @@ def test_preoptimization_artifacts_accept_group_qualified_pool_candidate_reuse(
     manifest = json.loads(
         (output / "case_manifest.json").read_text(encoding="utf-8")
     )
-    assert manifest["schema_version"] == 7
+    assert manifest["schema_version"] == 8
     membership = manifest["candidate_membership_audit"]
     assert membership["candidate_domain"] == "group_qualified_pool"
     assert membership["candidate_record_count"] == len(qualified_pool)
@@ -414,12 +432,12 @@ def test_preoptimization_artifacts_accept_group_qualified_pool_candidate_reuse(
     coverage = json.loads(
         (output / "coverage_audit.json").read_text(encoding="utf-8")
     )
-    assert coverage["schema_version"] == 5
+    assert coverage["schema_version"] == 6
     assert coverage["candidate_reuse_count"] > 0
     assert coverage["overall_passed"] is True
     far_cases = [
         case for case in cases
-        if case["training_group"] in {"far", "far_robustness"}
+        if case["training_group"] == "far"
     ]
     assert far_cases
     selection_audit = far_cases[0]["coverage_selection_audit"]

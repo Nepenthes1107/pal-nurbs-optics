@@ -16,8 +16,7 @@ import numpy as np
 
 
 TRAINING_GROUP_COUNTS = {
-    "far": 20,
-    "far_robustness": 8,
+    "far": 28,
     "corridor_upper": 5,
     "corridor_middle": 5,
     "corridor_lower": 5,
@@ -33,7 +32,6 @@ PERIPHERAL_REAR_MIRROR_TOLERANCE_MM = 1.0e-4
 REFERENCE_RETRACE_TOLERANCE_MM = 1.0e-8
 FUNCTIONAL_GROUPS = (
     "far",
-    "far_robustness",
     "corridor_upper",
     "corridor_middle",
     "corridor_lower",
@@ -48,7 +46,6 @@ PARTITION_ORDER = (
 )
 GROUP_TO_ZONE = {
     "far": "far",
-    "far_robustness": "far",
     "corridor_upper": "corridor",
     "corridor_middle": "corridor",
     "corridor_lower": "corridor",
@@ -629,7 +626,7 @@ def select_training_cases(
         forward-qualified oversampling pool is already tagged, however, and
         each record carries group-specific distance/qualification evidence.
         Re-selection from that pool must not mix sibling groups that happen
-        to share a partition (for example far and far_robustness).
+        to share a partition (for example near and near_robustness).
         """
         return [
             row for row in eligible
@@ -641,7 +638,6 @@ def select_training_cases(
         ]
 
     far_rows = source_rows("far", "far")
-    far_robustness_rows = source_rows("far_robustness", "far")
     corridor_upper_rows = source_rows("corridor_upper", "corridor")
     corridor_middle_rows = source_rows("corridor_middle", "corridor")
     corridor_lower_rows = source_rows("corridor_lower", "corridor")
@@ -650,11 +646,6 @@ def select_training_cases(
     near_edge_astig_rows = source_rows("near_edge_astig", "near")
     groups: dict[str, list[dict[str, Any]]] = {
         "far": _fps_rows(far_rows, resolved_counts["far"]),
-        "far_robustness": _fps_rows(
-            far_robustness_rows,
-            resolved_counts["far_robustness"],
-            (0.0, 15.0),
-        ),
         "corridor_upper": _select_corridor_stratum(
             corridor_upper_rows, resolved_counts["corridor_upper"],
             add_min_D=0.2, add_max_D=0.5, include_upper=False,
@@ -704,17 +695,13 @@ def select_training_cases(
     if retain_source_groups:
         _refine_group_union_coverage(
             groups,
-            source_groups={
-                "far": far_rows,
-                "far_robustness": far_robustness_rows,
-            },
-            group_names=("far", "far_robustness"),
+            source_groups={"far": far_rows},
+            group_names=("far",),
             mask_name="far",
             zones_payload=zones_payload,
         )
     group_distance = {
         "far": far_object_distance_mm,
-        "far_robustness": intermediate_object_distance_mm,
         "near": near_object_distance_mm,
         "near_robustness": intermediate_object_distance_mm,
         "near_edge_astig": near_object_distance_mm,
@@ -756,7 +743,7 @@ def partition_audit(payload: Mapping[str, Any], cases: Sequence[Mapping[str, Any
     topology = dict(dict(payload.get("rules", {})).get("topology", {}))
     stats = dict(payload.get("statistics", {}))
     zone_groups = {
-        "far": ("far", "far_robustness"),
+        "far": ("far",),
         "corridor": ("corridor_upper", "corridor_middle", "corridor_lower"),
         "corridor_flank": ("corridor_upper", "corridor_middle", "corridor_lower"),
         "near": ("near", "near_robustness", "near_edge_astig"),
@@ -1130,7 +1117,7 @@ def coverage_audit(
     pitch_y = float(np.median(abs(np.diff(y))))
     cell_area = pitch_x * pitch_y
     zone_specs = {
-        "far": ("far", ("far", "far_robustness")),
+        "far": ("far", ("far",)),
         "corridor": (
             "corridor", ("corridor_upper", "corridor_middle", "corridor_lower")
         ),
@@ -1271,7 +1258,7 @@ def coverage_audit(
         if not bool(band["coverage_gate"]["passed"])
     )
     return {
-        "schema_version": 5,
+        "schema_version": 6,
         "interpretation": (
             "Coverage is contracted on zone-intersection trace-successful candidates; "
             "the complete raster mask can contain physically unreachable cells. Occupied-cell fractions count "
@@ -1393,7 +1380,7 @@ def _validate_selected_case_geometry(
             expected_distance = resolved_band_distances[expected_band]
         elif group == "far":
             expected_distance = resolved_distances["far"]
-        elif group in {"far_robustness", "near_robustness"}:
+        elif group == "near_robustness":
             expected_distance = resolved_distances["intermediate"]
         elif group in {"near", "near_edge_astig"}:
             expected_distance = resolved_distances["near"]
@@ -1683,7 +1670,7 @@ def write_preoptimization_artifacts(
         )
 
     manifest = {
-        "schema_version": 7,
+        "schema_version": 8,
         "purpose": f"pal_nurbs_dense_field_fps_{TOTAL_TRAINING_CASES}_case_contract",
         "source": {
             "excel": {"path": str(excel_path), "sha256": _sha256_file(excel_path)},
@@ -1692,10 +1679,10 @@ def write_preoptimization_artifacts(
         "reference_geometry": {"object_distance_mm": reference_distance_mm, "ray": "aimed centre-pupil ray", "surface": "Original PAL rear surface", "coordinates": "physical local-surface x/y in mm"},
         "sampling_contract": dict(sampling_contract),
         "objective_contract": {
-            "denominator": "per-case Original PAL baseline for the routed physical metric",
-            "metrics": "far=CSF-MTF loss; corridor/near=Z4 OPD mm^2; peripheral=surface A_D",
-            "J": "sum(group_weight * mean(per-case normalized score))",
-            "aggregation_order": "mean within each of ten groups before explicit group weighting",
+            "denominator": "fixed physical tolerance for each routed metric type",
+            "metrics": "far=Ahumada weighted-MTF loss; corridor/near=Z4 OPD mm^2; peripheral=surface A_D",
+            "J": "sum(group_weight * mean(fixed-tolerance normalized score))",
+            "aggregation_order": "mean within each of nine groups before explicit group weighting",
         },
         "coverage_audit": {
             "path": str(coverage_json.resolve()),

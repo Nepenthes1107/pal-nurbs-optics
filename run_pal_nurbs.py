@@ -93,6 +93,24 @@ def main() -> int:
         help="仅在 19x19 阶段启用的 NURBS 归一化二阶差分权重",
     )
     parser.add_argument(
+        "--weighted-mtf-loss-tolerance",
+        type=float,
+        default=MinimalConfig.weighted_mtf_loss_tolerance,
+        help="Far 的固定 Ahumada weighted-MTF loss 容差（无量纲）",
+    )
+    parser.add_argument(
+        "--z4-rms-tolerance-mm",
+        type=float,
+        default=MinimalConfig.z4_rms_tolerance_mm,
+        help="corridor/near 的固定 Z4 RMS 容差（mm，目标分母为其平方）",
+    )
+    parser.add_argument(
+        "--astigmatism-tolerance-D",
+        type=float,
+        default=MinimalConfig.astigmatism_tolerance_D,
+        help="near-edge/peripheral 的固定 A_D 容差（D）",
+    )
+    parser.add_argument(
         "--prepare-only",
         action="store_true",
         help="只输出优化前分区图、case 清单和镜片/物方 case 分布图，不启动 PSF 优化",
@@ -113,6 +131,9 @@ def main() -> int:
         relative_improvement_threshold=args.relative_improvement_threshold,
         max_extra_terminal_stage_steps=args.max_extra_terminal_stage_steps,
         smooth_lambda=args.smooth_lambda,
+        weighted_mtf_loss_tolerance=args.weighted_mtf_loss_tolerance,
+        z4_rms_tolerance_mm=args.z4_rms_tolerance_mm,
+        astigmatism_tolerance_D=args.astigmatism_tolerance_D,
         candidate_trace_import=args.candidate_trace_import,
         forward_qualification_import=args.forward_qualification_import,
         final_phase_qualification_import=args.final_phase_qualification_import,

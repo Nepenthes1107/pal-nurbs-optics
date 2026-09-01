@@ -60,13 +60,13 @@ python -m biot.gui
   不改变物理面形的精确 knot refinement。patience 从 terminal 第一步累计，最低
   配额前不允许 early stop；连续 7 个 attempt 未使 best 相对改善严格超过
   `1e-3` 时停止。
-- 109 个 case 分为 10 组：Far 20、Far-robustness 8、Corridor upper/middle/lower 各 5、
+- 109 个 case 分为 9 组：Far 28、Corridor upper/middle/lower 各 5、
   Near 20、Near-robustness 8、Near-edge-astig 8、Peripheral-left/right 各 15。
 - 420-case WFNO 合格池的最终固定数量选择保持各自 `training_group`，并在不改变
   覆盖门槛和各组数量的前提下做 coverage-constrained 选择；确定性选择无法通过时失败关闭。
   phase 进度使用 `training_group/candidate_id/distance/field` 稳定源键，不依赖每轮
   重新编号的 `case_id`。
-- Far 使用真实 `Dinf`，robustness 使用 `D1000`，Near 使用 `D500`；
+- Far 的 28 个 case 全部使用真实 `Dinf`，Near-robustness 使用 `D1000`，Near 使用 `D500`；
   corridor 从 Original PAL 中心带局部 ADD 逐行计算 `distance_mm=1000/ADD_D`。
 - 使用真实可微追迹、GRIN3 固定步长 RK4、连续参考球 OPL 和 FFT PSF；
   离线 PSF 不参与反传。Z4 复用 BIOT 的 OSA/ANSI RMS 基、全低阶最小二乘与
@@ -77,9 +77,13 @@ python -m biot.gui
   不做光线追迹；不因 OOM 自动缩小 batch。
 - 训练输出统一包含 `stage`、`step`、`batch`、`loss`、`update` 和 `lr`；每个 run 的 `training.log` 持久化同样的进度摘要，中断时追加异常信息，各阶段仍保留结构化 `history.csv`。
 - 追迹失败保持失败关闭，由当前 run 的资格筛选进度记录错误；底层追迹不在项目根目录自动导出 `wrong_result` Excel。
-- `J=sum(group_weight*group_mean)`，10 组权重显式且和为 1。Far 路由到
-  Mannos-Sakrison CSF 加权 MTF loss，corridor/near 路由到 Z4²，near-edge 为
-  90% Z4² + 10% near 区 A_D，周边区为对应区平均 A_D；均用 Original PAL 归一化。
+- `J=sum(group_weight*group_mean)`，9 组权重显式且和为 1。Far 路由到与正式评价
+  完全一致的 Ahumada weighted-MTF loss，corridor/near 路由到 Z4²，near-edge 为
+  90% Z4² + 10% near 区 A_D，周边区为对应区平均 A_D。三类指标分别使用固定
+  `0.10` weighted-MTF loss、`0.10 µm` Z4 RMS、`0.80 D` A_D 容差归一化，
+  Original PAL baseline 不参与 loss 分母，只用于健康比例、改善率和审计。
+- 每个新 run 在 Original PAL 7×7 和 `stage_7x7/final.pt` 保存九组梯度范数、
+  两两余弦及与总梯度余弦；产物位于 `gradient_diagnostics/` 并绑定 run/checkpoint 哈希。
 - 19×19 阶段额外使用 `smooth_lambda=0.05` 的控制点归一化二阶差分正则。
 - 约束包括 trace/PSF health、`P_far`、`ADD`、下缘监管带相对 Original PAL 的
   最大光焦度/像散变化和单步 sag trust region。
@@ -148,6 +152,9 @@ python run_pal_nurbs.py `
   --early-stopping-patience 7 `
   --relative-improvement-threshold 1e-3 `
   --max-extra-terminal-stage-steps 30 `
+  --weighted-mtf-loss-tolerance 0.10 `
+  --z4-rms-tolerance-mm 1e-4 `
+  --astigmatism-tolerance-D 0.80 `
   --smooth-lambda 0.05
 ```
 
@@ -176,13 +183,13 @@ Adam、初始学习率和 patience 计数；父 Adam 动量不会导入。child 
 开始。若起点晚于父 terminal，程序逐级核验父 run 保存的零预算 `final.pt`/
 `resume.pt`，并以 `1e-10` 容差确认 knot refinement 未改变面形或一、二阶导数。
 
-下面从父 `run_005` 的 11×11 best 新增 11×11 的 10 个 attempt，再新增 19×19
+下面从一个当前合同的已完成父 run 的 11×11 best 新增 11×11 的 10 个 attempt，再新增 19×19
 的 10 个最低 attempt；terminal 19×19 最多再执行 30 个 attempt：
 
 ```powershell
 python run_pal_nurbs.py `
   --output results/optimization/v3_branch/run_006 `
-  --parent-run results/optimization/v3_branch/run_005 `
+  --parent-run results/optimization/run_010 `
   --start-stage 11 `
   --steps 0 10 10 `
   --max-extra-terminal-stage-steps 30 `
@@ -203,8 +210,8 @@ child 的 `summary.json` 分开保存父阶段历史、child 阶段历史、逐�
 steps、父 checkpoint/evidence 哈希和
 `optimizer_policy=parent_best_fresh_adam`；`actual_training_steps` 仅统计 child
 实际执行量。child 中断后只能在 child 自身目录使用 `--resume`。run identity
-schema 9 的 child 与当前 schema 8 已完成 run 都可作为只读父源，但 schema 8
-run 不因此获得 schema 9 的原目录 `--resume` 兼容性。
+schema 10 的 run 只能使用同为 schema 10 且方法身份一致的已完成父源；旧
+schema 8/9 run、旧 baseline、旧资格池和旧 checkpoint 均保持只读，不能接入新目标。
 
 完整 `candidate-trace` 进度可显式导入新 run：保存的原身份必须先通过自身哈希
 校验，镜片内容 SHA-256 与物理追迹参数也必须匹配；Linux/Windows checkout 的

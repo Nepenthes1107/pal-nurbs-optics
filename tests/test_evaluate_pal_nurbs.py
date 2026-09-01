@@ -9,6 +9,7 @@ import torch
 from scipy.signal import fftconvolve
 
 import evaluate_pal_nurbs as evaluator
+from biot.e2e.weighted_mtf import weighted_mtf_mean_torch_batch
 
 
 def test_weighted_mtf_is_finite_and_dc_normalized() -> None:
@@ -22,6 +23,24 @@ def test_weighted_mtf_is_finite_and_dc_normalized() -> None:
     assert np.isfinite(sag).all() and np.isfinite(tan).all()
     assert abs(float(sag[0]) - 1.0) < 1e-12
     assert abs(float(tan[0]) - 1.0) < 1e-12
+
+
+def test_training_weighted_mtf_matches_evaluator_and_preserves_autograd() -> None:
+    axis = np.arange(512, dtype=np.float64) - 255.5
+    yy, xx = np.meshgrid(axis, axis, indexing="ij")
+    psf = np.exp(-((xx / 3.0) ** 2 + (yy / 5.0) ** 2) / 2.0)
+    psf /= psf.sum()
+    expected = float(evaluator._weighted_mtf(psf, 1.0e-3)[0][2])
+    tensor = torch.tensor(psf, dtype=torch.float64, requires_grad=True)
+    actual = weighted_mtf_mean_torch_batch(
+        tensor.unsqueeze(0),
+        pixel_pitch_mm=torch.tensor([1.0e-3], dtype=torch.float64),
+    )[0]
+    assert float(actual.detach()) == pytest.approx(expected, rel=0.0, abs=1.0e-12)
+    actual.backward()
+    assert tensor.grad is not None
+    assert bool(torch.isfinite(tensor.grad).all())
+    assert int(torch.count_nonzero(tensor.grad)) > 0
 
 
 def test_weighted_mtf_field_interpolation_preserves_nodes_and_domain() -> None:
