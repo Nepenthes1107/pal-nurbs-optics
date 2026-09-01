@@ -1,6 +1,6 @@
 # 当前工程状态
 
-更新时间：2026-08-31。
+更新时间：2026-09-01。
 
 ## 当前主线
 
@@ -28,6 +28,14 @@
   成功 summary；完成后后续零预算阶段只做精确 refinement，再以最终 19×19 表示
   做完整 109-case 无梯度复核。summary 显式记录 terminal control count、extra
   attempt 数和 terminal 停止原因。
+- 已完成父 run 可通过 `--parent-run` 和 `--start-stage 7|11|19` 分叉为新
+  child identity；合法起点必须不早于父 terminal。child `--steps` 只统计新增
+  attempt，使用父阶段 best 但重置 Adam/学习率/patience。父 candidate trace、
+  forward/final-phase qualification、baseline 及从 terminal 到起点的逐级
+  zero-budget refinement 必须通过身份、checkpoint 和 `1e-10` 面形/导数审计；
+  不存在重算或导入父 Adam 的兜底。父目录保持只读，child 只能在自身
+  目录 `--resume`。新 child 使用 run identity schema 9；已完成 schema 8
+  run 只获得父源导入兼容，不获得原目录新 schema resume 兼容。
 - 新训练合同统一使用 `D500/D1000/Dinf`；已完成的旧 `run_001` 保持历史训练身份，不原位改写。
 - `main` 与多物距分支均显式固定 `legacy_pupil_phase=False`、`phase_reference="biot_reference_sphere"`、`remove_tilt=False`；相位/PSF 表示变化已提升 run、case-layout 和 baseline schema，旧 checkpoint 不可按新合同恢复。
 - `evaluate_pal_nurbs.py` 在 `<run>/evaluation` 生成独立评价身份；三物距×双状态
@@ -37,6 +45,14 @@
 - PSF 数据库默认通过 `raw_psf_batch()` 以 `psf_batch_size=8` 做原生 FFT PSF case 批量追迹；批大小纳入评价 identity。已完成 HDF5 节点仍逐个核验，未完成节点按小批量恢复；不自动缩批或串行回退。
 - `evaluate_pal_nurbs.py` 的控制台进度统一使用 `[pal-eval]`，显示当前阶段、条件、
   PSF batch、条件内及全局场点完成数；恢复时显式报告已跳过的完整条件/阶段。
+- `weighted_mtf/` 保留 9×9 原始 mean map 和 NPZ，并为三物距×
+  baseline/optimized/delta 额外生成 9 张 `*_mean_interpolated.png`。
+  插值是仅显示的规则网格 cubic 200×200 上采样，严格限定在原生
+  `[-40,40]°` 域内、原节点误差不超过 `1e-12`；非有限或超出
+  MTF 物理范围的原生数据直接失败，不填洞或外推。
+- 完整 run 可用 `evaluate_pal_nurbs.py --checkpoint-stage 7|11|19` 直接评价对应
+  已完成阶段的 `final.pt`；评价器严格核对 summary 阶段记录、checkpoint
+  `control_count` 与源 identity，并写入独立的 `evaluation_stage_NxN/`。
 
 ## 历史 r12
 
@@ -181,3 +197,33 @@ run identity schema 提升为 8、stage-resume schema 提升为 3，旧 checkpoi
 `.venv\Scripts\python.exe -m pytest tests -q --basetemp .tmp_pytest_terminal_stage_full`
 为 `199 passed`；`py_compile` 与 `git diff --check` 通过。本次未启动正式训练，
 不形成新的优化收益结论。
+
+2026-09-01 PAL 阶段 checkpoint 独立评价验收：完整 run 可通过
+`evaluate_pal_nurbs.py --checkpoint-stage 7|11|19` 直接读取对应阶段的
+`final.pt`，无需重跑该阶段训练；阶段评价使用独立 `evaluation_stage_NxN/`
+身份，并校验 summary 阶段记录、checkpoint `control_count`、源 run identity
+和 checkpoint SHA-256。评价器定向测试 `10 passed`，完整测试
+`.venv\Scripts\python.exe -m pytest tests -q --basetemp .tmp_pytest_eval_stage_full`
+为 `200 passed`；`py_compile` 与 `git diff --check` 通过。本次未运行正式评价，
+不形成新的光学或性能结论。
+
+2026-09-01 PAL 父阶段分叉续训验收：`run_pal_nurbs.py` 新增
+`--parent-run`/`--start-stage`，实现完成父 run 只读验证、合法起点矩阵、
+父 best + fresh Adam 的 child 初始化、逐级零预算精确 refinement 审计、四类
+预处理/baseline 证据复用、child-only 步数与累计 lineage 记录。定向
+PAL 测试 `58 passed`；完整测试
+`.venv\Scripts\python.exe -m pytest tests -q --basetemp .tmp_pytest_parent_fork_full`
+为 `215 passed`，无失败；`py_compile`、CLI `--help` 与 `git diff --check` 通过。
+本次只做代码/合成测试验收，未启动正式续训，不形成优化收益或
+运行时长结论。
+
+2026-09-01 PAL weighted-MTF 插值显示图验收：评价链在原有三物距×
+baseline/optimized/delta 的 9×9 PNG/NPZ 之外，新增 9 张 cubic
+200×200 `*_mean_interpolated.png`。显示插值严核原节点、边界、finite 与
+MTF `[0,1]` 物理范围，delta 由分别插值后的 optimized-baseline 得到；
+原生 NPZ 不改写。使用已有 `run_004` D500 optimized NPZ 完成一张真实
+渲染方向/样式检查。评价器定向测试 `13 passed`；完整测试
+`.venv\Scripts\python.exe -m pytest tests -q --basetemp
+.tmp_pytest_weighted_mtf_interpolated_full` 为 `218 passed`，无失败；
+`py_compile` 与 `git diff --check` 通过。本次未重跑正式评价，不新增
+光学或性能结论。

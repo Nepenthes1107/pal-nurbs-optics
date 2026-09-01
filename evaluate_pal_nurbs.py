@@ -25,7 +25,7 @@ import numpy as np
 import pandas as pd
 import scipy
 import torch
-from scipy.interpolate import CubicSpline
+from scipy.interpolate import CubicSpline, RegularGridInterpolator
 from scipy.ndimage import gaussian_filter, zoom
 from scipy.signal import fftconvolve
 
@@ -44,6 +44,8 @@ CROP_PHYSICAL_SIZE_MM = 0.184378803949209
 TILE_GAP_PX = 5
 PSF_DISPLAY_SMOOTH_SIGMA = 2.0
 FIGURE_DPI = 160
+WEIGHTED_MTF_INTERPOLATED_RESOLUTION = 200
+WEIGHTED_MTF_FIELD_INTERPOLATION = "cubic"
 COMMON_FREQ = np.linspace(0.0, 100.0, 1000, dtype=np.float64)
 CSF_MM_PER_DEG = 0.291
 CSF_F0 = 4.1726
@@ -106,9 +108,24 @@ def _load_config(run: Path, device: str) -> Any:
 
 
 def _load_checkpoint(
-    run: Path, summary: Mapping[str, Any], device: torch.device
+    run: Path, summary: Mapping[str, Any], device: torch.device,
+    *, checkpoint_stage: int | None, source_identity_sha256: str,
 ) -> tuple[Path, dict[str, Any]]:
-    if hasattr(pal, "DISTANCE_SPECS"):
+    if checkpoint_stage is not None:
+        if checkpoint_stage not in (7, 11, 19):
+            raise ValueError("checkpoint_stage must be one of 7, 11, or 19")
+        stage_records = [
+            record for record in summary.get("stages", [])
+            if isinstance(record, Mapping)
+            and int(record.get("control_count", -1)) == checkpoint_stage
+        ]
+        if len(stage_records) != 1:
+            raise ValueError(
+                f"summary does not contain exactly one completed {checkpoint_stage}x"
+                f"{checkpoint_stage} stage"
+            )
+        candidate = run / f"stage_{checkpoint_stage}x{checkpoint_stage}" / "final.pt"
+    elif hasattr(pal, "DISTANCE_SPECS"):
         candidate = run / "final.pt"
     else:
         count = int(summary.get("final_control_count", 0))
@@ -117,9 +134,22 @@ def _load_checkpoint(
         candidate = run / f"stage_{count}x{count}" / "final.pt"
     if not candidate.is_file():
         raise FileNotFoundError(f"final checkpoint not found: {candidate}")
-    payload = torch.load(candidate, map_location=device)
+    with candidate.open("rb") as handle:
+        payload = torch.load(handle, map_location=device)
     if not isinstance(payload, dict) or not isinstance(payload.get("state_dict"), dict):
         raise ValueError(f"malformed final checkpoint: {candidate}")
+    expected_control_count = (
+        checkpoint_stage
+        if checkpoint_stage is not None
+        else int(payload.get("control_count", summary.get("final_control_count", 0)))
+    )
+    if int(payload.get("control_count", -1)) != expected_control_count:
+        raise ValueError(
+            f"checkpoint control_count mismatch: expected {expected_control_count}, "
+            f"got {payload.get('control_count')!r}"
+        )
+    if str(payload.get("identity_sha256", "")) != source_identity_sha256:
+        raise ValueError("checkpoint identity does not match source run identity")
     return candidate, payload
 
 
@@ -178,6 +208,121 @@ def _plot_map(path: Path, values: np.ndarray, *, title: str, symmetric: bool = F
     axis.set(title=title, xlabel="field X (deg)", ylabel="field Y (deg)")
     figure.colorbar(image, ax=axis)
     figure.savefig(path, dpi=150)
+    plt.close(figure)
+
+
+def _interpolate_weighted_mtf_map(
+    values: np.ndarray,
+    field_x_deg: Sequence[float],
+    field_y_deg: Sequence[float],
+    *,
+    resolution: int = WEIGHTED_MTF_INTERPOLATED_RESOLUTION,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Cubic display interpolation over the sealed rectangular field grid.
+
+    The returned grid uses ascending Y rows and covers only the native field
+    domain. Missing/non-finite native samples are rejected rather than filled.
+    """
+    array = np.asarray(values, dtype=np.float64)
+    x_native = np.asarray(field_x_deg, dtype=np.float64)
+    y_native = np.asarray(field_y_deg, dtype=np.float64)
+    if x_native.ndim != 1 or y_native.ndim != 1:
+        raise ValueError("weighted-MTF field axes must be one-dimensional")
+    if array.shape != (y_native.size, x_native.size):
+        raise ValueError(
+            "weighted-MTF field map shape does not match its axes: "
+            f"map={array.shape}, axes={(y_native.size, x_native.size)}"
+        )
+    if x_native.size < 4 or y_native.size < 4:
+        raise ValueError("cubic weighted-MTF field interpolation requires at least 4x4 nodes")
+    if not np.isfinite(array).all():
+        raise ValueError("weighted-MTF field map contains NaN/Inf; interpolation is forbidden")
+    if bool((array < -1.0e-12).any()) or bool((array > 1.0 + 1.0e-12).any()):
+        raise ValueError("weighted-MTF field map lies outside the physical [0,1] range")
+    if not (np.diff(x_native) > 0.0).all() or not (np.diff(y_native) > 0.0).all():
+        raise ValueError("weighted-MTF field axes must be strictly ascending")
+    if isinstance(resolution, bool) or int(resolution) < 2:
+        raise ValueError("weighted-MTF interpolation resolution must be at least 2")
+
+    interpolator = RegularGridInterpolator(
+        (y_native, x_native), array,
+        method=WEIGHTED_MTF_FIELD_INTERPOLATION,
+        bounds_error=True,
+    )
+    native_xx, native_yy = np.meshgrid(x_native, y_native)
+    recovered = np.asarray(interpolator((native_yy, native_xx)), dtype=np.float64)
+    node_error = float(np.max(np.abs(recovered - array)))
+    if node_error > 1.0e-12:
+        raise RuntimeError(
+            f"weighted-MTF interpolation changed native nodes by {node_error:.3e}"
+        )
+
+    x_fine = np.linspace(x_native[0], x_native[-1], int(resolution), dtype=np.float64)
+    y_fine = np.linspace(y_native[0], y_native[-1], int(resolution), dtype=np.float64)
+    fine_xx, fine_yy = np.meshgrid(x_fine, y_fine)
+    fine = np.asarray(interpolator((fine_yy, fine_xx)), dtype=np.float64)
+    if fine.shape != (int(resolution), int(resolution)) or not np.isfinite(fine).all():
+        raise ValueError("weighted-MTF field interpolation produced an invalid fine grid")
+    return x_fine, y_fine, fine
+
+
+def _plot_interpolated_weighted_mtf_map(
+    path: Path,
+    values: np.ndarray,
+    field_x_deg: np.ndarray,
+    field_y_deg: np.ndarray,
+    *,
+    title: str,
+    symmetric: bool = False,
+) -> None:
+    """Render an already interpolated display map without further image resampling."""
+    array = np.asarray(values, dtype=np.float64)
+    if array.shape != (field_y_deg.size, field_x_deg.size):
+        raise ValueError("interpolated weighted-MTF map shape does not match its axes")
+    if not np.isfinite(array).all():
+        raise ValueError("interpolated weighted-MTF map contains NaN/Inf")
+    figure, axis = plt.subplots(figsize=(8.4, 6.3), constrained_layout=True)
+    image_options: dict[str, Any] = {"cmap": "viridis", "vmin": 0.0, "vmax": 1.0}
+    colorbar_label = "weighted mean MTF"
+    if symmetric:
+        limit = max(float(np.max(np.abs(array))), np.finfo(np.float64).eps)
+        image_options = {"cmap": "coolwarm", "vmin": -limit, "vmax": limit}
+        colorbar_label = "delta weighted mean MTF"
+    image = axis.imshow(
+        array,
+        origin="lower",
+        extent=[
+            float(field_x_deg[0]), float(field_x_deg[-1]),
+            float(field_y_deg[0]), float(field_y_deg[-1]),
+        ],
+        interpolation="none",
+        aspect="auto",
+        **image_options,
+    )
+    x_ticks = np.arange(
+        math.ceil(float(field_x_deg[0]) / 5.0) * 5.0,
+        math.floor(float(field_x_deg[-1]) / 5.0) * 5.0 + 0.1,
+        5.0,
+    )
+    y_ticks = np.arange(
+        math.ceil(float(field_y_deg[0]) / 5.0) * 5.0,
+        math.floor(float(field_y_deg[-1]) / 5.0) * 5.0 + 0.1,
+        5.0,
+    )
+    axis.set_xticks(x_ticks)
+    axis.set_yticks(y_ticks)
+    axis.set_xlabel("field X (Degrees)", fontfamily="Times New Roman", fontsize=14)
+    axis.set_ylabel("field Y (Degrees)", fontfamily="Times New Roman", fontsize=14)
+    axis.set_title(f"{title} — interpolated", fontsize=13)
+    axis.tick_params(direction="in", top=True, right=True, labelsize=11)
+    for tick in axis.get_xticklabels() + axis.get_yticklabels():
+        tick.set_fontfamily("Times New Roman")
+    colorbar = figure.colorbar(image, ax=axis, fraction=0.046, pad=0.04)
+    colorbar.set_label(colorbar_label, fontfamily="Times New Roman", fontsize=14)
+    colorbar.ax.tick_params(direction="in", labelsize=12)
+    for tick in colorbar.ax.get_yticklabels():
+        tick.set_fontfamily("Times New Roman")
+    figure.savefig(path, dpi=FIGURE_DPI)
     plt.close(figure)
 
 
@@ -759,7 +904,16 @@ def _run_weighted_mtf(
         "psf_database_manifest_sha256": database_sha256,
         "algorithm": "Ahumada-1D mean of sagittal/tangential",
         "frequency_support_cycles_per_mm": [0.0, 100.0],
-        "samples": len(COMMON_FREQ), "published_maps": "mean_only",
+        "samples": len(COMMON_FREQ),
+        "published_maps": "mean_native_and_interpolated_png",
+        "field_map_interpolation": {
+            "purpose": "display_only",
+            "method": WEIGHTED_MTF_FIELD_INTERPOLATION,
+            "resolution": WEIGHTED_MTF_INTERPOLATED_RESOLUTION,
+            "domain": [float(FIELD_VALUES[0]), float(FIELD_VALUES[-1])],
+            "extrapolation": False,
+            "native_nodes_preserved_abs_tolerance": 1.0e-12,
+        },
     }
     manifest_path = output / "weighted_mtf_manifest.json"
     if _stage_is_complete(manifest_path, stage_config):
@@ -769,6 +923,9 @@ def _run_weighted_mtf(
     completed = 0
     for label, _, _ in _distance_cases(config):
         maps: dict[str, np.ndarray] = {}
+        interpolated_maps: dict[str, np.ndarray] = {}
+        interpolated_x: np.ndarray | None = None
+        interpolated_y: np.ndarray | None = None
         for state in ("baseline", "optimized"):
             _progress(
                 phase="weighted_mtf", condition=f"{completed + 1}/6",
@@ -780,23 +937,47 @@ def _run_weighted_mtf(
                                   float(handle["raw_pixel_pitch_mm"][index]))[0][2]
                     for index in range(FIELD_COUNT)
                 ]
-            maps[state] = np.asarray(scores).reshape(len(FIELD_VALUES), len(FIELD_VALUES))[::-1]
+            native_ascending_y = np.asarray(scores).reshape(
+                len(FIELD_VALUES), len(FIELD_VALUES)
+            )
+            maps[state] = native_ascending_y[::-1]
+            fine_x, fine_y, fine = _interpolate_weighted_mtf_map(
+                native_ascending_y,
+                FIELD_VALUES,
+                FIELD_VALUES,
+            )
+            interpolated_x, interpolated_y = fine_x, fine_y
+            interpolated_maps[state] = np.clip(fine, 0.0, 1.0)
             completed += 1
             _progress(
                 phase="weighted_mtf", condition=f"{completed}/6",
                 name=f"{label}_{state}", fields=f"{FIELD_COUNT}/{FIELD_COUNT}", status="DONE",
             )
         maps["delta"] = maps["optimized"] - maps["baseline"]
+        interpolated_maps["delta"] = (
+            interpolated_maps["optimized"] - interpolated_maps["baseline"]
+        )
+        if interpolated_x is None or interpolated_y is None:
+            raise RuntimeError("weighted-MTF interpolation axes were not initialized")
         for state in ("baseline", "optimized", "delta"):
             numeric = output / f"{label}_{state}_mean_map.npz"
             image = output / f"{label}_{state}_mean.png"
+            interpolated_image = output / f"{label}_{state}_mean_interpolated.png"
             np.savez_compressed(
                 numeric, mean=maps[state], field_x_deg=np.asarray(FIELD_VALUES),
                 field_y_deg=np.asarray(FIELD_VALUES[::-1]),
             )
             _plot_map(image, maps[state], title=f"{label} {state} weighted MTF mean",
                       symmetric=state == "delta")
-            files.extend((numeric, image))
+            _plot_interpolated_weighted_mtf_map(
+                interpolated_image,
+                interpolated_maps[state],
+                interpolated_x,
+                interpolated_y,
+                title=f"{label} {state} CSF-weighted mean MTF",
+                symmetric=state == "delta",
+            )
+            files.extend((numeric, image, interpolated_image))
     _write_stage_manifest(manifest_path, config=stage_config, files=files)
     _progress(phase="weighted_mtf", conditions="6/6", status="COMPLETE")
 
@@ -1052,7 +1233,7 @@ def _write_evaluation_manifest(evaluation: Path, *, identity_sha256: str) -> Non
 
 def evaluate(
     run: Path, *, device_name: str, resume: bool, blur_scale: float = 4.0,
-    psf_batch_size: int = 8,
+    psf_batch_size: int = 8, checkpoint_stage: int | None = None,
 ) -> Path:
     if not math.isfinite(float(blur_scale)) or float(blur_scale) < 1.0:
         raise ValueError(f"blur_scale must be finite and >= 1, got {blur_scale!r}")
@@ -1077,13 +1258,22 @@ def evaluate(
             if not claimed or not callable(canonical) or canonical(body) != claimed:
                 raise error
             source_identity_legacy = True
-    evaluation = run / "evaluation"
+    if checkpoint_stage is not None and int(checkpoint_stage) not in (7, 11, 19):
+        raise ValueError("checkpoint_stage must be one of 7, 11, or 19")
+    evaluation = (
+        run / "evaluation"
+        if checkpoint_stage is None
+        else run / f"evaluation_stage_{int(checkpoint_stage)}x{int(checkpoint_stage)}"
+    )
     identity_path = evaluation / "evaluation_identity.json"
     if identity_path.exists() and not resume:
         raise FileExistsError(f"evaluation already exists: {evaluation}; use --resume")
     device = torch.device(device_name)
     config = _load_config(run, device_name)
-    checkpoint_path, checkpoint = _load_checkpoint(run, summary, device)
+    checkpoint_path, checkpoint = _load_checkpoint(
+        run, summary, device, checkpoint_stage=checkpoint_stage,
+        source_identity_sha256=str(source_identity.get("identity_sha256", "")),
+    )
     checkpoint_sha256 = _sha256(checkpoint_path)
     state_dict = checkpoint["state_dict"]
     control_count = int(checkpoint.get("control_count", summary.get("final_control_count", 7)))
@@ -1116,6 +1306,11 @@ def evaluate(
                     "scipy": str(scipy.__version__), "h5py": str(h5py.__version__),
                     "platform": sys.platform},
     }
+    if checkpoint_stage is not None:
+        identity_body.update({
+            "checkpoint_selection": f"stage_{int(checkpoint_stage)}x{int(checkpoint_stage)}",
+            "checkpoint_control_count": control_count,
+        })
     identity = {**identity_body, "identity_sha256": _canonical_sha256(identity_body)}
     if identity_path.exists() and _json(identity_path).get("identity_sha256") != identity["identity_sha256"]:
         raise ValueError("existing evaluation identity does not match current source/checkpoint")
@@ -1123,7 +1318,12 @@ def evaluate(
     identity_sha256 = str(identity["identity_sha256"])
     _progress(
         phase="startup", device=device_name, resume=resume,
-        psf_batch_size=int(psf_batch_size), status="COMPLETE",
+        psf_batch_size=int(psf_batch_size),
+        checkpoint=(
+            "final" if checkpoint_stage is None
+            else f"stage_{int(checkpoint_stage)}x{int(checkpoint_stage)}"
+        ),
+        status="COMPLETE",
     )
     _write_evaluation_state(
         evaluation, identity_sha256=identity_sha256, status="running", phase="psf_database"
@@ -1184,8 +1384,20 @@ def evaluate(
          "psf_database_status": "complete", "psf_condition_count": 6,
          "psf_count": 6 * FIELD_COUNT,
          "psf_batch_size": int(psf_batch_size),
+         "checkpoint_selection": (
+             "final" if checkpoint_stage is None
+             else f"stage_{int(checkpoint_stage)}x{int(checkpoint_stage)}"
+         ),
+         "checkpoint_control_count": control_count,
          "distance_labels": [item[0] for item in _distance_cases(config)],
-         "weighted_mtf_products": "mean_only", "chart_blur_scale": float(blur_scale),
+         "weighted_mtf_products": "mean_native_and_interpolated_png",
+         "weighted_mtf_interpolation": {
+             "purpose": "display_only",
+             "method": WEIGHTED_MTF_FIELD_INTERPOLATION,
+             "resolution": WEIGHTED_MTF_INTERPOLATED_RESOLUTION,
+             "extrapolation": False,
+         },
+         "chart_blur_scale": float(blur_scale),
          "source_run_unchanged": True},
     )
     _write_evaluation_manifest(evaluation, identity_sha256=identity_sha256)
@@ -1202,6 +1414,13 @@ def main() -> int:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
+        "--checkpoint-stage", type=int, choices=(7, 11, 19), default=None,
+        help=(
+            "Evaluate a completed stage checkpoint instead of the run's final checkpoint; "
+            "writes to evaluation_stage_NxN without modifying the source run."
+        ),
+    )
+    parser.add_argument(
         "--psf-batch-size", type=int, default=8,
         help="Number of field cases traced together for each raw PSF CUDA batch.",
     )
@@ -1215,6 +1434,7 @@ def main() -> int:
         Path(arguments.run), device_name=arguments.device,
         resume=bool(arguments.resume), blur_scale=float(arguments.blur_scale),
         psf_batch_size=int(arguments.psf_batch_size),
+        checkpoint_stage=arguments.checkpoint_stage,
     )
     return 0
 

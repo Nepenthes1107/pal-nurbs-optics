@@ -135,6 +135,8 @@ class MinimalConfig:
     forward_qualification_import: str | None = None
     final_phase_qualification_import: str | None = None
     baseline_state_import: str | None = None
+    parent_run: str | None = None
+    start_stage: int | None = None
 
     def __post_init__(self) -> None:
         if bool(self.legacy_pupil_phase):
@@ -171,6 +173,33 @@ class MinimalConfig:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"{name} must be a non-negative integer")
+        if (self.parent_run is None) != (self.start_stage is None):
+            raise ValueError("parent_run and start_stage must be supplied together")
+        if self.start_stage is not None:
+            if isinstance(self.start_stage, bool) or int(self.start_stage) not in STAGE_LADDER:
+                raise ValueError("start_stage must be one of 7, 11, or 19")
+            explicit_imports = {
+                "candidate_trace_import": self.candidate_trace_import,
+                "forward_qualification_import": self.forward_qualification_import,
+                "final_phase_qualification_import": self.final_phase_qualification_import,
+                "baseline_state_import": self.baseline_state_import,
+            }
+            mixed = [name for name, value in explicit_imports.items() if value is not None]
+            if mixed:
+                raise ValueError(
+                    "parent_run cannot be combined with explicit evidence imports: "
+                    + ", ".join(mixed)
+                )
+            budgets = {
+                7: int(self.max_steps_7),
+                11: int(self.max_steps_11),
+                19: int(self.max_steps_19),
+            }
+            earlier = [control for control in STAGE_LADDER if control < int(self.start_stage)]
+            if any(budgets[control] != 0 for control in earlier):
+                raise ValueError("training budgets before start_stage must be zero")
+            if budgets[int(self.start_stage)] <= 0:
+                raise ValueError("start_stage training budget must be positive")
         if (
             isinstance(self.early_stopping_patience, bool)
             or not isinstance(self.early_stopping_patience, int)
@@ -184,7 +213,8 @@ class MinimalConfig:
             raise ValueError("relative_improvement_threshold must be finite and positive")
 
 
-RUN_IDENTITY_SCHEMA_VERSION = 8
+RUN_IDENTITY_SCHEMA_VERSION = 9
+PARENT_RUN_IDENTITY_SCHEMA_VERSIONS = (8, 9)
 CASE_LAYOUT_STATE_SCHEMA_VERSION = 10
 BASELINE_STATE_SCHEMA_VERSION = 6
 BASELINE_PROGRESS_SCHEMA_VERSION = 6
@@ -406,7 +436,9 @@ def _implementation_closure_paths() -> list[Path]:
     return paths
 
 
-def _identity_input_paths(config: MinimalConfig) -> dict[str, Path]:
+def _identity_input_paths(
+    config: MinimalConfig, *, parent_context: Mapping[str, Any] | None = None,
+) -> dict[str, Path]:
     paths = {
         "excel": Path(config.excel),
         "support_json": Path(config.support_json),
@@ -422,6 +454,9 @@ def _identity_input_paths(config: MinimalConfig) -> dict[str, Path]:
         )
     if config.baseline_state_import is not None:
         paths["baseline_state_import"] = Path(config.baseline_state_import)
+    if parent_context is not None:
+        for name, path in dict(parent_context["artifact_paths"]).items():
+            paths[f"parent_{name}"] = Path(path)
     lens = load_lens(
         Path(config.excel), device=resolve_device("cpu"), wavelength_nm=config.wavelength_nm,
     )
@@ -437,9 +472,15 @@ def _identity_input_paths(config: MinimalConfig) -> dict[str, Path]:
 
 def _build_run_identity(config: MinimalConfig) -> dict[str, Any]:
     root = Path(__file__).resolve().parents[2]
+    parent_context = _validate_parent_run_source(config, device="cpu")
+    input_paths = (
+        _identity_input_paths(config)
+        if parent_context is None else
+        _identity_input_paths(config, parent_context=parent_context)
+    )
     inputs = {
         name: {"path": str(path.resolve()), "sha256": _sha256_file(path)}
-        for name, path in sorted(_identity_input_paths(config).items())
+        for name, path in sorted(input_paths.items())
     }
     implementation: dict[str, str] = {}
     for path in _implementation_closure_paths():
@@ -464,6 +505,8 @@ def _build_run_identity(config: MinimalConfig) -> dict[str, Any]:
             "platform": sys.platform,
         },
     }
+    if parent_context is not None:
+        body["parent_lineage"] = dict(parent_context["identity_metadata"])
     return {**body, "identity_sha256": _canonical_json_sha256(body)}
 
 
@@ -594,7 +637,9 @@ def _load_identity_bound_torch(
     schema_version: int,
     map_location: torch.device | str,
 ) -> dict[str, Any]:
-    payload = torch.load(Path(path), map_location=map_location)
+    source = Path(path)
+    with source.open("rb") as handle:
+        payload = torch.load(handle, map_location=map_location)
     if not isinstance(payload, dict):
         raise ValueError(f"state payload must be a mapping: {path}")
     if int(payload.get("schema_version", -1)) != int(schema_version):
@@ -1527,8 +1572,13 @@ def _prepare_case_layout(
         field_max_deg=config.candidate_field_max_deg,
     )
     candidate_progress_path = output / "candidate_trace_progress.json"
-    if config.candidate_trace_import is not None and not candidate_progress_path.exists():
-        source = Path(config.candidate_trace_import)
+    candidate_trace_import = (
+        Path(config.parent_run) / "candidate_trace_progress.json"
+        if config.parent_run is not None else
+        (None if config.candidate_trace_import is None else Path(config.candidate_trace_import))
+    )
+    if candidate_trace_import is not None and not candidate_progress_path.exists():
+        source = candidate_trace_import
         imported = _read_json(source)
         if imported.get("status") != "complete":
             raise ValueError("candidate_trace_import must be a complete trace-progress artifact")
@@ -1578,7 +1628,10 @@ def _prepare_case_layout(
     ])
     qualification_progress_path = output / "forward_qualification_progress.json"
     _import_complete_pool_progress(
-        source_path=config.forward_qualification_import,
+        source_path=(
+            Path(config.parent_run) / "forward_qualification_progress.json"
+            if config.parent_run is not None else config.forward_qualification_import
+        ),
         destination_path=qualification_progress_path,
         pool_identity_sha256=pool_identity,
         progress_name="forward qualification progress",
@@ -1681,7 +1734,10 @@ def _prepare_case_layout(
     forward_attempts: list[dict[str, Any]] = []
     phase_progress_path = output / "final_phase_qualification_progress.json"
     _import_complete_pool_progress(
-        source_path=config.final_phase_qualification_import,
+        source_path=(
+            Path(config.parent_run) / "final_phase_qualification_progress.json"
+            if config.parent_run is not None else config.final_phase_qualification_import
+        ),
         destination_path=phase_progress_path,
         pool_identity_sha256=pool_identity,
         progress_name="final phase qualification progress",
@@ -2819,6 +2875,406 @@ def _load_stage_resume_state(
     return payload
 
 
+_PARENT_CONFIG_FORK_FIELDS = frozenset({
+    "output",
+    "max_steps_7",
+    "max_steps_11",
+    "max_steps_19",
+    "max_extra_terminal_stage_steps",
+    "candidate_trace_import",
+    "forward_qualification_import",
+    "final_phase_qualification_import",
+    "baseline_state_import",
+    "parent_run",
+    "start_stage",
+})
+
+
+def _load_torch_mapping(
+    path: str | Path, *, map_location: torch.device | str,
+) -> dict[str, Any]:
+    source = Path(path)
+    with source.open("rb") as handle:
+        payload = torch.load(handle, map_location=map_location)
+    if not isinstance(payload, dict):
+        raise ValueError(f"state payload must be a mapping: {source}")
+    return payload
+
+
+def _validate_parent_identity_payload(payload: Mapping[str, Any]) -> str:
+    saved = dict(payload)
+    claimed = str(saved.pop("identity_sha256", ""))
+    if not claimed or _canonical_json_sha256(saved) != claimed:
+        raise ValueError("parent run_identity.json is malformed or has been modified")
+    if int(saved.get("schema_version", -1)) not in PARENT_RUN_IDENTITY_SCHEMA_VERSIONS:
+        raise ValueError("parent run identity schema is not supported for read-only import")
+    if saved.get("method") != METHOD_NAME:
+        raise ValueError("parent run uses a different PAL method identity")
+    return claimed
+
+
+def _assert_state_dict_equal(
+    left: Mapping[str, Any], right: Mapping[str, Any], *, context: str,
+) -> None:
+    if set(left) != set(right):
+        raise ValueError(f"{context} state_dict keys do not match")
+    for name, left_value in left.items():
+        right_value = right[name]
+        if not torch.is_tensor(left_value) or not torch.is_tensor(right_value):
+            raise ValueError(f"{context} state_dict entry is not a tensor: {name}")
+        if not torch.equal(left_value.detach().cpu(), right_value.detach().cpu()):
+            raise ValueError(f"{context} state_dict mismatch: {name}")
+
+
+def _validate_parent_run_source(
+    config: MinimalConfig, *, device: torch.device | str,
+) -> dict[str, Any] | None:
+    """Validate a completed parent run without mutating it and seal its lineage inputs."""
+    if config.parent_run is None:
+        return None
+    if config.start_stage is None:
+        raise ValueError("parent_run requires start_stage")
+    parent = Path(config.parent_run).resolve()
+    if not parent.is_dir():
+        raise FileNotFoundError(f"parent run directory does not exist: {parent}")
+    if parent == Path(config.output).resolve():
+        raise ValueError("child output must differ from parent run directory")
+
+    base_paths = {
+        "run_identity": parent / "run_identity.json",
+        "run_state": parent / "run_state.json",
+        "summary": parent / "summary.json",
+        "config": parent / "config.json",
+        "case_layout_state": parent / "case_layout_state.json",
+        "candidate_trace_progress": parent / "candidate_trace_progress.json",
+        "forward_qualification_progress": parent / "forward_qualification_progress.json",
+        "final_phase_qualification_progress": parent / "final_phase_qualification_progress.json",
+        "baseline_state": parent / "baseline_state.pt",
+    }
+    missing = [f"{name}={path}" for name, path in base_paths.items() if not path.is_file()]
+    if missing:
+        raise FileNotFoundError("parent run evidence is incomplete: " + ", ".join(missing))
+
+    parent_identity_payload = _read_json(base_paths["run_identity"])
+    parent_identity_sha256 = _validate_parent_identity_payload(parent_identity_payload)
+    parent_state = _read_json(base_paths["run_state"])
+    parent_summary = _read_json(base_paths["summary"])
+    parent_config = _read_json(base_paths["config"])
+    if parent_state.get("status") != "complete" or parent_state.get("phase") != "complete":
+        raise ValueError("parent run must have complete run_state status and phase")
+    if str(parent_state.get("identity_sha256", "")) != parent_identity_sha256:
+        raise ValueError("parent run_state identity mismatch")
+    if str(parent_summary.get("identity_sha256", "")) != parent_identity_sha256:
+        raise ValueError("parent summary identity mismatch")
+
+    child_config = asdict(config)
+    compared_fields = sorted(set(child_config) - _PARENT_CONFIG_FORK_FIELDS)
+    drift = [
+        name for name in compared_fields
+        if name not in parent_config or parent_config[name] != child_config[name]
+    ]
+    if drift:
+        raise ValueError(
+            "parent/child configuration mismatch outside the permitted fork fields: "
+            + ", ".join(drift)
+        )
+
+    parent_budgets = {
+        7: int(parent_config.get("max_steps_7", -1)),
+        11: int(parent_config.get("max_steps_11", -1)),
+        19: int(parent_config.get("max_steps_19", -1)),
+    }
+    active_parent_stages = [
+        control for control in STAGE_LADDER if parent_budgets[control] > 0
+    ]
+    if not active_parent_stages:
+        raise ValueError("parent run config has no positive training stage")
+    parent_terminal = active_parent_stages[-1]
+    if int(parent_summary.get("terminal_control_count", -1)) != parent_terminal:
+        raise ValueError("parent terminal stage is inconsistent between config and summary")
+    start_stage = int(config.start_stage)
+    if start_stage < parent_terminal:
+        raise ValueError(
+            f"child start_stage {start_stage} cannot precede parent terminal stage "
+            f"{parent_terminal}"
+        )
+
+    stage_rows = parent_summary.get("stages")
+    if not isinstance(stage_rows, list):
+        raise ValueError("parent summary stages are malformed")
+    rows_by_control: dict[int, dict[str, Any]] = {}
+    for row in stage_rows:
+        if not isinstance(row, dict):
+            raise ValueError("parent summary contains a malformed stage record")
+        control = int(row.get("control_count", -1))
+        if control not in STAGE_LADDER or control in rows_by_control:
+            raise ValueError("parent summary contains invalid or duplicate stage records")
+        rows_by_control[control] = dict(row)
+    if set(rows_by_control) != set(STAGE_LADDER):
+        raise ValueError("parent summary must contain exactly the complete 7/11/19 ladder")
+    for control, row in rows_by_control.items():
+        if bool(row.get("is_terminal_stage")) != (control == parent_terminal):
+            raise ValueError("parent summary terminal stage flags are inconsistent")
+        if int(row.get("minimum_steps", -1)) != parent_budgets[control]:
+            raise ValueError(
+                f"parent {control}x{control} summary minimum budget mismatch"
+            )
+        actual = int(row.get("actual_steps", -1))
+        if actual < parent_budgets[control]:
+            raise ValueError(
+                f"parent {control}x{control} did not complete its minimum budget"
+            )
+        if control != parent_terminal and actual != parent_budgets[control]:
+            raise ValueError(
+                f"parent non-terminal {control}x{control} exceeded its fixed budget"
+            )
+    if int(parent_summary.get("actual_training_steps", -1)) != sum(
+        int(row["actual_steps"]) for row in rows_by_control.values()
+    ):
+        raise ValueError("parent summary total actual_training_steps mismatch")
+    if int(parent_summary.get("final_control_count", -1)) != STAGE_LADDER[-1]:
+        raise ValueError("parent summary final control count must be 19")
+    for control in STAGE_LADDER:
+        if parent_terminal < control <= start_stage:
+            if int(rows_by_control[control].get("actual_steps", -1)) != 0:
+                raise ValueError(
+                    "parent stages after terminal and through child start must be zero-budget "
+                    f"exact refinements: {control}x{control}"
+                )
+
+    selected_final_path = parent / f"stage_{start_stage}x{start_stage}" / "final.pt"
+    selected_resume_path = parent / f"stage_{start_stage}x{start_stage}" / "resume.pt"
+    terminal_final_path = (
+        parent / f"stage_{parent_terminal}x{parent_terminal}" / "final.pt"
+    )
+    lineage_stage_paths: dict[str, Path] = {}
+    for control in STAGE_LADDER:
+        if parent_terminal <= control <= start_stage:
+            lineage_stage_paths[f"stage_{control}_final"] = (
+                parent / f"stage_{control}x{control}" / "final.pt"
+            )
+            lineage_stage_paths[f"stage_{control}_resume"] = (
+                parent / f"stage_{control}x{control}" / "resume.pt"
+            )
+    for name, path in (
+        ("selected_stage_final", selected_final_path),
+        ("selected_stage_resume", selected_resume_path),
+        ("terminal_stage_final", terminal_final_path),
+        *lineage_stage_paths.items(),
+    ):
+        if not path.is_file():
+            raise FileNotFoundError(f"parent {name} is missing: {path}")
+
+    parent_minimum = parent_budgets[start_stage]
+    parent_maximum = parent_minimum + (
+        int(parent_config.get("max_extra_terminal_stage_steps", 0))
+        if start_stage == parent_terminal else 0
+    )
+    selected_resume = _load_stage_resume_state(
+        selected_resume_path,
+        identity_sha256=parent_identity_sha256,
+        control_count=start_stage,
+        minimum_steps=parent_minimum,
+        maximum_steps=parent_maximum,
+        terminal_control_count=parent_terminal,
+        early_stopping_patience=int(parent_config["early_stopping_patience"]),
+        relative_improvement_threshold=float(
+            parent_config["relative_improvement_threshold"]
+        ),
+        max_extra_terminal_stage_steps=int(
+            parent_config["max_extra_terminal_stage_steps"]
+        ),
+        device=device,
+    )
+    if selected_resume.get("status") != "completed":
+        raise ValueError("parent selected stage resume state must be complete")
+    selected_checkpoint = _load_torch_mapping(
+        selected_final_path, map_location=device,
+    )
+    if int(selected_checkpoint.get("control_count", -1)) != start_stage:
+        raise ValueError("parent selected checkpoint control_count mismatch")
+    if str(selected_checkpoint.get("identity_sha256", "")) != parent_identity_sha256:
+        raise ValueError("parent selected checkpoint identity mismatch")
+    selected_state = selected_checkpoint.get("state_dict")
+    if not isinstance(selected_state, dict):
+        raise ValueError("parent selected checkpoint state_dict is malformed")
+    _assert_state_dict_equal(
+        selected_state, selected_resume["best_state"],
+        context="parent final/best",
+    )
+    _assert_state_dict_equal(
+        selected_state, selected_resume["model_state"],
+        context="parent final/resume model",
+    )
+    if int(selected_checkpoint.get("step", -1)) != int(
+        rows_by_control[start_stage].get("actual_steps", -2)
+    ):
+        raise ValueError("parent selected checkpoint step disagrees with summary")
+
+    terminal_checkpoint = _load_torch_mapping(
+        terminal_final_path, map_location=device,
+    )
+    if int(terminal_checkpoint.get("control_count", -1)) != parent_terminal:
+        raise ValueError("parent terminal checkpoint control_count mismatch")
+    if str(terminal_checkpoint.get("identity_sha256", "")) != parent_identity_sha256:
+        raise ValueError("parent terminal checkpoint identity mismatch")
+    terminal_state = terminal_checkpoint.get("state_dict")
+    if not isinstance(terminal_state, dict):
+        raise ValueError("parent terminal checkpoint state_dict is malformed")
+    previous_module: FixedWeightNURBSPerturbation | None = None
+    for control in STAGE_LADDER:
+        if not parent_terminal <= control <= start_stage:
+            continue
+        stage_minimum = parent_budgets[control]
+        stage_maximum = stage_minimum + (
+            int(parent_config.get("max_extra_terminal_stage_steps", 0))
+            if control == parent_terminal else 0
+        )
+        stage_resume = _load_stage_resume_state(
+            lineage_stage_paths[f"stage_{control}_resume"],
+            identity_sha256=parent_identity_sha256,
+            control_count=control,
+            minimum_steps=stage_minimum,
+            maximum_steps=stage_maximum,
+            terminal_control_count=parent_terminal,
+            early_stopping_patience=int(parent_config["early_stopping_patience"]),
+            relative_improvement_threshold=float(
+                parent_config["relative_improvement_threshold"]
+            ),
+            max_extra_terminal_stage_steps=int(
+                parent_config["max_extra_terminal_stage_steps"]
+            ),
+            device=device,
+        )
+        if stage_resume.get("status") != "completed":
+            raise ValueError(f"parent {control}x{control} resume state must be complete")
+        stage_checkpoint = _load_torch_mapping(
+            lineage_stage_paths[f"stage_{control}_final"], map_location=device,
+        )
+        if int(stage_checkpoint.get("control_count", -1)) != control:
+            raise ValueError(f"parent {control}x{control} checkpoint control_count mismatch")
+        if str(stage_checkpoint.get("identity_sha256", "")) != parent_identity_sha256:
+            raise ValueError(f"parent {control}x{control} checkpoint identity mismatch")
+        stage_state = stage_checkpoint.get("state_dict")
+        if not isinstance(stage_state, dict):
+            raise ValueError(f"parent {control}x{control} checkpoint state_dict is malformed")
+        _assert_state_dict_equal(
+            stage_state, stage_resume["best_state"],
+            context=f"parent {control}x{control} final/best",
+        )
+        _assert_state_dict_equal(
+            stage_state, stage_resume["model_state"],
+            context=f"parent {control}x{control} final/resume model",
+        )
+        if int(stage_checkpoint.get("step", -1)) != int(
+            rows_by_control[control].get("actual_steps", -2)
+        ):
+            raise ValueError(
+                f"parent {control}x{control} checkpoint step disagrees with summary"
+            )
+        current_module = FixedWeightNURBSPerturbation(
+            control, device=device, dtype=torch.float64,
+        )
+        current_module.load_state_dict(stage_state)
+        if previous_module is not None:
+            expected = previous_module.refined(control)
+            refinement_audit = audit_exact_refinement(
+                expected, current_module, samples=129,
+            )
+            if max(
+                refinement_audit.max_abs_sag_mm,
+                refinement_audit.max_abs_first_derivative,
+                refinement_audit.max_abs_second_derivative_per_mm,
+            ) > 1.0e-10:
+                raise ValueError(
+                    f"parent {control}x{control} is not an exact zero-budget refinement"
+                )
+        previous_module = current_module
+
+    case_layout_state = _read_json(base_paths["case_layout_state"])
+    if str(case_layout_state.get("identity_sha256", "")) != parent_identity_sha256:
+        raise ValueError("parent case layout state identity mismatch")
+    candidate_progress = _read_json(base_paths["candidate_trace_progress"])
+    if candidate_progress.get("status") != "complete":
+        raise ValueError("parent candidate trace progress must be complete")
+    for name in ("forward_qualification_progress", "final_phase_qualification_progress"):
+        progress = _read_json(base_paths[name])
+        if progress.get("status") != "complete":
+            raise ValueError(f"parent {name} must be complete")
+    baseline_state = _load_torch_mapping(base_paths["baseline_state"], map_location=device)
+    if int(baseline_state.get("schema_version", -1)) != BASELINE_STATE_SCHEMA_VERSION:
+        raise ValueError("parent baseline state schema mismatch")
+    if str(baseline_state.get("identity_sha256", "")) != parent_identity_sha256:
+        raise ValueError("parent baseline state identity mismatch")
+
+    artifact_paths = {
+        **base_paths,
+        **lineage_stage_paths,
+        "selected_stage_final": selected_final_path,
+        "selected_stage_resume": selected_resume_path,
+        "terminal_stage_final": terminal_final_path,
+    }
+    evidence_hashes = {
+        name: _sha256_file(path) for name, path in sorted(artifact_paths.items())
+    }
+    parent_steps_by_stage = {
+        str(control): int(rows_by_control.get(control, {}).get("actual_steps", 0))
+        for control in STAGE_LADDER
+    }
+    return {
+        "root": parent,
+        "identity_sha256": parent_identity_sha256,
+        "summary": parent_summary,
+        "config": parent_config,
+        "terminal_control_count": parent_terminal,
+        "start_stage": start_stage,
+        "selected_checkpoint": selected_checkpoint,
+        "selected_resume": selected_resume,
+        "parent_steps_by_stage": parent_steps_by_stage,
+        "artifact_paths": artifact_paths,
+        "identity_metadata": {
+            "source_run_identity_sha256": parent_identity_sha256,
+            "source_identity_schema_version": int(
+                parent_identity_payload["schema_version"]
+            ),
+            "source_terminal_control_count": parent_terminal,
+            "child_start_stage": start_stage,
+            "selected_checkpoint_path": selected_final_path.relative_to(parent).as_posix(),
+            "selected_checkpoint_sha256": evidence_hashes["selected_stage_final"],
+            "selected_resume_sha256": evidence_hashes["selected_stage_resume"],
+            "optimizer_policy": "parent_best_fresh_adam",
+            "parent_actual_training_steps_by_stage": parent_steps_by_stage,
+            "parent_stage_history": [dict(row) for row in stage_rows],
+            "parent_summary_sha256": evidence_hashes["summary"],
+            "evidence_sha256": evidence_hashes,
+        },
+    }
+
+
+def _activate_parent_best(
+    model: MinimalOpticalModel,
+    parent_context: Mapping[str, Any],
+    *,
+    device: torch.device,
+) -> FixedWeightNURBSPerturbation:
+    start_stage = int(parent_context["start_stage"])
+    selected_checkpoint = parent_context["selected_checkpoint"]
+    selected_state = selected_checkpoint.get("state_dict")
+    if not isinstance(selected_state, dict):
+        raise ValueError("validated parent checkpoint lost its state_dict")
+    module = FixedWeightNURBSPerturbation(
+        start_stage, device=device, dtype=torch.float64,
+    )
+    module.load_state_dict(selected_state)
+    model.perturbation = module
+    for template, _ in model._templates.values():
+        template.back_surface.perturbation = module
+    for cached_system, _ in model._cache.values():
+        cached_system.back_surface.perturbation = module
+    _restore_rng_state(parent_context["selected_resume"]["rng_state"])
+    return module
+
+
 def _restore_optimizer_state(
     optimizer: torch.optim.Optimizer,
     state: Mapping[str, Any],
@@ -2849,6 +3305,7 @@ def _run_bound(
     session_start: float,
 ) -> Path:
     identity_sha256 = str(identity["identity_sha256"])
+    parent_context = _validate_parent_run_source(config, device=device)
 
     def write_state(phase: str, **details: Any) -> None:
         _write_run_state(
@@ -2897,15 +3354,15 @@ def _run_bound(
 
     baseline_state_path = output / "baseline_state.pt"
     baseline_import = (
-        None if config.baseline_state_import is None else Path(config.baseline_state_import)
+        Path(config.parent_run) / "baseline_state.pt"
+        if config.parent_run is not None else
+        (None if config.baseline_state_import is None else Path(config.baseline_state_import))
     )
     if baseline_state_path.is_file() or baseline_import is not None:
         imported_baseline = not baseline_state_path.is_file()
         write_state("import_baseline" if imported_baseline else "restore_baseline")
         if imported_baseline:
-            baseline_state = torch.load(baseline_import, map_location=device)
-            if not isinstance(baseline_state, dict):
-                raise ValueError("baseline state import must contain a mapping")
+            baseline_state = _load_torch_mapping(baseline_import, map_location=device)
             if int(baseline_state.get("schema_version", -1)) != BASELINE_STATE_SCHEMA_VERSION:
                 raise ValueError("baseline state import schema mismatch")
             source_identity = str(baseline_state.get("identity_sha256", ""))
@@ -3015,6 +3472,26 @@ def _run_bound(
 
     stage_summaries: list[dict[str, Any]] = []
     stage_specs = _training_stage_specs(config)
+    if parent_context is not None:
+        start_stage = int(parent_context["start_stage"])
+        stage_specs = tuple(
+            spec for spec in stage_specs if int(spec[0]) >= start_stage
+        )
+        selected_checkpoint = dict(parent_context["selected_checkpoint"])
+        module = _activate_parent_best(model, parent_context, device=device)
+        write_state(
+            "parent_stage_loaded",
+            parent_identity_sha256=parent_context["identity_sha256"],
+            parent_terminal_control_count=parent_context["terminal_control_count"],
+            start_stage=start_stage,
+            selected_checkpoint_sha256=identity["parent_lineage"][
+                "selected_checkpoint_sha256"
+            ],
+        )
+        log_progress(
+            f"stage={start_stage}x{start_stage} step=parent-best batch=complete "
+            f"loss={float(selected_checkpoint['J']):.6g} update=PARENT_IMPORT lr=RESET"
+        )
     terminal_control_count = next(
         control_count
         for control_count, _, _, is_terminal_stage in stage_specs
@@ -3121,7 +3598,7 @@ def _run_bound(
                 continue
         else:
             write_state("stage_initialize", control_count=control_count, completed_step=0)
-            if control_count == 7:
+            if control_count == 7 and parent_context is None:
                 # The 7x7 module is verified above to be the exact zero-residual
                 # Original PAL state. Every case denominator is that same physical
                 # baseline, so all group objectives and J are exactly 1 without an
@@ -3712,6 +4189,49 @@ def _run_bound(
         "trace_psf_exception": False,
         "health": final_health,
     }
+    if parent_context is not None:
+        child_steps_by_stage = {
+            str(control): next(
+                (
+                    int(stage["actual_steps"])
+                    for stage in stage_summaries
+                    if int(stage["control_count"]) == control
+                ),
+                0,
+            )
+            for control in STAGE_LADDER
+        }
+        parent_steps_by_stage = dict(parent_context["parent_steps_by_stage"])
+        lineage_steps_by_stage = {
+            str(control): (
+                int(parent_steps_by_stage[str(control)])
+                + int(child_steps_by_stage[str(control)])
+            )
+            for control in STAGE_LADDER
+        }
+        stage_lineage = [
+            {
+                "control_count": control,
+                "parent_actual_steps": int(parent_steps_by_stage[str(control)]),
+                "child_actual_steps": int(child_steps_by_stage[str(control)]),
+                "lineage_actual_steps": int(lineage_steps_by_stage[str(control)]),
+            }
+            for control in STAGE_LADDER
+        ]
+        summary.update({
+            "parent_lineage": dict(identity["parent_lineage"]),
+            "child_start_stage": int(parent_context["start_stage"]),
+            "optimizer_policy": "parent_best_fresh_adam",
+            "parent_stage_history": [
+                dict(stage) for stage in parent_context["summary"]["stages"]
+            ],
+            "child_stage_history": [dict(stage) for stage in stage_summaries],
+            "parent_actual_training_steps_by_stage": parent_steps_by_stage,
+            "child_actual_training_steps_by_stage": child_steps_by_stage,
+            "lineage_actual_training_steps_by_stage": lineage_steps_by_stage,
+            "stage_lineage": stage_lineage,
+            "source_parent_run_unchanged": True,
+        })
     _write_json_atomic(summary_path, summary)
     _write_run_state(
         output,

@@ -52,6 +52,186 @@ def _ten_group_cases() -> list[dict[str, object]]:
     ]
 
 
+def _write_json_fixture(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _make_completed_parent_fixture(
+    root: Path, *, steps: tuple[int, int, int],
+) -> tuple[Path, MinimalConfig, dict[int, FixedWeightNURBSPerturbation]]:
+    parent = root / "parent"
+    parent.mkdir(parents=True)
+    config = MinimalConfig(
+        output=str(parent), device="cpu",
+        max_steps_7=steps[0], max_steps_11=steps[1], max_steps_19=steps[2],
+        max_extra_terminal_stage_steps=0,
+    )
+    identity_body = {
+        "schema_version": 8,
+        "method": pal_nurbs.METHOD_NAME,
+        "fixture": "completed-parent",
+    }
+    identity_sha256 = pal_nurbs._canonical_json_sha256(identity_body)
+    identity = {**identity_body, "identity_sha256": identity_sha256}
+    _write_json_fixture(parent / "run_identity.json", identity)
+    _write_json_fixture(parent / "config.json", pal_nurbs.asdict(config))
+    _write_json_fixture(
+        parent / "run_state.json",
+        {
+            "status": "complete", "phase": "complete",
+            "identity_sha256": identity_sha256,
+        },
+    )
+
+    module7 = FixedWeightNURBSPerturbation(7, device="cpu", dtype=torch.float64)
+    with torch.no_grad():
+        module7.inner_q.copy_(
+            torch.linspace(-1.0e-4, 1.0e-4, module7.inner_q.numel()).reshape_as(module7.inner_q)
+        )
+    module11 = module7.refined(11)
+    if steps[1] > 0:
+        with torch.no_grad():
+            module11.inner_q.add_(2.0e-5)
+    module19 = module11.refined(19)
+    if steps[2] > 0:
+        with torch.no_grad():
+            module19.inner_q.add_(1.0e-5)
+    modules = {7: module7, 11: module11, 19: module19}
+    terminal = [control for control, budget in zip((7, 11, 19), steps) if budget > 0][-1]
+    stage_rows: list[dict[str, object]] = []
+    for control, minimum in zip((7, 11, 19), steps):
+        module = modules[control]
+        actual = int(minimum)
+        terminal_stage = control == terminal
+        history = [
+            {
+                "step": step,
+                "significant_improvement": bool(terminal_stage),
+                "no_improvement_attempts": 0,
+            }
+            for step in range(1, actual + 1)
+        ]
+        stop_reason = "max_extra_reached" if terminal_stage else "minimum_completed"
+        stage_summary = {
+            "control_count": control,
+            "is_terminal_stage": terminal_stage,
+            "initial_J": 1.0,
+            "initial_groups": {"J": 1.0},
+            "best_J": 0.9,
+            "best_groups": {"J": 0.9},
+            "relative_stage_improvement": 0.1,
+            "steps": actual,
+            "minimum_steps": minimum,
+            "maximum_steps": minimum,
+            "actual_steps": actual,
+            "extra_steps": 0,
+            "early_stopping_patience": config.early_stopping_patience,
+            "relative_improvement_threshold": config.relative_improvement_threshold,
+            "no_improvement_attempts": 0,
+            "stop_reason": stop_reason,
+        }
+        optimizer = torch.optim.Adam([module.inner_q], lr=config.learning_rate)
+        stage_dir = parent / f"stage_{control}x{control}"
+        pal_nurbs._save_checkpoint(
+            stage_dir / "final.pt", module,
+            identity_sha256=identity_sha256, J=0.9, step=actual,
+        )
+        _torch_save_atomic(
+            stage_dir / "resume.pt",
+            _make_stage_resume_payload(
+                identity_sha256=identity_sha256,
+                status="completed",
+                control_count=control,
+                minimum_steps=minimum,
+                maximum_steps=minimum,
+                terminal_control_count=terminal,
+                early_stopping_patience=config.early_stopping_patience,
+                relative_improvement_threshold=config.relative_improvement_threshold,
+                max_extra_terminal_stage_steps=0,
+                no_improvement_attempts=0,
+                stop_reason=stop_reason,
+                module=module,
+                optimizer=optimizer,
+                learning_rate=config.learning_rate,
+                completed_step=actual,
+                history=history,
+                stage_initial=1.0,
+                stage_initial_groups={"J": 1.0},
+                best=0.9,
+                best_state=module.state_dict(),
+                best_health={"J_far": 0.9},
+                stage_summary=stage_summary,
+                optimizer_model_state=module.state_dict(),
+            ),
+        )
+        stage_rows.append(stage_summary)
+    _write_json_fixture(
+        parent / "summary.json",
+        {
+            "identity_sha256": identity_sha256,
+            "terminal_control_count": terminal,
+            "final_control_count": 19,
+            "actual_training_steps": sum(steps),
+            "runtime_seconds": 1.0,
+            "stages": stage_rows,
+        },
+    )
+    _write_json_fixture(
+        parent / "case_layout_state.json",
+        {"schema_version": pal_nurbs.CASE_LAYOUT_STATE_SCHEMA_VERSION,
+         "identity_sha256": identity_sha256},
+    )
+    _write_json_fixture(parent / "candidate_trace_progress.json", {"status": "complete"})
+    _write_json_fixture(
+        parent / "forward_qualification_progress.json", {"status": "complete"}
+    )
+    _write_json_fixture(
+        parent / "final_phase_qualification_progress.json", {"status": "complete"}
+    )
+    zero = FixedWeightNURBSPerturbation(7, device="cpu", dtype=torch.float64)
+    baseline_cases = _ten_group_cases()
+    baseline_rows = [
+        {
+            **case,
+            "loss_metric": 1.0,
+            "astig_A_D": 1.0,
+            "valid_fraction": 1.0,
+            "edge_fraction": 0.0,
+        }
+        for case in baseline_cases
+    ]
+    baseline_health = {
+        "objective_name": "fixture objective",
+        "minimum_valid_fraction_ratio": 1.0,
+        "maximum_edge_fraction": 0.0,
+        **{
+            f"J_{name}": 1.0
+            for name in (*pal_nurbs.FUNCTIONAL_GROUPS, *pal_nurbs.PERIPHERAL_GROUPS)
+        },
+        "J_mid": 1.0,
+        "J_functional": 1.0,
+        "J_peripheral": 1.0,
+        "J_total": 1.0,
+    }
+    _torch_save_atomic(
+        parent / "baseline_state.pt",
+        {
+            "schema_version": pal_nurbs.BASELINE_STATE_SCHEMA_VERSION,
+            "identity_sha256": identity_sha256,
+            "control_count": 7,
+            "model_state": zero.state_dict(),
+            "training_case_ids": [str(case["case_id"]) for case in baseline_cases],
+            "baseline_value": 1.0,
+            "baseline_rows": baseline_rows,
+            "baseline_health": baseline_health,
+            "baseline_power": {"P_far_D": 0.0, "ADD_D": 0.0},
+            "rng_state": pal_nurbs._capture_rng_state(),
+        },
+    )
+    return parent, config, modules
+
+
 def test_current_phase_progress_uses_stable_source_key_before_renumbered_case_id() -> None:
     qualified_pool = [
         {
@@ -148,6 +328,337 @@ def test_main_training_phase_contract_is_nonlegacy_raw_psf() -> None:
 def test_training_budget_config_rejects_invalid_values(kwargs, message) -> None:
     with pytest.raises(ValueError, match=message):
         MinimalConfig(device="cpu", **kwargs)
+
+
+def test_parent_fork_config_requires_paired_arguments_and_unmixed_imports(tmp_path) -> None:
+    with pytest.raises(ValueError, match="supplied together"):
+        MinimalConfig(parent_run=str(tmp_path / "parent"), device="cpu")
+    with pytest.raises(ValueError, match="before start_stage"):
+        MinimalConfig(
+            parent_run=str(tmp_path / "parent"), start_stage=11,
+            max_steps_7=1, max_steps_11=1, max_steps_19=0, device="cpu",
+        )
+    with pytest.raises(ValueError, match="start_stage training budget"):
+        MinimalConfig(
+            parent_run=str(tmp_path / "parent"), start_stage=11,
+            max_steps_7=0, max_steps_11=0, max_steps_19=1, device="cpu",
+        )
+    with pytest.raises(ValueError, match="explicit evidence imports"):
+        MinimalConfig(
+            parent_run=str(tmp_path / "parent"), start_stage=11,
+            max_steps_7=0, max_steps_11=1, max_steps_19=0,
+            baseline_state_import="baseline.pt", device="cpu",
+        )
+
+
+@pytest.mark.parametrize(
+    ("parent_steps", "start_stage", "allowed"),
+    [
+        ((50, 0, 0), 7, True),
+        ((50, 0, 0), 11, True),
+        ((50, 0, 0), 19, True),
+        ((50, 25, 0), 7, False),
+        ((50, 25, 0), 11, True),
+        ((50, 25, 0), 19, True),
+        ((50, 25, 10), 7, False),
+        ((50, 25, 10), 11, False),
+        ((50, 25, 10), 19, True),
+    ],
+)
+def test_parent_fork_start_stage_matrix(
+    tmp_path, parent_steps: tuple[int, int, int], start_stage: int, allowed: bool,
+) -> None:
+    case_root = tmp_path / f"p_{parent_steps[0]}_{parent_steps[1]}_{parent_steps[2]}_s{start_stage}"
+    parent, _, _ = _make_completed_parent_fixture(case_root, steps=parent_steps)
+    budgets = {
+        7: (1, 0, 0),
+        11: (0, 1, 0),
+        19: (0, 0, 1),
+    }[start_stage]
+    child = MinimalConfig(
+        output=str(case_root / "child"), parent_run=str(parent), start_stage=start_stage,
+        device="cpu", max_steps_7=budgets[0], max_steps_11=budgets[1],
+        max_steps_19=budgets[2],
+    )
+    before = {
+        path.relative_to(parent).as_posix(): pal_nurbs._sha256_file(path)
+        for path in parent.rglob("*") if path.is_file()
+    }
+    if allowed:
+        context = pal_nurbs._validate_parent_run_source(child, device="cpu")
+        assert context is not None
+        assert context["terminal_control_count"] == next(
+            control for control, budget in reversed(list(zip((7, 11, 19), parent_steps)))
+            if budget > 0
+        )
+        assert context["start_stage"] == start_stage
+    else:
+        with pytest.raises(ValueError, match="cannot precede parent terminal stage"):
+            pal_nurbs._validate_parent_run_source(child, device="cpu")
+    after = {
+        path.relative_to(parent).as_posix(): pal_nurbs._sha256_file(path)
+        for path in parent.rglob("*") if path.is_file()
+    }
+    assert after == before
+
+
+def test_parent_best_activation_uses_selected_final_and_fresh_adam(tmp_path) -> None:
+    parent, _, modules = _make_completed_parent_fixture(tmp_path, steps=(50, 0, 0))
+    child = MinimalConfig(
+        output=str(tmp_path / "child"), parent_run=str(parent), start_stage=19,
+        device="cpu", max_steps_7=0, max_steps_11=0, max_steps_19=1,
+    )
+    context = pal_nurbs._validate_parent_run_source(child, device="cpu")
+    assert context is not None
+
+    model = SimpleNamespace(perturbation=None, _templates={}, _cache={})
+    activated = pal_nurbs._activate_parent_best(
+        model, context, device=torch.device("cpu"),
+    )
+    _assert = pal_nurbs._assert_state_dict_equal
+    _assert(activated.state_dict(), modules[19].state_dict(), context="test activation")
+    optimizer = torch.optim.Adam([activated.inner_q], lr=child.learning_rate)
+    assert optimizer.state == {}
+    assert model.perturbation is activated
+
+
+def test_parent_fork_rejects_nonfork_config_drift(tmp_path) -> None:
+    parent, _, _ = _make_completed_parent_fixture(tmp_path, steps=(50, 25, 0))
+    child = MinimalConfig(
+        output=str(tmp_path / "child"), parent_run=str(parent), start_stage=11,
+        device="cpu", max_steps_7=0, max_steps_11=1, max_steps_19=1,
+        smooth_lambda=0.06,
+    )
+    with pytest.raises(ValueError, match="configuration mismatch.*smooth_lambda"):
+        pal_nurbs._validate_parent_run_source(child, device="cpu")
+
+
+def test_parent_fork_rejects_incomplete_parent_and_evidence(tmp_path) -> None:
+    incomplete_root = tmp_path / "incomplete"
+    parent, _, _ = _make_completed_parent_fixture(incomplete_root, steps=(1, 0, 0))
+    state = json.loads((parent / "run_state.json").read_text(encoding="utf-8"))
+    state.update({"status": "running", "phase": "stage_training"})
+    _write_json_fixture(parent / "run_state.json", state)
+    child = MinimalConfig(
+        output=str(incomplete_root / "child"), parent_run=str(parent), start_stage=7,
+        device="cpu", max_steps_7=1, max_steps_11=0, max_steps_19=0,
+    )
+    with pytest.raises(ValueError, match="must have complete run_state"):
+        pal_nurbs._validate_parent_run_source(child, device="cpu")
+
+    evidence_root = tmp_path / "bad_evidence"
+    parent, _, _ = _make_completed_parent_fixture(evidence_root, steps=(1, 0, 0))
+    _write_json_fixture(
+        parent / "forward_qualification_progress.json", {"status": "running"},
+    )
+    child = replace(child, output=str(evidence_root / "child"), parent_run=str(parent))
+    with pytest.raises(ValueError, match="forward_qualification_progress must be complete"):
+        pal_nurbs._validate_parent_run_source(child, device="cpu")
+
+
+def test_parent_fork_rejects_checkpoint_identity_and_intermediate_loss(
+    tmp_path,
+) -> None:
+    identity_root = tmp_path / "bad_checkpoint"
+    parent, _, _ = _make_completed_parent_fixture(identity_root, steps=(1, 1, 0))
+    final_path = parent / "stage_11x11" / "final.pt"
+    final = pal_nurbs._load_torch_mapping(final_path, map_location="cpu")
+    final["identity_sha256"] = "foreign"
+    _torch_save_atomic(final_path, final)
+    child = MinimalConfig(
+        output=str(identity_root / "child"), parent_run=str(parent), start_stage=11,
+        device="cpu", max_steps_7=0, max_steps_11=1, max_steps_19=0,
+    )
+    with pytest.raises(ValueError, match="selected checkpoint identity mismatch"):
+        pal_nurbs._validate_parent_run_source(child, device="cpu")
+
+    missing_root = tmp_path / "missing_intermediate"
+    parent, _, _ = _make_completed_parent_fixture(missing_root, steps=(1, 0, 0))
+    (parent / "stage_11x11" / "resume.pt").unlink()
+    child = replace(
+        child, output=str(missing_root / "child"), parent_run=str(parent),
+        start_stage=19, max_steps_11=0, max_steps_19=1,
+    )
+    with pytest.raises(FileNotFoundError, match="stage_11_resume"):
+        pal_nurbs._validate_parent_run_source(child, device="cpu")
+
+
+def test_parent_fork_run_uses_parent_best_and_preserves_parent(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent, _, _ = _make_completed_parent_fixture(tmp_path, steps=(1, 1, 0))
+    training_cases = _ten_group_cases()
+    for index, case in enumerate(training_cases):
+        case.update({
+            "distance_mm": 500.0 + 100.0 * index,
+            "field_x_deg": float(index - 5),
+            "field_y_deg": float(5 - index),
+        })
+
+    class Model:
+        _key = staticmethod(MinimalOpticalModel._key)
+
+        def __init__(self, config: MinimalConfig, perturbation) -> None:
+            self.config = config
+            self.perturbation = perturbation
+            self.device = torch.device("cpu")
+            self.size_reference_mm = {}
+            self._cache = {}
+            self._templates = {}
+
+        def set_prescription_context(self, sag, power_config, zones) -> None:
+            return None
+
+    monkeypatch.setattr(pal_nurbs, "MinimalOpticalModel", Model)
+    monkeypatch.setattr(
+        pal_nurbs,
+        "_prepare_or_load_case_layout",
+        lambda config, output, model, identity_sha256: training_cases,
+    )
+    monkeypatch.setattr(
+        pal_nurbs,
+        "load_pal",
+        lambda config, device: (
+            torch.zeros((5, 5), dtype=torch.float64),
+            PALPowerConfig(40.0, 1.5, 100.0, 5.0),
+            {},
+        ),
+    )
+
+    def fake_evaluate(model, cases, baseline, *, with_grad, **kwargs):
+        objective = 1.0 + model.perturbation.inner_q.square().mean()
+        if with_grad:
+            objective.backward()
+        value = float(objective.detach().cpu())
+        health = {
+            "objective_name": "fixture objective",
+            "minimum_valid_fraction_ratio": 1.0,
+            "maximum_edge_fraction": 0.0,
+            **{
+                f"J_{name}": value
+                for name in (*pal_nurbs.FUNCTIONAL_GROUPS, *pal_nurbs.PERIPHERAL_GROUPS)
+            },
+            "J_mid": value,
+            "J_functional": value,
+            "J_peripheral": value,
+            "J_total": value,
+        }
+        return value, [], health
+
+    monkeypatch.setattr(pal_nurbs, "_evaluate", fake_evaluate)
+
+    def fake_prescription(sag, power_config, zones, *, baseline_sag=None):
+        zero = sag.sum() * 0.0
+        return {
+            "P_far_D": zero,
+            "ADD_D": zero,
+            "astig_mean_D": zero,
+            "lower_edge_max_abs_power_change_D": zero,
+            "lower_edge_max_abs_astig_change_D": zero,
+        }
+
+    monkeypatch.setattr(pal_nurbs, "prescription_metrics", fake_prescription)
+    before = {
+        path.relative_to(parent).as_posix(): pal_nurbs._sha256_file(path)
+        for path in parent.rglob("*") if path.is_file()
+    }
+    child = MinimalConfig(
+        output=str(tmp_path / "child"), parent_run=str(parent), start_stage=11,
+        device="cpu", max_steps_7=0, max_steps_11=1, max_steps_19=1,
+        max_extra_terminal_stage_steps=0,
+    )
+    run(child)
+
+    assert not (tmp_path / "child" / "stage_7x7").exists()
+    with (parent / "stage_11x11" / "final.pt").open("rb") as handle:
+        parent_final = torch.load(handle, map_location="cpu")
+    with (tmp_path / "child" / "stage_11x11" / "initial.pt").open("rb") as handle:
+        child_initial = torch.load(handle, map_location="cpu")
+    pal_nurbs._assert_state_dict_equal(
+        parent_final["state_dict"], child_initial["state_dict"],
+        context="child initial/parent best",
+    )
+    with (tmp_path / "child" / "stage_11x11" / "resume.pt").open("rb") as handle:
+        child_stage = torch.load(handle, map_location="cpu")
+    assert child_stage["history"][0]["step"] == 1
+    assert child_stage["optimizer_state"]["state"]
+
+    summary = json.loads(
+        (tmp_path / "child" / "summary.json").read_text(encoding="utf-8")
+    )
+    assert summary["actual_training_steps"] == 2
+    assert summary["child_actual_training_steps_by_stage"] == {
+        "7": 0, "11": 1, "19": 1,
+    }
+    assert summary["parent_actual_training_steps_by_stage"] == {
+        "7": 1, "11": 1, "19": 0,
+    }
+    assert summary["lineage_actual_training_steps_by_stage"] == {
+        "7": 1, "11": 2, "19": 1,
+    }
+    assert summary["optimizer_policy"] == "parent_best_fresh_adam"
+    child_identity = json.loads(
+        (tmp_path / "child" / "run_identity.json").read_text(encoding="utf-8")
+    )
+    assert child_identity["parent_lineage"]["selected_checkpoint_sha256"] == (
+        pal_nurbs._sha256_file(parent / "stage_11x11" / "final.pt")
+    )
+    assert "PARENT_IMPORT" in (
+        tmp_path / "child" / "training.log"
+    ).read_text(encoding="utf-8")
+
+    interruption = {"enabled": True, "gradient_calls": 0}
+
+    def interrupting_evaluate(model, cases, baseline, *, with_grad, **kwargs):
+        if with_grad:
+            interruption["gradient_calls"] += 1
+            if interruption["enabled"] and interruption["gradient_calls"] == 3:
+                raise RuntimeError("synthetic child interruption")
+        return fake_evaluate(
+            model, cases, baseline, with_grad=with_grad, **kwargs,
+        )
+
+    monkeypatch.setattr(pal_nurbs, "_evaluate", interrupting_evaluate)
+    interrupted = replace(
+        child, output=str(tmp_path / "child_interrupted"), max_steps_19=2,
+    )
+    with pytest.raises(RuntimeError, match="synthetic child interruption"):
+        run(interrupted)
+    with (
+        tmp_path / "child_interrupted" / "stage_19x19" / "resume.pt"
+    ).open("rb") as handle:
+        active = torch.load(handle, map_location="cpu")
+    assert active["status"] == "active"
+    assert active["completed_step"] == 1
+
+    interruption.update({"enabled": False, "gradient_calls": 0})
+    run(interrupted, resume=True)
+    uninterrupted = replace(
+        interrupted, output=str(tmp_path / "child_uninterrupted"),
+    )
+    run(uninterrupted)
+    with (
+        tmp_path / "child_interrupted" / "stage_19x19" / "final.pt"
+    ).open("rb") as handle:
+        resumed_final = torch.load(handle, map_location="cpu")
+    with (
+        tmp_path / "child_uninterrupted" / "stage_19x19" / "final.pt"
+    ).open("rb") as handle:
+        uninterrupted_final = torch.load(handle, map_location="cpu")
+    pal_nurbs._assert_state_dict_equal(
+        resumed_final["state_dict"], uninterrupted_final["state_dict"],
+        context="resumed/uninterrupted child",
+    )
+    assert (
+        tmp_path / "child_interrupted" / "stage_19x19" / "history.csv"
+    ).read_bytes() == (
+        tmp_path / "child_uninterrupted" / "stage_19x19" / "history.csv"
+    ).read_bytes()
+    after = {
+        path.relative_to(parent).as_posix(): pal_nurbs._sha256_file(path)
+        for path in parent.rglob("*") if path.is_file()
+    }
+    assert after == before
 
 
 def test_terminal_stage_patience_counts_every_attempt_and_resets_only_on_strict_improvement() -> None:

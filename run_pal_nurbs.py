@@ -49,6 +49,18 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--parent-run",
+        default=None,
+        help="已完成且保持只读的父 run；其阶段 best 和预处理证据用于创建新身份",
+    )
+    parser.add_argument(
+        "--start-stage",
+        type=int,
+        choices=(7, 11, 19),
+        default=None,
+        help="child 首个新增训练阶段；必须不早于父 run 的 terminal stage",
+    )
+    parser.add_argument(
         "--steps", type=int, nargs=3, metavar=("S7", "S11", "S19"),
         default=(MinimalConfig.max_steps_7, MinimalConfig.max_steps_11, MinimalConfig.max_steps_19),
         help=(
@@ -105,6 +117,8 @@ def main() -> int:
         forward_qualification_import=args.forward_qualification_import,
         final_phase_qualification_import=args.final_phase_qualification_import,
         baseline_state_import=args.baseline_state_import,
+        parent_run=args.parent_run,
+        start_stage=args.start_stage,
     )
     if args.prepare_only:
         output = prepare_only(config, resume=args.resume)

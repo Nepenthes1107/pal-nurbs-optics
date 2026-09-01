@@ -96,8 +96,26 @@ python -m biot.gui
 python evaluate_pal_nurbs.py --run results/optimization/run_001 --device cuda --psf-batch-size 8 --blur-scale 4
 ```
 
+若完整 run 中需要单独评价某个已完成阶段，可直接选择该阶段保存的最优
+`final.pt`，无需重跑训练。例如复用 `50/25/0` run 的 7×7 阶段：
+
+```powershell
+python evaluate_pal_nurbs.py --run results/optimization/v3_branch/run_005 --checkpoint-stage 7 --device cuda --psf-batch-size 8 --blur-scale 4
+```
+
+阶段评价要求源 run 已完整结束，且 `summary.json`、源 identity 与 checkpoint
+元数据一致；结果独立写入 `<run>/evaluation_stage_7x7/`。默认不指定该参数时仍
+评价最终 checkpoint 并写入 `<run>/evaluation/`。不得通过复制 checkpoint 或
+修改 `summary.json` 冒充另一训练身份。
+
 每个条件文件保存 81 个场点的原始 512×512 FFT PSF 和统一物理裁剪后的
 130×130 渲染 PSF；weighted MTF 只读取原始 PSF，拼接只读取渲染 PSF。
+每个 D500/D1000/Dinf 的 baseline、optimized 和 delta 除原有 9×9
+`*_mean.png`/`*_mean_map.npz` 外，还在 `weighted_mtf/` 中生成
+`*_mean_interpolated.png`，共 9 张。该显示产物复用 BIOT_vis 的规则网格
+cubic 方法，将 9×9 原始场点上采样到 200×200；不外推、不填补
+NaN/Inf，原始节点必须在 `1e-12` 容差内保持不变。插值仅用于平滑显示，
+不修改 NPZ、weighted-MTF 数值、评价门禁或科学结论。
 评价网格为 `[-40,40]` degree、步长 10 degree。`--resume` 精确核验并跳过
 HDF5 中已完成节点；损坏或身份不符的节点失败关闭。`--blur-scale` 默认 4，
 只控制视标拼接的显示模糊，不改变 PSF 数据库、MTF 或 PSF stitch。
@@ -140,6 +158,48 @@ attempt 数及其停止原因。
 stopping 改造提升了 run identity 与 stage-resume schema；旧 run/checkpoint
 保持只读，不可按新方法恢复，必须使用新输出目录。当前项目不再支持跨平台
 training-state/parity 导入。
+
+## 从已完成父 run 分叉续训
+
+`--parent-run` 与 `--start-stage {7,11,19}` 可从已完成父 run 的阶段 best 创建
+全新 child run。父目录始终只读，child 使用新的 `--output`、run identity、fresh
+Adam、初始学习率和 patience 计数；父 Adam 动量不会导入。child 的 `--steps`
+只表示新增 attempt，因此起点之前必须为 0，起点本身必须大于 0。
+
+合法起点不得早于父 run 最后一个非零训练阶段。例如父 run 为 `50/25/0` 时只能
+从 11×11 或 19×19 开始；父 run 为 `50/0/0` 时可从 7×7、11×11 或 19×19
+开始。若起点晚于父 terminal，程序逐级核验父 run 保存的零预算 `final.pt`/
+`resume.pt`，并以 `1e-10` 容差确认 knot refinement 未改变面形或一、二阶导数。
+
+下面从父 `run_005` 的 11×11 best 新增 11×11 的 10 个 attempt，再新增 19×19
+的 10 个最低 attempt；terminal 19×19 最多再执行 30 个 attempt：
+
+```powershell
+python run_pal_nurbs.py `
+  --output results/optimization/v3_branch/run_006 `
+  --parent-run results/optimization/v3_branch/run_005 `
+  --start-stage 11 `
+  --steps 0 10 10 `
+  --max-extra-terminal-stage-steps 30 `
+  --smooth-lambda 0.05 `
+  --early-stopping-patience 7 `
+  --relative-improvement-threshold 0.001 `
+  --case-batch-size 8 `
+  --device cuda
+```
+
+从 19×19 开始使用 `--start-stage 19 --steps 0 0 10`。父子除输出、分叉参数、
+新增预算、terminal 额外预算和导入路径外，其余物理、目标、约束、采样、batch、
+seed、优化器超参数和 `smooth_lambda` 必须完全一致。程序还会验证并复用父 run 的
+candidate trace、forward qualification、final-phase qualification 与
+`baseline_state.pt`；任何缺失、损坏或身份不符都会直接失败，不重新计算兜底。
+
+child 的 `summary.json` 分开保存父阶段历史、child 阶段历史、逐阶段新增/累计
+steps、父 checkpoint/evidence 哈希和
+`optimizer_policy=parent_best_fresh_adam`；`actual_training_steps` 仅统计 child
+实际执行量。child 中断后只能在 child 自身目录使用 `--resume`。run identity
+schema 9 的 child 与当前 schema 8 已完成 run 都可作为只读父源，但 schema 8
+run 不因此获得 schema 9 的原目录 `--resume` 兼容性。
 
 完整 `candidate-trace` 进度可显式导入新 run：保存的原身份必须先通过自身哈希
 校验，镜片内容 SHA-256 与物理追迹参数也必须匹配；Linux/Windows checkout 的
