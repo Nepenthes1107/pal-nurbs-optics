@@ -274,6 +274,56 @@ def test_evaluate_default_psf_batch_size_is_eight() -> None:
     assert evaluator.evaluate.__kwdefaults__["psf_batch_size"] == 8
 
 
+def test_resume_keeps_sealed_identity_across_legacy_classification_drift(
+    tmp_path,
+) -> None:
+    path = tmp_path / "evaluation_identity.json"
+    saved_body = {
+        "schema_version": evaluator.EVAL_SCHEMA,
+        "source_run_identity_sha256": "source",
+        "checkpoint_sha256": "checkpoint",
+        "source_identity_legacy_schema": False,
+        "psf_database": {"batch_size": 8},
+        "runtime": {"platform": "linux"},
+    }
+    saved = {
+        **saved_body,
+        "identity_sha256": evaluator._canonical_sha256(saved_body),
+    }
+    evaluator._write_json(path, saved)
+    before = path.read_bytes()
+
+    current_body = {**saved_body, "source_identity_legacy_schema": True}
+    bound = evaluator._bind_evaluation_identity(
+        path, identity_body=current_body, resume=True,
+    )
+
+    assert bound == saved
+    assert path.read_bytes() == before
+    with pytest.raises(ValueError, match="differing fields: checkpoint_sha256"):
+        evaluator._bind_evaluation_identity(
+            path,
+            identity_body={**current_body, "checkpoint_sha256": "changed"},
+            resume=True,
+        )
+
+
+def test_resume_rejects_modified_evaluation_identity(tmp_path) -> None:
+    path = tmp_path / "evaluation_identity.json"
+    body = {
+        "schema_version": evaluator.EVAL_SCHEMA,
+        "source_identity_legacy_schema": False,
+    }
+    evaluator._write_json(
+        path, {**body, "identity_sha256": evaluator._canonical_sha256(body)},
+    )
+    payload = evaluator._json(path)
+    payload["source_identity_legacy_schema"] = True
+    evaluator._write_json(path, payload)
+    with pytest.raises(ValueError, match="malformed or has been modified"):
+        evaluator._bind_evaluation_identity(path, identity_body=body, resume=True)
+
+
 def test_load_checkpoint_selects_completed_stage_and_checks_identity(tmp_path) -> None:
     stage = tmp_path / "stage_7x7"
     stage.mkdir()

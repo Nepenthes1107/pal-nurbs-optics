@@ -93,6 +93,58 @@ def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
     os.replace(temporary, path)
 
 
+def _validate_evaluation_identity_payload(payload: Mapping[str, Any]) -> str:
+    saved = dict(payload)
+    claimed = str(saved.pop("identity_sha256", ""))
+    if not claimed or _canonical_sha256(saved) != claimed:
+        raise ValueError("evaluation_identity.json is malformed or has been modified")
+    if int(saved.get("schema_version", -1)) != EVAL_SCHEMA:
+        raise ValueError("unsupported evaluation identity schema")
+    return claimed
+
+
+def _bind_evaluation_identity(
+    path: Path, *, identity_body: Mapping[str, Any], resume: bool,
+) -> dict[str, Any]:
+    """Create an evaluation identity or bind resume to the sealed existing one.
+
+    ``source_identity_legacy_schema`` describes how the *current* PAL code
+    classifies an otherwise self-hashed source identity. A later PAL schema
+    bump may change only that label. It is therefore excluded from resume
+    equivalence, while every physical/checkpoint/runtime field remains strict.
+    """
+    current_body = dict(identity_body)
+    current = {
+        **current_body,
+        "identity_sha256": _canonical_sha256(current_body),
+    }
+    if not path.exists():
+        _write_json(path, current)
+        return current
+    if not resume:
+        raise FileExistsError(f"evaluation already exists: {path.parent}; use --resume")
+
+    saved = _json(path)
+    _validate_evaluation_identity_payload(saved)
+    saved_body = dict(saved)
+    saved_body.pop("identity_sha256", None)
+    comparison_saved = dict(saved_body)
+    comparison_current = dict(current_body)
+    classification_field = "source_identity_legacy_schema"
+    comparison_saved.pop(classification_field, None)
+    comparison_current.pop(classification_field, None)
+    if comparison_saved != comparison_current:
+        differing = sorted(
+            key for key in set(comparison_saved) | set(comparison_current)
+            if comparison_saved.get(key) != comparison_current.get(key)
+        )
+        raise ValueError(
+            "existing evaluation identity does not match current source/checkpoint; "
+            "differing fields: " + ", ".join(differing)
+        )
+    return saved
+
+
 def _json_distance(value: Any) -> float | str:
     value = float(value)
     return "inf" if math.isinf(value) else value
@@ -1311,10 +1363,9 @@ def evaluate(
             "checkpoint_selection": f"stage_{int(checkpoint_stage)}x{int(checkpoint_stage)}",
             "checkpoint_control_count": control_count,
         })
-    identity = {**identity_body, "identity_sha256": _canonical_sha256(identity_body)}
-    if identity_path.exists() and _json(identity_path).get("identity_sha256") != identity["identity_sha256"]:
-        raise ValueError("existing evaluation identity does not match current source/checkpoint")
-    _write_json(identity_path, identity)
+    identity = _bind_evaluation_identity(
+        identity_path, identity_body=identity_body, resume=resume,
+    )
     identity_sha256 = str(identity["identity_sha256"])
     _progress(
         phase="startup", device=device_name, resume=resume,

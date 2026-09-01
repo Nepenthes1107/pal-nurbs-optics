@@ -116,6 +116,11 @@ python evaluate_pal_nurbs.py --run results/optimization/v3_branch/run_005 --chec
 cubic 方法，将 9×9 原始场点上采样到 200×200；不外推、不填补
 NaN/Inf，原始节点必须在 `1e-12` 容差内保持不变。插值仅用于平滑显示，
 不修改 NPZ、weighted-MTF 数值、评价门禁或科学结论。
+已完成的旧评价可用原命令加 `--resume` 补生这些图：程序保留原
+`evaluation_identity.json` 及其 SHA-256，只允许源 run 因后续训练 schema
+升级而从“当前”被重分类为“legacy”的非物理标签漂移。源 identity、
+checkpoint SHA-256、PSF batch、场网格、运行库和所有其他评价字段
+仍必须严格相同，已完成 HDF5 只校验和跳过，不重新追迹 PSF。
 评价网格为 `[-40,40]` degree、步长 10 degree。`--resume` 精确核验并跳过
 HDF5 中已完成节点；损坏或身份不符的节点失败关闭。`--blur-scale` 默认 4，
 只控制视标拼接的显示模糊，不改变 PSF 数据库、MTF 或 PSF stitch。

@@ -50,6 +50,10 @@
   插值是仅显示的规则网格 cubic 200×200 上采样，严格限定在原生
   `[-40,40]°` 域内、原节点误差不超过 `1e-12`；非有限或超出
   MTF 物理范围的原生数据直接失败，不填洞或外推。
+- 旧完整评价用 `--resume` 补生插值图时保留已封印的 evaluation identity
+  和 HDF5 identity。只忽略源 run 随当前训练 schema 升级而产生的
+  `source_identity_legacy_schema` 分类标签漂移；checkpoint/input/batch/
+  runtime 等实质字段仍逐项严格相等，旧 identity 自哈希也必须通过。
 - 完整 run 可用 `evaluate_pal_nurbs.py --checkpoint-stage 7|11|19` 直接评价对应
   已完成阶段的 `final.pt`；评价器严格核对 summary 阶段记录、checkpoint
   `control_count` 与源 identity，并写入独立的 `evaluation_stage_NxN/`。
@@ -222,8 +226,11 @@ baseline/optimized/delta 的 9×9 PNG/NPZ 之外，新增 9 张 cubic
 200×200 `*_mean_interpolated.png`。显示插值严核原节点、边界、finite 与
 MTF `[0,1]` 物理范围，delta 由分别插值后的 optimized-baseline 得到；
 原生 NPZ 不改写。使用已有 `run_004` D500 optimized NPZ 完成一张真实
-渲染方向/样式检查。评价器定向测试 `13 passed`；完整测试
+渲染方向/样式检查。后续补充旧评价 resume 兼容：训练 identity schema
+升级导致的 `source_identity_legacy_schema` 分类漂移不再改变已封印的
+evaluation identity，但其他字段与旧 identity 自哈希仍严格核验。最终
+评价器定向测试 `15 passed`；完整测试
 `.venv\Scripts\python.exe -m pytest tests -q --basetemp
-.tmp_pytest_weighted_mtf_interpolated_full` 为 `218 passed`，无失败；
+.tmp_pytest_eval_identity_resume_full` 为 `220 passed`，无失败；
 `py_compile` 与 `git diff --check` 通过。本次未重跑正式评价，不新增
 光学或性能结论。
