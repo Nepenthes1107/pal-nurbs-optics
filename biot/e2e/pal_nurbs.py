@@ -2653,6 +2653,24 @@ def _save_checkpoint(path: Path, module: FixedWeightNURBSPerturbation, **metadat
 GRADIENT_DIAGNOSTIC_SCHEMA_VERSION = 1
 
 
+def _backward_gradient_for_diagnostic(
+    contribution: torch.Tensor,
+    module: FixedWeightNURBSPerturbation,
+    *,
+    group: str,
+) -> torch.Tensor:
+    """Return one diagnostic gradient through reentrant checkpoints."""
+    module.zero_grad(set_to_none=True)
+    contribution.backward()
+    if module.inner_q.grad is None:
+        raise RuntimeError(f"missing gradient diagnostic for group {group}")
+    gradient = module.inner_q.grad.detach().clone()
+    module.zero_grad(set_to_none=True)
+    if not bool(torch.isfinite(gradient).all()):
+        raise RuntimeError(f"non-finite gradient diagnostic for group {group}")
+    return gradient
+
+
 def _group_gradient_for_diagnostic(
     model: MinimalOpticalModel,
     module: FixedWeightNURBSPerturbation,
@@ -2672,7 +2690,11 @@ def _group_gradient_for_diagnostic(
     if group in PERIPHERAL_GROUPS:
         raw = model.astig_A_by_zone()[GROUP_TO_ZONE[group]]
         group_loss = raw / float(astigmatism_tolerance_D)
-        gradient = torch.autograd.grad(group_loss, module.inner_q)[0]
+        gradient = _backward_gradient_for_diagnostic(
+            group_loss,
+            module,
+            group=group,
+        )
         accumulated.add_(gradient.detach())
         loss_value = float(group_loss.detach().cpu())
         return loss_value, accumulated
@@ -2699,9 +2721,11 @@ def _group_gradient_for_diagnostic(
             near_edge_astig_A_weight=near_edge_astig_A_weight,
         )
         contribution = scores.sum() / len(members)
-        gradient = torch.autograd.grad(contribution, module.inner_q)[0]
-        if not bool(torch.isfinite(gradient).all()):
-            raise RuntimeError(f"non-finite gradient diagnostic for group {group}")
+        gradient = _backward_gradient_for_diagnostic(
+            contribution,
+            module,
+            group=group,
+        )
         accumulated.add_(gradient.detach())
         loss_value += float(contribution.detach().cpu())
         result_device = result.kernels.device

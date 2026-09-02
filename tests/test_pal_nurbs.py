@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from torch.utils.checkpoint import checkpoint
 
 import biot.e2e.pal_nurbs as pal_nurbs
 from biot.e2e.pal_nurbs import (
@@ -1097,7 +1098,10 @@ def test_group_gradient_diagnostic_reports_norms_cosines_and_preserves_state() -
             scales = torch.as_tensor(
                 [float(case["scale"]) for case in batch], dtype=torch.float64
             )
-            edge = torch.sigmoid(module.inner_q.mean() * scales - 0.5)
+            edge = checkpoint(
+                lambda inner_q: torch.sigmoid(inner_q.mean() * scales - 0.5),
+                module.inner_q,
+            )
             kernels = torch.zeros((len(batch), 9, 9), dtype=torch.float64)
             kernels[:, 4, 4] = 1.0 - edge
             kernels[:, 4, 5] = edge

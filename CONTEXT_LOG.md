@@ -77,6 +77,8 @@
 - 逐 case baseline 归一化已删除。weighted-MTF loss、Z4 RMS、A_D 分别用固定
   0.10、1e-4 mm、0.80 D 容差；baseline 保存实际目标值，只用于健康比例、改善率和审计。
 - Original PAL 7×7 与 7×7 final 分别输出九组梯度范数/余弦 JSON 和哈希 manifest；
+  诊断通过不带 `inputs` 的逐组、逐 batch `backward()` 取得梯度，兼容 GRIN3
+  reentrant activation checkpoint，且在退出诊断时恢复进入前的参数梯度和 RNG。
   不新增 D1000 Far 门禁、区域统计或诊断图。正式评价器三物距六 HDF5 及所有
   D1000 weighted-MTF/PSF/chart 产物保持原合同。
 - 本次最小成本验证：case-layout 定向文件 `20 passed`，评价器定向文件
@@ -85,6 +87,10 @@
   weighted-MTF 数值/梯度、三项容差校验和九组梯度诊断共 `5 passed`；
   Dinf 稳定键与合格池重选另有 `3 passed`；
   `py_compile`、CLI `--help` 与 `git diff --check` 通过。未运行完整测试套件或正式训练。
+- 云端 PyTorch 2.0.1 暴露的诊断反传兼容性问题已有 reentrant checkpoint
+  聚焦回归测试，结果 `1 passed`。该修复会改变 implementation closure；
+  旧失败 run 不得直接 `--resume`，应建立新输出目录，仅通过显式 import 复用已校验的
+  candidate/forward/final-phase/baseline 产物。
 - Z4 执行层使用 Torch reduced-QR/三角求解保持 autograd；BIOT NumPy 拟合仅用于
   detached 对比验证，不从 PSF 逆变换恢复相位，也不保留 M2 训练回退。
 - 处方门禁除 `P_far`/`ADD` 外，对 lower-edge guard 检查 candidate 相对
