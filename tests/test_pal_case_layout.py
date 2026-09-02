@@ -356,7 +356,7 @@ def test_preoptimization_artifacts_record_candidates_and_nine_groups(tmp_path) -
     ):
         assert (output / name).is_file()
     manifest = json.loads((output / "case_manifest.json").read_text(encoding="utf-8"))
-    assert manifest["schema_version"] == 8
+    assert manifest["schema_version"] == 9
     assert "posthoc_cases_json" not in manifest["source"]
     assert manifest["group_counts"] == TRAINING_GROUP_COUNTS
     assert "group_weight" in manifest["objective_contract"]["J"]
@@ -424,7 +424,7 @@ def test_preoptimization_artifacts_accept_group_qualified_pool_candidate_reuse(
     manifest = json.loads(
         (output / "case_manifest.json").read_text(encoding="utf-8")
     )
-    assert manifest["schema_version"] == 8
+    assert manifest["schema_version"] == 9
     membership = manifest["candidate_membership_audit"]
     assert membership["candidate_domain"] == "group_qualified_pool"
     assert membership["candidate_record_count"] == len(qualified_pool)

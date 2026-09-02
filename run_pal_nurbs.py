@@ -96,19 +96,13 @@ def main() -> int:
         "--weighted-mtf-loss-tolerance",
         type=float,
         default=MinimalConfig.weighted_mtf_loss_tolerance,
-        help="Far 的固定 Ahumada weighted-MTF loss 容差（无量纲）",
-    )
-    parser.add_argument(
-        "--z4-rms-tolerance-mm",
-        type=float,
-        default=MinimalConfig.z4_rms_tolerance_mm,
-        help="corridor/near 的固定 Z4 RMS 容差（mm，目标分母为其平方）",
+        help="七个真实追迹功能训练组共用的 Ahumada weighted-MTF loss 容差（无量纲）",
     )
     parser.add_argument(
         "--astigmatism-tolerance-D",
         type=float,
         default=MinimalConfig.astigmatism_tolerance_D,
-        help="near-edge/peripheral 的固定 A_D 容差（D）",
+        help="左右 peripheral surface-only A_D 目标的固定容差（D）",
     )
     parser.add_argument(
         "--prepare-only",
@@ -132,7 +126,6 @@ def main() -> int:
         max_extra_terminal_stage_steps=args.max_extra_terminal_stage_steps,
         smooth_lambda=args.smooth_lambda,
         weighted_mtf_loss_tolerance=args.weighted_mtf_loss_tolerance,
-        z4_rms_tolerance_mm=args.z4_rms_tolerance_mm,
         astigmatism_tolerance_D=args.astigmatism_tolerance_D,
         candidate_trace_import=args.candidate_trace_import,
         forward_qualification_import=args.forward_qualification_import,

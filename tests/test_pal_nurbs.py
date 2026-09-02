@@ -228,9 +228,7 @@ def _make_completed_parent_fixture(
             "baseline_health": baseline_health,
             "objective_config": {
                 "group_weights": config.group_weights,
-                "near_edge_astig_A_weight": config.near_edge_astig_A_weight,
                 "weighted_mtf_loss_tolerance": config.weighted_mtf_loss_tolerance,
-                "z4_rms_tolerance_mm": config.z4_rms_tolerance_mm,
                 "astigmatism_tolerance_D": config.astigmatism_tolerance_D,
             },
             "baseline_power": {"P_far_D": 0.0, "ADD_D": 0.0},
@@ -966,7 +964,7 @@ def test_startup_cases_backward_immediately_and_match_summed_loss_gradient() -> 
                 )
             )
             return FieldResult(
-                kernel, torch.ones_like(edge), 1.0, torch.zeros_like(edge),
+                kernel, torch.ones_like(edge), 0.001, torch.zeros_like(edge),
                 z4_defocus_mm2=edge,
             )
 
@@ -984,10 +982,16 @@ def test_startup_cases_backward_immediately_and_match_summed_loss_gradient() -> 
 
     summed_module = FixedWeightNURBSPerturbation(7, device="cpu", dtype=torch.float64)
     summed_model = Model(summed_module, record_events=False)
-    summed_loss = sum(summed_model.field(case).z4_defocus_mm2 for case in cases)
+    summed_loss = sum(
+        1.0 - pal_nurbs.weighted_mtf_mean_torch_batch(
+            summed_model.field(case).kernel.unsqueeze(0),
+            pixel_pitch_mm=torch.tensor([0.001], dtype=torch.float64),
+        ).sum()
+        for case in cases
+    )
     summed_loss.backward()
     assert summed_module.inner_q.grad is not None
-    assert torch.equal(sequential_gradient, summed_module.inner_q.grad)
+    assert torch.allclose(sequential_gradient, summed_module.inner_q.grad)
 
 
 def test_inactive_case_cuda_cache_is_released_only_for_cuda(
@@ -1005,7 +1009,6 @@ def test_inactive_case_cuda_cache_is_released_only_for_cuda(
     "field_name,bad_value",
     [
         ("weighted_mtf_loss_tolerance", 0.0),
-        ("z4_rms_tolerance_mm", float("nan")),
         ("astigmatism_tolerance_D", -0.1),
     ],
 )
@@ -1019,7 +1022,7 @@ def test_fixed_metric_tolerances_must_be_finite_and_positive(
     assert sum(pal_nurbs.DEFAULT_GROUP_WEIGHTS.values()) == pytest.approx(1.0)
 
 
-def test_joint_loss_uses_explicit_nine_group_weights_and_routed_metrics() -> None:
+def test_joint_loss_uses_weighted_mtf_for_functional_groups_only() -> None:
     parameter = torch.nn.Parameter(torch.tensor(-0.5, dtype=torch.float64))
 
     class Model:
@@ -1048,15 +1051,13 @@ def test_joint_loss_uses_explicit_nine_group_weights_and_routed_metrics() -> Non
     }
     value, rows, health = _evaluate(Model(), cases, baseline, with_grad=True)
     metrics = {str(row["training_group"]): str(row["loss_metric_name"]) for row in rows}
-    assert metrics["far"] == "ahumada_weighted_mtf_loss"
     assert all(
-        metrics[group].startswith("z4_defocus_mm2")
+        metrics[group] == "ahumada_weighted_mtf_loss"
         for group in pal_nurbs.FUNCTIONAL_GROUPS
-        if group != "far"
     )
     assert all(
         metrics[group] == "astig_A_D"
-        for group in ("peripheral_left", "peripheral_right")
+        for group in pal_nurbs.PERIPHERAL_GROUPS
     )
     expected = sum(
         pal_nurbs.DEFAULT_GROUP_WEIGHTS[group] * health[f"J_{group}"]
@@ -1064,16 +1065,9 @@ def test_joint_loss_uses_explicit_nine_group_weights_and_routed_metrics() -> Non
     )
     assert abs(value - expected) < 1e-15
     by_group = {str(row["training_group"]): row for row in rows}
-    assert by_group["far"]["score"] == pytest.approx(
-        by_group["far"]["weighted_mtf_loss"] / 0.10
-    )
-    assert by_group["corridor_upper"]["score"] == pytest.approx(
-        by_group["corridor_upper"]["z4_defocus_mm2"] / (1.0e-4 ** 2)
-    )
-    assert by_group["near_edge_astig"]["score"] == pytest.approx(
-        0.9 * by_group["near_edge_astig"]["z4_defocus_mm2"] / (1.0e-4 ** 2)
-        + 0.1 * by_group["near_edge_astig"]["astig_A_D"] / 0.80
-    )
+    for group in pal_nurbs.FUNCTIONAL_GROUPS:
+        row = by_group[group]
+        assert row["score"] == pytest.approx(row["weighted_mtf_loss"] / 0.10)
     assert by_group["peripheral_left"]["score"] == pytest.approx(
         by_group["peripheral_left"]["astig_A_D"] / 0.80
     )
@@ -1127,9 +1121,7 @@ def test_group_gradient_diagnostic_reports_norms_cosines_and_preserves_state() -
         identity_sha256="identity",
         checkpoint_sha256="checkpoint",
         group_weights=pal_nurbs.DEFAULT_GROUP_WEIGHTS,
-        near_edge_astig_A_weight=0.10,
         weighted_mtf_loss_tolerance=0.10,
-        z4_rms_tolerance_mm=1.0e-4,
         astigmatism_tolerance_D=0.80,
     )
     assert payload["group_order"] == list(
@@ -1588,6 +1580,8 @@ def test_case_layout_filters_oversampled_pool_before_final_fps(
         {"candidate_id": "good", "eligible": True},
     ]
     selections = {"count": 0}
+    wfno_calls: list[str] = []
+    forward_calls: list[str] = []
     written = {}
 
     monkeypatch.setattr(pal_nurbs, "generate_dense_candidate_fields", lambda **kwargs: [{}])
@@ -1610,7 +1604,9 @@ def test_case_layout_filters_oversampled_pool_before_final_fps(
                     if kwargs.get("group_counts") is pal_nurbs.FORWARD_POOL_GROUP_COUNTS
                     else "final_01_Dinf"
                 ),
-                "training_group": "far", "distance_mm": 100000.0,
+                "training_group": (
+                    "peripheral_left" if selected["candidate_id"] == "good" else "far"
+                ), "distance_mm": 100000.0,
                 "field_x_deg": 0.0, "field_y_deg": 0.0,
             }
             for selected in selected_rows
@@ -1634,11 +1630,13 @@ def test_case_layout_filters_oversampled_pool_before_final_fps(
 
     class Model:
         def validate_training_case_wfno(self, case):
+            wfno_calls.append(str(case["candidate_id"]))
             if case["candidate_id"] == "bad":
                 raise RuntimeError("formal aiming failed")
             return {"physical_fft_pixel_pitch_mm": 0.001}
 
         def validate_training_case_forward(self, case):
+            forward_calls.append(str(case["candidate_id"]))
             return {
                 "ray_count": 4, "valid_ray_count": 4, "valid_fraction": 1.0,
                 "physical_fft_pixel_pitch_mm": 0.001,
@@ -1650,6 +1648,8 @@ def test_case_layout_filters_oversampled_pool_before_final_fps(
     assert [row["candidate_id"] for row in written["candidates"]] == ["good"]
     assert candidates[0]["eligible"]
     assert candidates[0]["forward_wfno_status"] == "failed"
+    assert wfno_calls == ["bad"]
+    assert forward_calls == []
     audit = json.loads(
         (tmp_path / "preoptimization" / "forward_qualification_audit.json").read_text(
             encoding="utf-8"

@@ -69,19 +69,19 @@ python -m biot.gui
 - Far 的 28 个 case 全部使用真实 `Dinf`，Near-robustness 使用 `D1000`，Near 使用 `D500`；
   corridor 从 Original PAL 中心带局部 ADD 逐行计算 `distance_mm=1000/ADD_D`。
 - 使用真实可微追迹、GRIN3 固定步长 RK4、连续参考球 OPL 和 FFT PSF；
-  离线 PSF 不参与反传。Z4 复用 BIOT 的 OSA/ANSI RMS 基、全低阶最小二乘与
-  `(n,m)=(2,0)` 映射，执行层为 Torch QR，不从 PSF 逆变换相位。
+  离线 PSF 不参与反传。七个真实追迹功能组都直接使用归一化物理 FFT PSF 的
+  Ahumada weighted-MTF loss；Zernike 仅保留为诊断量，不参与该分支目标。
 - 两个分支统一使用 `legacy_pupil_phase=False`、`phase_reference="biot_reference_sphere"` 和 `remove_tilt=False`；训练 loss、健康检查和梯度均直接基于原始 `512×512` 物理 FFT PSF 及其物理像素间距。`130×130` crop/render 仅用于评价数据库与拼接显示。
 - 默认 pupil 采样为 `np=256`、FFT 为 `512`；79 个功能 case 按
-  `case_batch_size=8` 做 GPU tensor 追迹和 FFT，30 个周边 case 直接使用面形 A_D，
-  不做光线追迹；不因 OOM 自动缩小 batch。
+  `case_batch_size=8` 做 GPU tensor 追迹和 FFT，30 个周边 case 保持原来的
+  `surface_only` A_D 目标且不做光线追迹；不因 OOM 自动缩小 batch。
 - 训练输出统一包含 `stage`、`step`、`batch`、`loss`、`update` 和 `lr`；每个 run 的 `training.log` 持久化同样的进度摘要，中断时追加异常信息，各阶段仍保留结构化 `history.csv`。
 - 追迹失败保持失败关闭，由当前 run 的资格筛选进度记录错误；底层追迹不在项目根目录自动导出 `wrong_result` Excel。
-- `J=sum(group_weight*group_mean)`，9 组权重显式且和为 1。Far 路由到与正式评价
-  完全一致的 Ahumada weighted-MTF loss，corridor/near 路由到 Z4²，near-edge 为
-  90% Z4² + 10% near 区 A_D，周边区为对应区平均 A_D。三类指标分别使用固定
-  `0.10` weighted-MTF loss、`0.10 µm` Z4 RMS、`0.80 D` A_D 容差归一化，
-  Original PAL baseline 不参与 loss 分母，只用于健康比例、改善率和审计。
+- `J=sum(group_weight*group_mean)`，9 组权重显式且和为 1。七个真实追迹功能组
+  使用与正式评价一致的 Ahumada weighted-MTF loss，并统一除以固定的 `0.10`
+  无量纲容差；左右 peripheral 继续使用对应区平均 A_D 与固定 `0.80 D` 容差，
+  保持 `surface_only` 且不做光线追迹。Original PAL baseline 不参与 loss 分母，
+  只用于健康比例、改善率和审计。
 - 每个新 run 在 Original PAL 7×7 和 `stage_7x7/final.pt` 保存九组梯度范数、
   两两余弦及与总梯度余弦；产物位于 `gradient_diagnostics/` 并绑定 run/checkpoint 哈希。
 - 19×19 阶段额外使用 `smooth_lambda=0.05` 的控制点归一化二阶差分正则。
@@ -153,7 +153,6 @@ python run_pal_nurbs.py `
   --relative-improvement-threshold 1e-3 `
   --max-extra-terminal-stage-steps 30 `
   --weighted-mtf-loss-tolerance 0.10 `
-  --z4-rms-tolerance-mm 1e-4 `
   --astigmatism-tolerance-D 0.80 `
   --smooth-lambda 0.05
 ```
@@ -210,8 +209,8 @@ child 的 `summary.json` 分开保存父阶段历史、child 阶段历史、逐�
 steps、父 checkpoint/evidence 哈希和
 `optimizer_policy=parent_best_fresh_adam`；`actual_training_steps` 仅统计 child
 实际执行量。child 中断后只能在 child 自身目录使用 `--resume`。run identity
-schema 10 的 run 只能使用同为 schema 10 且方法身份一致的已完成父源；旧
-schema 8/9 run、旧 baseline、旧资格池和旧 checkpoint 均保持只读，不能接入新目标。
+schema 11 的 run 只能使用同为 schema 11 且方法身份一致的已完成父源；旧
+schema run、旧 baseline、旧资格池和旧 checkpoint 均保持只读，不能接入新目标。
 
 完整 `candidate-trace` 进度可显式导入新 run：保存的原身份必须先通过自身哈希
 校验，镜片内容 SHA-256 与物理追迹参数也必须匹配；Linux/Windows checkout 的

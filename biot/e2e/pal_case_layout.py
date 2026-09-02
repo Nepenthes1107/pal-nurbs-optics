@@ -1670,7 +1670,7 @@ def write_preoptimization_artifacts(
         )
 
     manifest = {
-        "schema_version": 8,
+        "schema_version": 9,
         "purpose": f"pal_nurbs_dense_field_fps_{TOTAL_TRAINING_CASES}_case_contract",
         "source": {
             "excel": {"path": str(excel_path), "sha256": _sha256_file(excel_path)},
@@ -1679,8 +1679,8 @@ def write_preoptimization_artifacts(
         "reference_geometry": {"object_distance_mm": reference_distance_mm, "ray": "aimed centre-pupil ray", "surface": "Original PAL rear surface", "coordinates": "physical local-surface x/y in mm"},
         "sampling_contract": dict(sampling_contract),
         "objective_contract": {
-            "denominator": "fixed physical tolerance for each routed metric type",
-            "metrics": "far=Ahumada weighted-MTF loss; corridor/near=Z4 OPD mm^2; peripheral=surface A_D",
+            "denominator": "fixed physical tolerance for each metric type",
+            "metrics": "seven traced functional groups=Ahumada weighted-MTF loss; peripheral=surface-only A_D",
             "J": "sum(group_weight * mean(fixed-tolerance normalized score))",
             "aggregation_order": "mean within each of nine groups before explicit group weighting",
         },
