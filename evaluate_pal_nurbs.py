@@ -29,6 +29,7 @@ from scipy.interpolate import RegularGridInterpolator
 from scipy.ndimage import gaussian_filter, zoom
 from scipy.signal import fftconvolve
 
+from averfang import physical_display_map
 from biot.e2e import pal_nurbs as pal
 from biot.e2e.weighted_mtf import (
     COMMON_FREQ_LPMM,
@@ -47,6 +48,9 @@ CROP_PHYSICAL_SIZE_MM = 0.184378803949209
 TILE_GAP_PX = 5
 PSF_DISPLAY_SMOOTH_SIGMA = 2.0
 FIGURE_DPI = 160
+PLOT_FONT_FAMILY = "DejaVu Serif"
+AVERFANG_FIGURE_DPI = 180
+AVERFANG_DISPLAY_TRIM_PIXELS = 3
 WEIGHTED_MTF_INTERPOLATED_RESOLUTION = 200
 WEIGHTED_MTF_FIELD_INTERPOLATION = "cubic"
 COMMON_FREQ = COMMON_FREQ_LPMM
@@ -260,6 +264,71 @@ def _plot_map(path: Path, values: np.ndarray, *, title: str, symmetric: bool = F
     plt.close(figure)
 
 
+def _plot_averfang_distribution(
+    path: Path,
+    values: np.ndarray,
+    x_mm: np.ndarray,
+    physical_y_mm: np.ndarray,
+    *,
+    colorbar_label: str,
+    symmetric: bool = False,
+) -> None:
+    """Render one physical PAL map with the standalone AverFang plot contract."""
+
+    x_plot, y_plot, data = physical_display_map(
+        x_mm,
+        physical_y_mm,
+        values,
+        trim_pixels=AVERFANG_DISPLAY_TRIM_PIXELS,
+    )
+    if data.shape != (y_plot.size, x_plot.size):
+        raise ValueError("AverFang display map shape does not match its physical axes")
+    finite = np.isfinite(data)
+    if not finite.any():
+        raise ValueError("AverFang display map has no finite values")
+
+    image_options: dict[str, Any] = {
+        "cmap": "turbo" if "turbo" in plt.colormaps() else "viridis",
+    }
+    low, high = float(np.nanmin(data)), float(np.nanmax(data))
+    if symmetric:
+        limit = max(float(np.nanmax(np.abs(data))), np.finfo(np.float64).eps)
+        low, high = -limit, limit
+        image_options = {"cmap": "coolwarm", "vmin": low, "vmax": high}
+
+    with plt.rc_context(
+        {
+            "font.family": [PLOT_FONT_FAMILY],
+            "axes.unicode_minus": False,
+            "mathtext.fontset": "dejavuserif",
+        }
+    ):
+        figure, axis = plt.subplots(
+            figsize=(5.4, 4.8), dpi=AVERFANG_FIGURE_DPI, constrained_layout=True,
+        )
+        image = axis.imshow(
+            data,
+            extent=[float(x_plot[0]), float(x_plot[-1]), float(y_plot[0]), float(y_plot[-1])],
+            origin="lower",
+            aspect="equal",
+            **image_options,
+        )
+        levels = np.linspace(low, high, 14)
+        if not symmetric and np.unique(np.round(levels, 12)).size > 1:
+            axis.contour(
+                x_plot, y_plot, data, levels=levels, colors="0.2", linewidths=0.45,
+            )
+        axis.plot(0.0, 0.0, "k+", markersize=5, linewidth=0.9)
+        axis.set_xlabel("X (mm)", fontsize=12, fontweight="bold")
+        axis.set_ylabel("Y (mm)", fontsize=12, fontweight="bold")
+        axis.tick_params(direction="in", top=True, right=True)
+        colorbar = figure.colorbar(image, ax=axis, fraction=0.046, pad=0.04)
+        colorbar.ax.set_title(colorbar_label, fontsize=9, fontweight="bold")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        figure.savefig(path, bbox_inches="tight")
+        plt.close(figure)
+
+
 def _interpolate_weighted_mtf_map(
     values: np.ndarray,
     field_x_deg: Sequence[float],
@@ -360,17 +429,17 @@ def _plot_interpolated_weighted_mtf_map(
     )
     axis.set_xticks(x_ticks)
     axis.set_yticks(y_ticks)
-    axis.set_xlabel("field X (Degrees)", fontfamily="Times New Roman", fontsize=14)
-    axis.set_ylabel("field Y (Degrees)", fontfamily="Times New Roman", fontsize=14)
+    axis.set_xlabel("field X (Degrees)", fontfamily=PLOT_FONT_FAMILY, fontsize=14)
+    axis.set_ylabel("field Y (Degrees)", fontfamily=PLOT_FONT_FAMILY, fontsize=14)
     axis.set_title(f"{title} — interpolated", fontsize=13)
     axis.tick_params(direction="in", top=True, right=True, labelsize=11)
     for tick in axis.get_xticklabels() + axis.get_yticklabels():
-        tick.set_fontfamily("Times New Roman")
+        tick.set_fontfamily(PLOT_FONT_FAMILY)
     colorbar = figure.colorbar(image, ax=axis, fraction=0.046, pad=0.04)
-    colorbar.set_label(colorbar_label, fontfamily="Times New Roman", fontsize=14)
+    colorbar.set_label(colorbar_label, fontfamily=PLOT_FONT_FAMILY, fontsize=14)
     colorbar.ax.tick_params(direction="in", labelsize=12)
     for tick in colorbar.ax.get_yticklabels():
-        tick.set_fontfamily("Times New Roman")
+        tick.set_fontfamily(PLOT_FONT_FAMILY)
     figure.savefig(path, dpi=FIGURE_DPI)
     plt.close(figure)
 
@@ -415,11 +484,16 @@ def _save_sag_and_averfang(
         for key in outputs["baseline"]
     }
     np.savez_compressed(maps_dir / "delta.npz", **outputs["delta"])
-    for key, label in (("power_D", "power (D)"), ("astigmatism_D", "astigmatism (D)")):
+    map_size = int(outputs["baseline"]["power_D"].shape[0])
+    start = (int(coord.numel()) - map_size) // 2
+    map_coord_mm = coord[start : start + map_size].detach().cpu().numpy()
+    physical_y_mm = map_coord_mm[::-1]
+    for key, label in (("power_D", "Power (D)"), ("astigmatism_D", "Astigmatism (D)")):
         for name in ("baseline", "optimized", "delta"):
-            _plot_map(
+            _plot_averfang_distribution(
                 maps_dir / f"{name}_{key}.png", outputs[name][key],
-                title=f"{name} {label}", symmetric=name == "delta",
+                map_coord_mm, physical_y_mm,
+                colorbar_label=label, symmetric=name == "delta",
             )
     _write_json(
         maps_dir / "metadata.json",
@@ -708,11 +782,12 @@ def _build_condition_database(
             pending_indices.append(index)
         completed_in_condition = FIELD_COUNT - len(pending_indices)
         batch_count = math.ceil(len(pending_indices) / int(psf_batch_size))
-        _progress(
-            phase="psf_database", condition=f"{completed_conditions + 1}/6",
-            name=f"{label}_{state}", fields=f"{completed_in_condition}/{FIELD_COUNT}",
-            pending=len(pending_indices), batch_size=int(psf_batch_size), status="RUNNING",
-        )
+        if pending_indices:
+            _progress(
+                phase="psf_database", condition=f"{completed_conditions + 1}/6",
+                name=f"{label}_{state}", fields=f"{completed_in_condition}/{FIELD_COUNT}",
+                pending=len(pending_indices), batch_size=int(psf_batch_size), status="RUNNING",
+            )
         for batch_number, start in enumerate(
             range(0, len(pending_indices), int(psf_batch_size)), start=1
         ):
@@ -755,22 +830,35 @@ def _build_condition_database(
                     current_condition=f"{label}_{state}",
                 )
             completed_in_condition += len(batch_indices)
-            _progress(
-                phase="psf_database", condition=f"{completed_conditions + 1}/6",
-                name=f"{label}_{state}", batch=f"{batch_number}/{batch_count}",
-                fields=f"{completed_in_condition}/{FIELD_COUNT}",
-                total=f"{completed_conditions * FIELD_COUNT + completed_in_condition}/{6 * FIELD_COUNT}",
-                status="DONE",
-            )
+            if completed_in_condition < FIELD_COUNT:
+                _progress(
+                    phase="psf_database", condition=f"{completed_conditions + 1}/6",
+                    name=f"{label}_{state}", batch=f"{batch_number}/{batch_count}",
+                    fields=f"{completed_in_condition}/{FIELD_COUNT}",
+                    total=(
+                        f"{completed_conditions * FIELD_COUNT + completed_in_condition}"
+                        f"/{6 * FIELD_COUNT}"
+                    ),
+                    status="RUNNING",
+                )
         for index in range(FIELD_COUNT):
             _validate_database_node(handle, index, verify_render_contract=True)
         handle.attrs["status"] = "complete"
         handle.flush()
     os.replace(partial_path, final_path)
     _validate_condition_file(final_path, contract, verify_render_contract=True)
+    completion = {
+        "phase": "psf_database",
+        "condition": f"{completed_conditions + 1}/6",
+        "name": f"{label}_{state}",
+    }
+    if batch_count:
+        completion["batch"] = f"{batch_count}/{batch_count}"
     _progress(
-        phase="psf_database", condition=f"{completed_conditions + 1}/6",
-        name=f"{label}_{state}", fields=f"{FIELD_COUNT}/{FIELD_COUNT}", status="COMPLETE",
+        **completion,
+        fields=f"{FIELD_COUNT}/{FIELD_COUNT}",
+        total=f"{(completed_conditions + 1) * FIELD_COUNT}/{6 * FIELD_COUNT}",
+        status="DONE",
     )
     return final_path
 
@@ -1046,13 +1134,13 @@ def _five_degree_ticks(values: np.ndarray) -> np.ndarray:
 
 
 def _style_stitch_axis(axis: Any, fields: np.ndarray) -> None:
-    axis.set_xlabel("field X (Degrees)", fontfamily="Times New Roman", fontsize=18)
-    axis.set_ylabel("field Y (Degrees)", fontfamily="Times New Roman", fontsize=18)
+    axis.set_xlabel("field X (Degrees)", fontfamily=PLOT_FONT_FAMILY, fontsize=18)
+    axis.set_ylabel("field Y (Degrees)", fontfamily=PLOT_FONT_FAMILY, fontsize=18)
     axis.set_xticks(_five_degree_ticks(fields))
     axis.set_yticks(_five_degree_ticks(fields))
     axis.tick_params(direction="in", top=True, right=True, labelsize=14)
     for tick in axis.get_xticklabels() + axis.get_yticklabels():
-        tick.set_fontfamily("Times New Roman")
+        tick.set_fontfamily(PLOT_FONT_FAMILY)
     for spine in axis.spines.values():
         spine.set_linewidth(0.8)
 
@@ -1087,7 +1175,7 @@ def _save_psf_stitch_figure(path: Path, image: np.ndarray) -> None:
     colorbar = figure.colorbar(shown, ax=axis, fraction=0.046, pad=0.04)
     colorbar.ax.tick_params(direction="in", labelsize=12)
     for tick in colorbar.ax.get_yticklabels():
-        tick.set_fontfamily("Times New Roman")
+        tick.set_fontfamily(PLOT_FONT_FAMILY)
     figure.tight_layout()
     figure.savefig(path, dpi=FIGURE_DPI, bbox_inches="tight")
     plt.close(figure)
@@ -1107,7 +1195,7 @@ def _save_chart_stitch_figure(path: Path, image: np.ndarray) -> None:
     colorbar.ax.invert_yaxis()
     colorbar.ax.tick_params(direction="in", labelsize=12)
     for tick in colorbar.ax.get_yticklabels():
-        tick.set_fontfamily("Times New Roman")
+        tick.set_fontfamily(PLOT_FONT_FAMILY)
     figure.tight_layout()
     figure.savefig(path, dpi=FIGURE_DPI, bbox_inches="tight")
     plt.close(figure)

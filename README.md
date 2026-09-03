@@ -100,6 +100,11 @@ python -m biot.gui
 python evaluate_pal_nurbs.py --run results/optimization/run_001 --device cuda --psf-batch-size 8 --blur-scale 4
 ```
 
+`evaluation/averfang/` 的六张分布 PNG 使用与 `averfang.py` 一致的物理
+`X/Y (mm)` 坐标、Y 方向、等比例轴、中心标记、边缘 3 像素显示裁剪和色标设计；
+baseline/optimized 保留 14 级等高线，delta 使用以零为中心的对称冷暖色标且不画
+等高线。对应 NPZ 数值不裁剪、不改写。
+
 若完整 run 中需要单独评价某个已完成阶段，可直接选择该阶段保存的最优
 `final.pt`，无需重跑训练。例如复用 `50/25/0` run 的 7×7 阶段：
 
@@ -133,7 +138,10 @@ PSF 追迹通过必选的 `raw_psf_batch()` 接口做 CUDA case 小批量并行�
 失败直接终止，不自动缩批也不回退到串行。恢复时仅对未完成场点重新分批，
 已完成节点仍逐个核验并跳过。
 运行期间控制台以 `[pal-eval]` 前缀即时显示阶段、六个条件、PSF batch、当前条件
-场点数和全局场点数；`--resume` 对已完成条件或后处理阶段显示 `status=SKIP`。
+场点数和全局场点数；中间 batch 使用 `status=RUNNING`，每个条件只在 HDF5 完成
+核验后报告一次满计数 `status=DONE`，不重复打印末批终点。`--resume` 对已完成条件
+或后处理阶段显示 `status=SKIP`。评价图统一使用 Matplotlib 自带的 DejaVu Serif，
+不依赖系统安装 Times New Roman。
 批量生成已提升评价 identity schema；改造前未完成的串行评价不能用
 新 `--resume` 接续，应保留为历史证据并在新的空 `evaluation/` 目录从头评价。
 

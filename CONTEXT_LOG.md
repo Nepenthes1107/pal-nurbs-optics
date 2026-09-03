@@ -1,6 +1,6 @@
 # 当前工程状态
 
-更新时间：2026-09-02。
+更新时间：2026-09-03。
 
 ## 当前主线
 
@@ -47,9 +47,16 @@
   分别保存为六个 HDF5，每个文件含 81 个场点的原始 FFT PSF、130×130 渲染
   PSF及最小恢复信息。只有数据库整体 `complete` 后才运行 weighted-MTF Mean、
   PSF stitch 和 chart stitch；chart 的 `blur-scale` 默认 4且仅影响显示。
+- `evaluation/averfang/` 的光焦度/像散 PNG 复用 `averfang.py` 的物理毫米坐标、
+  Y 方向、等比例轴、中心标记、3 像素显示裁剪与色标版式。baseline/optimized
+  绘制 14 级等高线；delta 保留零对称冷暖色标但不绘制等高线。NPZ 原始数值、
+  文件名和其他评价产物不变。
 - PSF 数据库默认通过 `raw_psf_batch()` 以 `psf_batch_size=8` 做原生 FFT PSF case 批量追迹；批大小纳入评价 identity。已完成 HDF5 节点仍逐个核验，未完成节点按小批量恢复；不自动缩批或串行回退。
 - `evaluate_pal_nurbs.py` 的控制台进度统一使用 `[pal-eval]`，显示当前阶段、条件、
-  PSF batch、条件内及全局场点完成数；恢复时显式报告已跳过的完整条件/阶段。
+  PSF batch、条件内及全局场点完成数；中间 batch 保持 `RUNNING`，条件 HDF5
+  完成核验后只报告一次满计数 `DONE`，不再将末批和条件完成重复打印。恢复时
+  显式报告已跳过的完整条件/阶段。评价图字体固定为 Matplotlib 自带的
+  DejaVu Serif，不再依赖系统 Times New Roman。
 - `weighted_mtf/` 保留 9×9 原始 mean map 和 NPZ，并为三物距×
   baseline/optimized/delta 额外生成 9 张 `*_mean_interpolated.png`。
   插值是仅显示的规则网格 cubic 200×200 上采样，严格限定在原生
@@ -87,6 +94,15 @@
   `.venv\Scripts\python.exe -m pytest tests -q --basetemp .tmp_pytest_functional_wmtf_full`
   为 `224 passed`。`py_compile`、CLI `--help` 与 `git diff --check` 通过。
   未运行完整训练或正式评价，不形成优化收益结论。
+- 当前评价进度/字体修复验证：评价器定向测试 `18 passed`；完整测试
+  `.venv\Scripts\python.exe -m pytest tests -q --basetemp
+  .tmp_pytest_eval_progress_font_final_full` 为 `226 passed`。`py_compile` 与
+  `git diff --check` 通过；未重跑正式评价，不形成新的光学或性能结论。
+- 当前 AverFang 显示改造仅执行两项定向样式/字体测试（`2 passed`），并在移除
+  delta 等高线后单独复跑对应样式测试（`1 passed`）；`py_compile` 与
+  `git diff --check` 通过，按要求未运行完整测试。示例 `run_50_0_0_mtf`
+  只重绘六张 AverFang PNG 并更新评价 manifest，逐 SHA-256 核对其余 75 个文件
+  未变化；移除 delta 等高线时再次核对其余 79 个文件未变化。
 - 云端 PyTorch 2.0.1 暴露的诊断反传兼容性问题已有 reentrant checkpoint
   聚焦回归测试，结果 `1 passed`。该修复会改变 implementation closure；
   旧失败 run 不得直接 `--resume`，应建立新输出目录，仅通过显式 import 复用已校验的

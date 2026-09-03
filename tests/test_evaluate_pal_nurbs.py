@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import h5py
+from matplotlib import font_manager
 import numpy as np
 import pytest
 import torch
@@ -237,8 +238,11 @@ def test_condition_hdf5_resumes_exact_nodes_and_fails_on_corruption(
     assert resumed.batch_sizes == [1]
     progress = capsys.readouterr().out
     assert "[pal-eval] phase=psf_database condition=1/6 name=D500_baseline" in progress
-    assert "batch=1/1 fields=4/4 total=4/24 status=DONE" in progress
-    assert "fields=4/4 status=COMPLETE" in progress
+    terminal = [line for line in progress.splitlines() if "fields=4/4" in line]
+    assert terminal == [
+        "[pal-eval] phase=psf_database condition=1/6 name=D500_baseline "
+        "batch=1/1 fields=4/4 total=4/24 status=DONE"
+    ]
     assert final.name == "D500_baseline.h5"
     assert not partial.exists()
     with h5py.File(final, "r") as handle:
@@ -269,6 +273,65 @@ def test_condition_hdf5_resumes_exact_nodes_and_fails_on_corruption(
         evaluator._validate_condition_file(final, contract, verify_render_contract=True)
 
 
+def test_condition_resume_after_last_batch_reports_terminal_count_once(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(evaluator, "FIELD_VALUES", (-1.0, 1.0))
+    monkeypatch.setattr(evaluator, "FIELD_COUNT", 4)
+    monkeypatch.setattr(evaluator, "RAW_SIZE_PX", 8)
+    monkeypatch.setattr(evaluator, "RENDER_SIZE_PX", 4)
+    monkeypatch.setattr(evaluator, "CROP_PHYSICAL_SIZE_MM", 0.04)
+    cases = [
+        {"case_id": f"c{index}", "field_x_deg": x, "field_y_deg": y}
+        for index, (x, y) in enumerate(
+            ((-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0))
+        )
+    ]
+
+    class Model:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def raw_psf_batch(self, batch):
+            self.calls += 1
+            raw = torch.zeros((len(batch), 8, 8), dtype=torch.float64)
+            raw[:, 4, 4] = 1.0
+            return SimpleNamespace(
+                psf=raw,
+                pixel_pitch_mm=torch.full((len(batch),), 0.01, dtype=torch.float64),
+                valid_fraction=torch.full((len(batch),), 0.75, dtype=torch.float64),
+            )
+
+    root = tmp_path / "psf_database"
+    validate_node = evaluator._validate_database_node
+    monkeypatch.setattr(
+        evaluator,
+        "_validate_database_node",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("after final batch")),
+    )
+    with pytest.raises(RuntimeError, match="after final batch"):
+        evaluator._build_condition_database(
+            root, label="D500", distance=500.0, state="baseline", cases=cases,
+            model=Model(), identity_sha256="identity", checkpoint_sha256="checkpoint",
+            resume=False, completed_conditions=0, psf_batch_size=4,
+        )
+    monkeypatch.setattr(evaluator, "_validate_database_node", validate_node)
+    capsys.readouterr()
+
+    resumed = Model()
+    evaluator._build_condition_database(
+        root, label="D500", distance=500.0, state="baseline", cases=cases,
+        model=resumed, identity_sha256="identity", checkpoint_sha256="checkpoint",
+        resume=True, completed_conditions=0, psf_batch_size=4,
+    )
+    progress = capsys.readouterr().out.splitlines()
+    assert resumed.calls == 0
+    assert [line for line in progress if "fields=4/4" in line] == [
+        "[pal-eval] phase=psf_database condition=1/6 name=D500_baseline "
+        "fields=4/4 total=4/24 status=DONE"
+    ]
+
+
 def test_blur_scale_one_matches_reference_and_scale_four_is_display_only() -> None:
     chart = np.zeros((8, 8), dtype=np.float64)
     chart[3:5, 3:5] = 1.0
@@ -291,6 +354,49 @@ def test_evaluate_default_blur_scale_is_four() -> None:
 
 def test_evaluate_default_psf_batch_size_is_eight() -> None:
     assert evaluator.evaluate.__kwdefaults__["psf_batch_size"] == 8
+
+
+def test_evaluation_plot_font_is_bundled_and_resolvable() -> None:
+    resolved = font_manager.findfont(
+        font_manager.FontProperties(family=evaluator.PLOT_FONT_FAMILY),
+        fallback_to_default=False,
+    )
+    assert font_manager.FontProperties(fname=resolved).get_name() == evaluator.PLOT_FONT_FAMILY
+
+
+def test_averfang_distribution_uses_physical_mm_axes_and_local_style(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    x_mm = np.arange(-5.0, 6.0)
+    physical_y_mm = x_mm[::-1]
+    values = np.arange(121, dtype=np.float64).reshape(11, 11) - 60.0
+    saved_font_family = list(evaluator.plt.rcParams["font.family"])
+    closed = []
+    real_close = evaluator.plt.close
+    monkeypatch.setattr(evaluator.plt, "close", closed.append)
+
+    path = tmp_path / "delta_power_D.png"
+    evaluator._plot_averfang_distribution(
+        path, values, x_mm, physical_y_mm,
+        colorbar_label="Power (D)", symmetric=True,
+    )
+
+    assert path.is_file()
+    assert len(closed) == 1
+    figure = closed[0]
+    axis, colorbar_axis = figure.axes
+    assert axis.get_xlabel() == "X (mm)"
+    assert axis.get_ylabel() == "Y (mm)"
+    assert axis.get_aspect() == 1.0
+    assert axis.images[0].origin == "lower"
+    assert axis.images[0].get_extent() == [-2.0, 2.0, -2.0, 2.0]
+    np.testing.assert_array_equal(axis.images[0].get_array(), values[3:-3, 3:-3][::-1])
+    low, high = axis.images[0].get_clim()
+    assert low == -high
+    assert not axis.collections
+    assert colorbar_axis.get_title() == "Power (D)"
+    assert list(evaluator.plt.rcParams["font.family"]) == saved_font_family
+    real_close(figure)
 
 
 def test_resume_keeps_sealed_identity_across_legacy_classification_drift(
