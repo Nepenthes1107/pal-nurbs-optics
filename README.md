@@ -220,6 +220,13 @@ steps、父 checkpoint/evidence 哈希和
 schema 11 的 run 只能使用同为 schema 11 且方法身份一致的已完成父源；旧
 schema run、旧 baseline、旧资格池和旧 checkpoint 均保持只读，不能接入新目标。
 
+已完成 child 也可继续作为下一代 `--parent-run`。累计训练步数读取并核验
+`lineage_actual_training_steps_by_stage`，而不是只统计直接父 run 的本地新增步数。
+新 child 会在自身 `gradient_diagnostics/` 保存绑定当前 child identity、同时记录
+祖先来源哈希的诊断文件。早期只保存继承 manifest、未保存两份诊断 JSON 的已完成
+child 仍保持只读；下一代会从其封印的 run identity 输入解析祖先诊断，并同时核验
+identity、manifest 和文件 SHA-256，无法解析时明确失败。
+
 完整 `candidate-trace` 进度可显式导入新 run：保存的原身份必须先通过自身哈希
 校验，镜片内容 SHA-256 与物理追迹参数也必须匹配；Linux/Windows checkout 的
 绝对路径不是物理身份字段。forward/final-phase 进度仍须严格匹配 pool identity。

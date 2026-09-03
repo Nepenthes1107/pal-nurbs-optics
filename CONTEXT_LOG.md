@@ -37,6 +37,12 @@
   不存在重算或导入父 Adam 的兜底。父目录保持只读，child 只能在自身
   目录 `--resume`。新训练与 child 使用 run identity schema 11，父源也必须是
   同方法的 schema 11；旧目标和旧 schema run 不获得 resume 或 parent 兼容性。
+- 父子分叉支持多代链式续训。child 作为下一代父源时，阶段集合按其
+  `child_start_stage` 验证，累计步数严格读取并交叉核验
+  `parent/child/lineage_actual_training_steps_by_stage`。新 child 会物化两份绑定自身
+  identity 的继承 gradient diagnostic，并记录直接来源 identity/诊断哈希；早期仅有
+  继承 manifest 的已完成 child 不被改写，校验器从其封印 run identity 输入解析祖先
+  诊断，且要求 run identity、manifest、诊断自哈希和文件 SHA-256 全部一致。
 - Far 训练只使用 28 个 `Dinf` case，不再包含 Far-robustness/D1000 Far 组；
   Near-robustness 仍使用 D1000。七个真实追迹功能组的目标统一为 Ahumada
   weighted-MTF loss；左右 peripheral 像散区保持原来的 `surface_only` A_D 目标，
@@ -103,6 +109,11 @@
   `git diff --check` 通过，按要求未运行完整测试。示例 `run_50_0_0_mtf`
   只重绘六张 AverFang PNG 并更新评价 manifest，逐 SHA-256 核对其余 75 个文件
   未变化；移除 delta 等高线时再次核对其余 79 个文件未变化。
+- 当前多代 parent-child 续训修复验证：父分叉定向测试 `15 passed`，PAL 模块
+  `61 passed`，完整测试 `.venv\Scripts\python.exe -m pytest tests -q --basetemp
+  .tmp_pytest_parent_chain_project_full` 为 `227 passed`；`py_compile` 与
+  `git diff --check` 通过。测试覆盖新 child 诊断物化、旧 manifest-only child 的
+  祖先证据解析、三级 lineage 累计步数及父目录逐文件不变；未启动正式训练。
 - 云端 PyTorch 2.0.1 暴露的诊断反传兼容性问题已有 reentrant checkpoint
   聚焦回归测试，结果 `1 passed`。该修复会改变 implementation closure；
   旧失败 run 不得直接 `--resume`，应建立新输出目录，仅通过显式 import 复用已校验的

@@ -2859,18 +2859,47 @@ def _write_inherited_gradient_diagnostic_manifest(
 ) -> None:
     parent_identity = str(parent_context["identity_sha256"])
     artifact_paths = dict(parent_context["artifact_paths"])
-    records = [
-        {
-            "label": label,
-            "source": "parent_run",
-            "parent_identity_sha256": parent_identity,
-            "sha256": _sha256_file(Path(artifact_paths[key])),
+    directory = output / "gradient_diagnostics"
+    records = []
+    for label, key in (
+        ("baseline_7x7", "gradient_diagnostic_baseline"),
+        ("stage_7x7_final", "gradient_diagnostic_stage_7"),
+    ):
+        source_path = Path(artifact_paths[key])
+        source_payload = _read_json(source_path)
+        source_body = dict(source_payload)
+        source_claimed = str(source_body.pop("diagnostic_sha256", ""))
+        if not source_claimed or source_claimed != _canonical_json_sha256(source_body):
+            raise ValueError(f"inherited gradient diagnostic self-hash mismatch: {source_path}")
+        source_identity = str(source_body.get("identity_sha256", ""))
+        if not source_identity:
+            raise ValueError(f"inherited gradient diagnostic has no identity: {source_path}")
+        inherited_body = {
+            **source_body,
+            "identity_sha256": identity_sha256,
+            "source": "validated_parent_lineage",
+            "source_identity_sha256": source_identity,
+            "source_diagnostic_sha256": source_claimed,
         }
-        for label, key in (
-            ("baseline_7x7", "gradient_diagnostic_baseline"),
-            ("stage_7x7_final", "gradient_diagnostic_stage_7"),
+        inherited_path = directory / f"{label}.json"
+        _write_json_atomic(
+            inherited_path,
+            {
+                **inherited_body,
+                "diagnostic_sha256": _canonical_json_sha256(inherited_body),
+            },
         )
-    ]
+        records.append(
+            {
+                "label": label,
+                "path": inherited_path.name,
+                "source": "parent_run",
+                "parent_identity_sha256": parent_identity,
+                "source_identity_sha256": source_identity,
+                "source_diagnostic_sha256": source_claimed,
+                "sha256": _sha256_file(inherited_path),
+            }
+        )
     body = {
         "schema_version": GRADIENT_DIAGNOSTIC_SCHEMA_VERSION,
         "identity_sha256": identity_sha256,
@@ -3203,6 +3232,86 @@ def _assert_state_dict_equal(
             raise ValueError(f"{context} state_dict mismatch: {name}")
 
 
+def _validate_parent_gradient_diagnostic_manifest(
+    path: Path, *, identity_sha256: str,
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    payload = _read_json(path)
+    body = dict(payload)
+    claimed = str(body.pop("manifest_sha256", ""))
+    if not claimed or claimed != _canonical_json_sha256(body):
+        raise ValueError("parent gradient diagnostic manifest self-hash mismatch")
+    if (
+        int(body.get("schema_version", -1)) != GRADIENT_DIAGNOSTIC_SCHEMA_VERSION
+        or body.get("identity_sha256") != identity_sha256
+    ):
+        raise ValueError("parent gradient diagnostic manifest identity mismatch")
+    records = body.get("artifacts")
+    if not isinstance(records, list):
+        raise ValueError("parent gradient diagnostic manifest artifacts are malformed")
+    by_label: dict[str, dict[str, Any]] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            raise ValueError("parent gradient diagnostic manifest contains a malformed artifact")
+        label = str(record.get("label", ""))
+        if label not in ("baseline_7x7", "stage_7x7_final") or label in by_label:
+            raise ValueError("parent gradient diagnostic manifest labels are invalid")
+        by_label[label] = dict(record)
+    if set(by_label) != {"baseline_7x7", "stage_7x7_final"}:
+        raise ValueError("parent gradient diagnostic manifest is incomplete")
+    return body, by_label
+
+
+def _resolve_parent_gradient_diagnostic(
+    *,
+    parent: Path,
+    key: str,
+    label: str,
+    direct_path: Path,
+    parent_identity_payload: Mapping[str, Any],
+    parent_config: Mapping[str, Any],
+    diagnostic_manifest: Mapping[str, Any],
+    manifest_record: Mapping[str, Any],
+) -> Path:
+    if direct_path.is_file():
+        return direct_path
+    if diagnostic_manifest.get("source") != "validated_parent_lineage":
+        raise FileNotFoundError(f"parent {key} is missing: {direct_path}")
+
+    inputs = parent_identity_payload.get("inputs")
+    input_record = (
+        inputs.get(f"parent_{key}") if isinstance(inputs, dict) else None
+    )
+    if not isinstance(input_record, dict):
+        raise FileNotFoundError(
+            f"parent inherited {key} is missing and has no sealed source input"
+        )
+    expected_sha256 = str(input_record.get("sha256", ""))
+    manifest_sha256 = str(manifest_record.get("sha256", ""))
+    if not expected_sha256 or manifest_sha256 != expected_sha256:
+        raise ValueError(f"parent inherited {key} hash metadata mismatch")
+
+    candidates: list[Path] = []
+    recorded_path = input_record.get("path")
+    if recorded_path:
+        candidates.append(Path(str(recorded_path)))
+    source_parent = parent_config.get("parent_run")
+    if source_parent:
+        filename = "baseline_7x7.json" if label == "baseline_7x7" else "stage_7x7_final.json"
+        candidates.append(Path(str(source_parent)) / "gradient_diagnostics" / filename)
+    checked: list[str] = []
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if str(resolved) in checked:
+            continue
+        checked.append(str(resolved))
+        if resolved.is_file() and _sha256_file(resolved) == expected_sha256:
+            return resolved
+    raise FileNotFoundError(
+        f"parent inherited {key} source cannot be resolved with sealed SHA-256 "
+        f"{expected_sha256}: parent={parent}, checked={checked}"
+    )
+
+
 def _validate_parent_run_source(
     config: MinimalConfig, *, device: torch.device | str,
 ) -> dict[str, Any] | None:
@@ -3237,7 +3346,14 @@ def _validate_parent_run_source(
             parent / "gradient_diagnostics" / "manifest.json"
         ),
     }
-    missing = [f"{name}={path}" for name, path in base_paths.items() if not path.is_file()]
+    diagnostic_keys = {
+        "gradient_diagnostic_baseline": "baseline_7x7",
+        "gradient_diagnostic_stage_7": "stage_7x7_final",
+    }
+    missing = [
+        f"{name}={path}" for name, path in base_paths.items()
+        if name not in diagnostic_keys and not path.is_file()
+    ]
     if missing:
         raise FileNotFoundError("parent run evidence is incomplete: " + ", ".join(missing))
 
@@ -3246,6 +3362,21 @@ def _validate_parent_run_source(
     parent_state = _read_json(base_paths["run_state"])
     parent_summary = _read_json(base_paths["summary"])
     parent_config = _read_json(base_paths["config"])
+    diagnostic_manifest, diagnostic_records = _validate_parent_gradient_diagnostic_manifest(
+        base_paths["gradient_diagnostic_manifest"],
+        identity_sha256=parent_identity_sha256,
+    )
+    for key, label in diagnostic_keys.items():
+        base_paths[key] = _resolve_parent_gradient_diagnostic(
+            parent=parent,
+            key=key,
+            label=label,
+            direct_path=base_paths[key],
+            parent_identity_payload=parent_identity_payload,
+            parent_config=parent_config,
+            diagnostic_manifest=diagnostic_manifest,
+            manifest_record=diagnostic_records[label],
+        )
     if parent_state.get("status") != "complete" or parent_state.get("phase") != "complete":
         raise ValueError("parent run must have complete run_state status and phase")
     if str(parent_state.get("identity_sha256", "")) != parent_identity_sha256:
@@ -3296,8 +3427,20 @@ def _validate_parent_run_source(
         if control not in STAGE_LADDER or control in rows_by_control:
             raise ValueError("parent summary contains invalid or duplicate stage records")
         rows_by_control[control] = dict(row)
-    if set(rows_by_control) != set(STAGE_LADDER):
-        raise ValueError("parent summary must contain exactly the complete 7/11/19 ladder")
+    inherited_parent = isinstance(parent_summary.get("parent_lineage"), dict)
+    if inherited_parent:
+        recorded_start_stage = int(parent_summary.get("child_start_stage", -1))
+        if recorded_start_stage not in STAGE_LADDER:
+            raise ValueError("parent child_start_stage is invalid")
+        expected_stage_controls = {
+            control for control in STAGE_LADDER if control >= recorded_start_stage
+        }
+    else:
+        expected_stage_controls = set(STAGE_LADDER)
+    if set(rows_by_control) != expected_stage_controls:
+        raise ValueError(
+            "parent summary stage ladder does not match its root/child lineage"
+        )
     for control, row in rows_by_control.items():
         if bool(row.get("is_terminal_stage")) != (control == parent_terminal):
             raise ValueError("parent summary terminal stage flags are inconsistent")
@@ -3492,23 +3635,30 @@ def _validate_parent_run_source(
         raise ValueError("parent baseline state schema mismatch")
     if str(baseline_state.get("identity_sha256", "")) != parent_identity_sha256:
         raise ValueError("parent baseline state identity mismatch")
-    for name in ("gradient_diagnostic_baseline", "gradient_diagnostic_stage_7"):
-        diagnostic = _read_json(base_paths[name])
+    for name, label in diagnostic_keys.items():
+        diagnostic_path = base_paths[name]
+        record = diagnostic_records[label]
+        if str(record.get("sha256", "")) != _sha256_file(diagnostic_path):
+            raise ValueError(f"parent {name} manifest/file SHA-256 mismatch")
+        record_path = record.get("path")
+        if record_path is not None and Path(str(record_path)).name != diagnostic_path.name:
+            raise ValueError(f"parent {name} manifest path mismatch")
+        diagnostic = _read_json(diagnostic_path)
         claimed = str(diagnostic.pop("diagnostic_sha256", ""))
         if not claimed or claimed != _canonical_json_sha256(diagnostic):
             raise ValueError(f"parent {name} self-hash mismatch")
+        allowed_identities = {parent_identity_sha256}
+        if diagnostic_manifest.get("source") == "validated_parent_lineage":
+            for field in ("parent_identity_sha256", "source_identity_sha256"):
+                value = str(record.get(field, ""))
+                if value:
+                    allowed_identities.add(value)
         if (
-            int(diagnostic.get("schema_version", -1))
-            != GRADIENT_DIAGNOSTIC_SCHEMA_VERSION
-            or diagnostic.get("identity_sha256") != parent_identity_sha256
+            int(diagnostic.get("schema_version", -1)) != GRADIENT_DIAGNOSTIC_SCHEMA_VERSION
+            or diagnostic.get("label") != label
+            or diagnostic.get("identity_sha256") not in allowed_identities
         ):
             raise ValueError(f"parent {name} identity mismatch")
-    diagnostic_manifest = _read_json(base_paths["gradient_diagnostic_manifest"])
-    manifest_claim = str(diagnostic_manifest.pop("manifest_sha256", ""))
-    if not manifest_claim or manifest_claim != _canonical_json_sha256(diagnostic_manifest):
-        raise ValueError("parent gradient diagnostic manifest self-hash mismatch")
-    if diagnostic_manifest.get("identity_sha256") != parent_identity_sha256:
-        raise ValueError("parent gradient diagnostic manifest identity mismatch")
 
     artifact_paths = {
         **base_paths,
@@ -3520,10 +3670,32 @@ def _validate_parent_run_source(
     evidence_hashes = {
         name: _sha256_file(path) for name, path in sorted(artifact_paths.items())
     }
-    parent_steps_by_stage = {
-        str(control): int(rows_by_control.get(control, {}).get("actual_steps", 0))
-        for control in STAGE_LADDER
-    }
+    if inherited_parent:
+        parent_local_steps = parent_summary.get("child_actual_training_steps_by_stage")
+        prior_steps = parent_summary.get("parent_actual_training_steps_by_stage")
+        lineage_steps = parent_summary.get("lineage_actual_training_steps_by_stage")
+        if not all(
+            isinstance(value, dict)
+            for value in (parent_local_steps, prior_steps, lineage_steps)
+        ):
+            raise ValueError("parent child step-lineage summaries are malformed")
+        parent_steps_by_stage = {}
+        for control in STAGE_LADDER:
+            key = str(control)
+            local = int(parent_local_steps.get(key, -1))
+            prior = int(prior_steps.get(key, -1))
+            lineage = int(lineage_steps.get(key, -1))
+            recorded_local = int(rows_by_control.get(control, {}).get("actual_steps", 0))
+            if min(local, prior, lineage) < 0 or local != recorded_local:
+                raise ValueError("parent child step-lineage local counts are inconsistent")
+            if lineage != prior + local:
+                raise ValueError("parent child cumulative step lineage is inconsistent")
+            parent_steps_by_stage[key] = lineage
+    else:
+        parent_steps_by_stage = {
+            str(control): int(rows_by_control.get(control, {}).get("actual_steps", 0))
+            for control in STAGE_LADDER
+        }
     return {
         "root": parent,
         "identity_sha256": parent_identity_sha256,

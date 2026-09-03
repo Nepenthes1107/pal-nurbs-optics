@@ -644,6 +644,88 @@ def test_parent_fork_run_uses_parent_best_and_preserves_parent(
         tmp_path / "child" / "training.log"
     ).read_text(encoding="utf-8")
 
+    child_root = tmp_path / "child"
+    child_identity_sha256 = str(child_identity["identity_sha256"])
+    for label in ("baseline_7x7", "stage_7x7_final"):
+        diagnostic = json.loads(
+            (child_root / "gradient_diagnostics" / f"{label}.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert diagnostic["identity_sha256"] == child_identity_sha256
+        assert diagnostic["source"] == "validated_parent_lineage"
+
+    # The case-layout builder is mocked above, so materialize the output evidence
+    # that a real child run writes before validating it as the next parent.
+    _write_json_fixture(
+        child_root / "case_layout_state.json",
+        {"identity_sha256": child_identity_sha256},
+    )
+    for name in (
+        "candidate_trace_progress.json",
+        "forward_qualification_progress.json",
+        "final_phase_qualification_progress.json",
+    ):
+        _write_json_fixture(child_root / name, {"status": "complete"})
+
+    grandchild = replace(
+        child,
+        output=str(tmp_path / "grandchild"),
+        parent_run=str(child_root),
+        start_stage=19,
+        max_steps_11=0,
+        max_steps_19=1,
+    )
+    grandchild_context = pal_nurbs._validate_parent_run_source(
+        grandchild, device="cpu"
+    )
+    assert grandchild_context is not None
+    assert grandchild_context["parent_steps_by_stage"] == {
+        "7": 1, "11": 2, "19": 1,
+    }
+
+    root_identity = json.loads(
+        (parent / "run_identity.json").read_text(encoding="utf-8")
+    )["identity_sha256"]
+    legacy_records = []
+    for label in ("baseline_7x7", "stage_7x7_final"):
+        source = parent / "gradient_diagnostics" / f"{label}.json"
+        legacy_records.append({
+            "label": label,
+            "source": "parent_run",
+            "parent_identity_sha256": root_identity,
+            "sha256": pal_nurbs._sha256_file(source),
+        })
+        (child_root / "gradient_diagnostics" / f"{label}.json").unlink()
+    legacy_manifest_body = {
+        "schema_version": pal_nurbs.GRADIENT_DIAGNOSTIC_SCHEMA_VERSION,
+        "identity_sha256": child_identity_sha256,
+        "source": "validated_parent_lineage",
+        "parent_identity_sha256": root_identity,
+        "artifacts": legacy_records,
+    }
+    _write_json_fixture(
+        child_root / "gradient_diagnostics" / "manifest.json",
+        {
+            **legacy_manifest_body,
+            "manifest_sha256": pal_nurbs._canonical_json_sha256(legacy_manifest_body),
+        },
+    )
+    legacy_before = {
+        path.relative_to(child_root).as_posix(): pal_nurbs._sha256_file(path)
+        for path in child_root.rglob("*") if path.is_file()
+    }
+    legacy_context = pal_nurbs._validate_parent_run_source(grandchild, device="cpu")
+    assert legacy_context is not None
+    assert legacy_context["artifact_paths"]["gradient_diagnostic_baseline"] == (
+        parent / "gradient_diagnostics" / "baseline_7x7.json"
+    ).resolve()
+    legacy_after = {
+        path.relative_to(child_root).as_posix(): pal_nurbs._sha256_file(path)
+        for path in child_root.rglob("*") if path.is_file()
+    }
+    assert legacy_after == legacy_before
+
     interruption = {"enabled": True, "gradient_calls": 0}
 
     def interrupting_evaluate(model, cases, baseline, *, with_grad, **kwargs):
