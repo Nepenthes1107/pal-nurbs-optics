@@ -105,7 +105,7 @@ class MinimalConfig:
     max_steps_19: int = 30
     early_stopping_patience: int = 7
     relative_improvement_threshold: float = 1.0e-3
-    max_extra_terminal_stage_steps: int = 30
+    max_extra_terminal_stage_steps: int = 0
     max_backtracks: int = 8
     step_sag_limit_mm: float = 2.0e-3
     far_tolerance_D: float = 0.15
@@ -4608,6 +4608,21 @@ def _run_bound(
                     }
                 )
                 completed_step = step
+                if step == minimum_steps:
+                    # Preserve the best state at the mandatory-budget boundary.
+                    # This remains available even when a terminal stage later
+                    # spends extra attempts improving the objective.
+                    current_state_at_boundary = copy.deepcopy(module.state_dict())
+                    module.load_state_dict(best_state)
+                    _save_checkpoint(
+                        stage_dir / "minimum.pt",
+                        module,
+                        identity_sha256=identity_sha256,
+                        **_joint_metric_fields(best, best_health),
+                        step=minimum_steps,
+                        checkpoint_role="minimum_budget_best",
+                    )
+                    module.load_state_dict(current_state_at_boundary)
                 _torch_save_atomic(
                     resume_path,
                     _make_stage_resume_payload(

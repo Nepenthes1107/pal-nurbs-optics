@@ -55,7 +55,8 @@ python -m biot.gui
 - `--steps S7 S11 S19` 定义三个阶段的最低完整 attempt 数，拒绝的候选也消耗
   attempt；最后一个非零阶段是 terminal stage。terminal 之前的阶段严格执行各自
   固定配额，terminal 达到最低配额后才允许 early stop，并可由
-  `--max-extra-terminal-stage-steps` 追加最多 30 个 attempt。默认 `10/10/30`
+  `--max-extra-terminal-stage-steps` 追加额外 attempt，默认值为 `0`；如显式设置
+  为 `30`，则 `10/10/30` 最多执行 80 个 attempt。
   的 terminal 为 19×19；例如 `50/10/0` 的 terminal 为 11×11，19×19 只做
   不改变物理面形的精确 knot refinement。patience 从 terminal 第一步累计，最低
   配额前不允许 early stop；连续 7 个 attempt 未使 best 相对改善严格超过
@@ -169,7 +170,7 @@ python run_pal_nurbs.py `
   --steps 10 10 30 `
   --early-stopping-patience 7 `
   --relative-improvement-threshold 1e-3 `
-  --max-extra-terminal-stage-steps 30 `
+  --max-extra-terminal-stage-steps 0 `
   --weighted-mtf-loss-tolerance 0.10 `
   --astigmatism-tolerance-D 0.80 `
   --smooth-lambda 0.05 `
@@ -177,12 +178,13 @@ python run_pal_nurbs.py `
   --directional-softmin-temperature 0.02
 ```
 
-该示例最低训练 50 个 attempt，最多训练 80 个 attempt。terminal stage 每个 attempt
+该示例最低训练 50 个 attempt，且默认不追加 extra attempt。terminal stage 每个 attempt
 完成后先原子保存 resume/history，再按 early stopping、学习率下限和额外预算
 顺序判断；最低预算前若学习率跌破下限，则 run 失败且不写成功 `summary.json`。
 后续零预算阶段只做精确 refinement；最终 19×19 表示完成 121-case 无梯度复核后
 才标记 complete。`summary.json` 显式记录 terminal control count、terminal extra
-attempt 数及其停止原因。
+attempt 数及其停止原因。每个阶段在达到最低预算时还保存该时刻之前 best 状态的
+`minimum.pt`；因此即使显式允许 terminal extra attempt，也可以保留并单独取回最低预算结果。
 
 普通 `--resume` 只允许恢复同一运行目录中 identity、配置、输入哈希、实现闭包、
 最低/最大预算、patience 计数和终止规则完全一致的 checkpoint。本次 early
