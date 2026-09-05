@@ -33,13 +33,15 @@ from averfang import physical_display_map
 from biot.e2e import pal_nurbs as pal
 from biot.e2e.weighted_mtf import (
     COMMON_FREQ_LPMM,
+    DIRECTION_ANGLES_DEG,
+    weighted_mtf_directional_numpy,
     weighted_mtf_numpy,
 )
 
 
-EVAL_SCHEMA = 3
+EVAL_SCHEMA = 4
 PSF_DATABASE_SCHEMA = 1
-STAGE_MANIFEST_SCHEMA = 1
+STAGE_MANIFEST_SCHEMA = 2
 FIELD_VALUES = tuple(float(value) for value in np.arange(-40.0, 40.0 + 0.1, 10.0))
 FIELD_COUNT = len(FIELD_VALUES) ** 2
 RAW_SIZE_PX = 512
@@ -969,6 +971,20 @@ def _weighted_mtf(psf: np.ndarray, pitch_mm: float) -> tuple[np.ndarray, np.ndar
     return weighted_mtf_numpy(normalized, float(pitch_mm))
 
 
+def _directional_weighted_mtf(
+    psf: np.ndarray,
+    pitch_mm: float,
+    *,
+    softmin_temperature: float,
+) -> tuple[np.ndarray, float, np.ndarray]:
+    normalized = _normalize_physical_psf("directional weighted-MTF PSF", psf)
+    return weighted_mtf_directional_numpy(
+        normalized,
+        float(pitch_mm),
+        softmin_temperature=float(softmin_temperature),
+    )
+
+
 def _stage_is_complete(path: Path, config: Mapping[str, Any]) -> bool:
     if not path.is_file():
         return False
@@ -1009,10 +1025,17 @@ def _run_weighted_mtf(
     stage_config = {
         "identity_sha256": identity_sha256,
         "psf_database_manifest_sha256": database_sha256,
-        "algorithm": "Ahumada-1D mean of sagittal/tangential",
+        "algorithm": "Ahumada four-direction scores with normalized soft minimum",
+        "direction_angles_deg": list(DIRECTION_ANGLES_DEG),
+        "directional_softmin_temperature": float(
+            config.directional_softmin_temperature
+        ),
         "frequency_support_cycles_per_mm": [0.0, 100.0],
         "samples": len(COMMON_FREQ),
-        "published_maps": "mean_native_and_interpolated_png",
+        "published_maps": (
+            "legacy mean plus native four-direction, robust, worst, and spread maps; "
+            "legacy mean and robust also receive display-only interpolation"
+        ),
         "field_map_interpolation": {
             "purpose": "display_only",
             "method": WEIGHTED_MTF_FIELD_INTERPOLATION,
@@ -1029,8 +1052,9 @@ def _run_weighted_mtf(
     files: list[Path] = []
     completed = 0
     for label, _, _ in _distance_cases(config):
-        maps: dict[str, np.ndarray] = {}
-        interpolated_maps: dict[str, np.ndarray] = {}
+        metrics_by_state: dict[str, dict[str, np.ndarray]] = {}
+        mean_interpolated: dict[str, np.ndarray] = {}
+        robust_interpolated: dict[str, np.ndarray] = {}
         interpolated_x: np.ndarray | None = None
         interpolated_y: np.ndarray | None = None
         for state in ("baseline", "optimized"):
@@ -1039,52 +1063,151 @@ def _run_weighted_mtf(
                 name=f"{label}_{state}", fields=f"0/{FIELD_COUNT}", status="RUNNING",
             )
             with h5py.File(_condition_path(evaluation, label, state), "r") as handle:
-                scores = [
-                    _weighted_mtf(handle["raw_psf"][index],
-                                  float(handle["raw_pixel_pitch_mm"][index]))[0][2]
+                results = [
+                    _directional_weighted_mtf(
+                        handle["raw_psf"][index],
+                        float(handle["raw_pixel_pitch_mm"][index]),
+                        softmin_temperature=config.directional_softmin_temperature,
+                    )
                     for index in range(FIELD_COUNT)
                 ]
-            native_ascending_y = np.asarray(scores).reshape(
-                len(FIELD_VALUES), len(FIELD_VALUES)
+            directional_ascending = np.asarray(
+                [result[0] for result in results], dtype=np.float64
+            ).reshape(len(FIELD_VALUES), len(FIELD_VALUES), 4)
+            robust_ascending = np.asarray(
+                [result[1] for result in results], dtype=np.float64
+            ).reshape(len(FIELD_VALUES), len(FIELD_VALUES))
+            mean_ascending = 0.5 * (
+                directional_ascending[:, :, 0] + directional_ascending[:, :, 2]
             )
-            maps[state] = native_ascending_y[::-1]
-            fine_x, fine_y, fine = _interpolate_weighted_mtf_map(
-                native_ascending_y,
+            directional = np.moveaxis(directional_ascending[::-1], -1, 0)
+            robust = robust_ascending[::-1]
+            mean = mean_ascending[::-1]
+            metrics_by_state[state] = {
+                "directional": directional,
+                "robust": robust,
+                "legacy_mean": mean,
+                "worst": directional.min(axis=0),
+                "spread": directional.max(axis=0) - directional.min(axis=0),
+                "worst_direction_index": directional.argmin(axis=0).astype(np.int16),
+            }
+            fine_x, fine_y, fine_mean = _interpolate_weighted_mtf_map(
+                mean_ascending,
+                FIELD_VALUES,
+                FIELD_VALUES,
+            )
+            _, _, fine_robust = _interpolate_weighted_mtf_map(
+                robust_ascending,
                 FIELD_VALUES,
                 FIELD_VALUES,
             )
             interpolated_x, interpolated_y = fine_x, fine_y
-            interpolated_maps[state] = np.clip(fine, 0.0, 1.0)
+            mean_interpolated[state] = np.clip(fine_mean, 0.0, 1.0)
+            robust_interpolated[state] = np.clip(fine_robust, 0.0, 1.0)
             completed += 1
             _progress(
                 phase="weighted_mtf", condition=f"{completed}/6",
                 name=f"{label}_{state}", fields=f"{FIELD_COUNT}/{FIELD_COUNT}", status="DONE",
             )
-        maps["delta"] = maps["optimized"] - maps["baseline"]
-        interpolated_maps["delta"] = (
-            interpolated_maps["optimized"] - interpolated_maps["baseline"]
+        metrics_by_state["delta"] = {
+            name: metrics_by_state["optimized"][name] - metrics_by_state["baseline"][name]
+            for name in ("directional", "robust", "legacy_mean", "worst", "spread")
+        }
+        mean_interpolated["delta"] = (
+            mean_interpolated["optimized"] - mean_interpolated["baseline"]
+        )
+        robust_interpolated["delta"] = (
+            robust_interpolated["optimized"] - robust_interpolated["baseline"]
         )
         if interpolated_x is None or interpolated_y is None:
             raise RuntimeError("weighted-MTF interpolation axes were not initialized")
         for state in ("baseline", "optimized", "delta"):
+            metrics = metrics_by_state[state]
             numeric = output / f"{label}_{state}_mean_map.npz"
             image = output / f"{label}_{state}_mean.png"
             interpolated_image = output / f"{label}_{state}_mean_interpolated.png"
             np.savez_compressed(
-                numeric, mean=maps[state], field_x_deg=np.asarray(FIELD_VALUES),
+                numeric, mean=metrics["legacy_mean"], field_x_deg=np.asarray(FIELD_VALUES),
                 field_y_deg=np.asarray(FIELD_VALUES[::-1]),
             )
-            _plot_map(image, maps[state], title=f"{label} {state} weighted MTF mean",
+            _plot_map(image, metrics["legacy_mean"], title=f"{label} {state} weighted MTF mean",
                       symmetric=state == "delta")
             _plot_interpolated_weighted_mtf_map(
                 interpolated_image,
-                interpolated_maps[state],
+                mean_interpolated[state],
                 interpolated_x,
                 interpolated_y,
                 title=f"{label} {state} CSF-weighted mean MTF",
                 symmetric=state == "delta",
             )
-            files.extend((numeric, image, interpolated_image))
+            directional_numeric = output / f"{label}_{state}_directional_map.npz"
+            np.savez_compressed(
+                directional_numeric,
+                directional=metrics["directional"],
+                direction_angles_deg=np.asarray(DIRECTION_ANGLES_DEG),
+                robust=metrics["robust"],
+                legacy_mean=metrics["legacy_mean"],
+                worst=metrics["worst"],
+                spread=metrics["spread"],
+                worst_direction_index=(
+                    metrics["worst_direction_index"]
+                    if state != "delta"
+                    else np.full(metrics["worst"].shape, -1, dtype=np.int16)
+                ),
+                field_x_deg=np.asarray(FIELD_VALUES),
+                field_y_deg=np.asarray(FIELD_VALUES[::-1]),
+            )
+            robust_image = output / f"{label}_{state}_robust.png"
+            robust_interpolated_image = output / f"{label}_{state}_robust_interpolated.png"
+            worst_image = output / f"{label}_{state}_worst.png"
+            spread_image = output / f"{label}_{state}_direction_spread.png"
+            _plot_map(
+                robust_image,
+                metrics["robust"],
+                title=f"{label} {state} four-direction robust weighted MTF",
+                symmetric=state == "delta",
+            )
+            _plot_interpolated_weighted_mtf_map(
+                robust_interpolated_image,
+                robust_interpolated[state],
+                interpolated_x,
+                interpolated_y,
+                title=f"{label} {state} four-direction robust weighted MTF",
+                symmetric=state == "delta",
+            )
+            _plot_map(
+                worst_image,
+                metrics["worst"],
+                title=f"{label} {state} worst directional weighted MTF",
+                symmetric=state == "delta",
+            )
+            _plot_map(
+                spread_image,
+                metrics["spread"],
+                title=f"{label} {state} weighted MTF direction spread",
+                symmetric=state == "delta",
+            )
+            direction_images: list[Path] = []
+            for direction_index, angle in enumerate(DIRECTION_ANGLES_DEG):
+                direction_image = output / f"{label}_{state}_direction_{int(angle)}.png"
+                _plot_map(
+                    direction_image,
+                    metrics["directional"][direction_index],
+                    title=f"{label} {state} weighted MTF {angle:g} deg",
+                    symmetric=state == "delta",
+                )
+                direction_images.append(direction_image)
+            files.extend((
+                numeric,
+                image,
+                interpolated_image,
+                directional_numeric,
+                robust_image,
+                robust_interpolated_image,
+                worst_image,
+                spread_image,
+                *direction_images,
+            ))
     _write_stage_manifest(manifest_path, config=stage_config, files=files)
     _progress(phase="weighted_mtf", conditions="6/6", status="COMPLETE")
 
@@ -1496,7 +1619,10 @@ def evaluate(
          ),
          "checkpoint_control_count": control_count,
          "distance_labels": [item[0] for item in _distance_cases(config)],
-         "weighted_mtf_products": "mean_native_and_interpolated_png",
+         "weighted_mtf_products": (
+             "legacy_mean plus four-direction robust/worst/spread native maps; "
+             "mean and robust display-only interpolation"
+         ),
          "weighted_mtf_interpolation": {
              "purpose": "display_only",
              "method": WEIGHTED_MTF_FIELD_INTERPOLATION,

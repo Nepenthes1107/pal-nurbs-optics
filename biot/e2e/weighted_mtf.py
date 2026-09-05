@@ -6,12 +6,15 @@ from functools import lru_cache
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from scipy.interpolate import CubicSpline
 
 from optics import compute_dc_normalized_mtf
 
 
 COMMON_FREQ_LPMM = np.linspace(0.0, 100.0, 1000, dtype=np.float64)
+DIRECTION_ANGLES_DEG = (0.0, 45.0, 90.0, 135.0)
+DEFAULT_DIRECTIONAL_SOFTMIN_TEMPERATURE = 0.02
 CSF_MM_PER_DEG = 0.291
 CSF_F0 = 4.1726
 CSF_F1 = 1.3625
@@ -88,6 +91,62 @@ def weighted_mtf_numpy(
     psf: np.ndarray, pitch_mm: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return evaluator-compatible sagittal, tangential, and mean scores."""
+    directional, _, common = weighted_mtf_directional_numpy(
+        psf,
+        pitch_mm,
+        softmin_temperature=DEFAULT_DIRECTIONAL_SOFTMIN_TEMPERATURE,
+    )
+    scores = np.asarray(
+        [directional[0], directional[2], 0.5 * (directional[0] + directional[2])],
+        dtype=np.float64,
+    )
+    return scores, common[0], common[2]
+
+
+def _validate_softmin_temperature(value: float) -> float:
+    temperature = float(value)
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError("directional soft-min temperature must be finite and positive")
+    return temperature
+
+
+def _bilinear_radial_slice_numpy(
+    mtf: np.ndarray, *, angle_deg: float,
+) -> np.ndarray:
+    """Sample one positive radial OTF line in native frequency-index units."""
+    size = int(mtf.shape[0])
+    center = size // 2
+    radius = np.arange(size - center, dtype=np.float64)
+    angle = math.radians(float(angle_deg))
+    rows = center + radius * math.sin(angle)
+    columns = center + radius * math.cos(angle)
+    row0 = np.floor(rows).astype(np.int64)
+    column0 = np.floor(columns).astype(np.int64)
+    row1 = np.minimum(row0 + 1, size - 1)
+    column1 = np.minimum(column0 + 1, size - 1)
+    row_weight = rows - row0
+    column_weight = columns - column0
+    sampled = (
+        mtf[row0, column0] * (1.0 - row_weight) * (1.0 - column_weight)
+        + mtf[row1, column0] * row_weight * (1.0 - column_weight)
+        + mtf[row0, column1] * (1.0 - row_weight) * column_weight
+        + mtf[row1, column1] * row_weight * column_weight
+    )
+    return np.asarray(sampled, dtype=np.float64)
+
+
+def weighted_mtf_directional_numpy(
+    psf: np.ndarray,
+    pitch_mm: float,
+    *,
+    softmin_temperature: float = DEFAULT_DIRECTIONAL_SOFTMIN_TEMPERATURE,
+) -> tuple[np.ndarray, float, np.ndarray]:
+    """Return four directional scores, their soft minimum, and common curves.
+
+    Direction order is ``0/45/90/135`` degrees in OTF array coordinates.  The
+    0- and 90-degree lines are the historical sagittal and tangential slices.
+    """
+    temperature = _validate_softmin_temperature(softmin_temperature)
     array = np.asarray(psf, dtype=np.float64)
     if array.ndim != 2 or array.shape[0] != array.shape[1]:
         raise ValueError("weighted-MTF PSF must be a square 2-D array")
@@ -101,62 +160,82 @@ def weighted_mtf_numpy(
     mtf = np.asarray(compute_dc_normalized_mtf(array), dtype=np.float64)
     size, center = int(mtf.shape[0]), int(mtf.shape[0]) // 2
     frequency = _native_frequency(size, float(pitch_mm))
-    sagittal = np.clip(
-        np.asarray(mtf[center, center : center + center + 1], dtype=np.float64),
-        0.0,
-        1.0,
+    native = np.stack(
+        (
+            np.asarray(mtf[center, center : center + center + 1], dtype=np.float64),
+            _bilinear_radial_slice_numpy(mtf, angle_deg=45.0),
+            np.asarray(mtf[center : center + center + 1, center], dtype=np.float64),
+            _bilinear_radial_slice_numpy(mtf, angle_deg=135.0),
+        )
     )
-    tangential = np.clip(
-        np.asarray(mtf[center : center + center + 1, center], dtype=np.float64),
-        0.0,
-        1.0,
-    )
-    count = min(frequency.size, sagittal.size, tangential.size)
+    native = np.clip(native, 0.0, 1.0)
+    count = min(frequency.size, int(native.shape[1]))
     frequency = frequency[:count]
     if frequency[-1] < float(COMMON_FREQ_LPMM[-1]):
         raise ValueError(
             f"native MTF support ends at {frequency[-1]:g} cycles/mm, below 100"
         )
-    sagittal_common = CubicSpline(
-        frequency, sagittal[:count], extrapolate=False
+    common = CubicSpline(
+        frequency, native[:, :count], axis=1, extrapolate=False
     )(COMMON_FREQ_LPMM)
-    tangential_common = CubicSpline(
-        frequency, tangential[:count], extrapolate=False
-    )(COMMON_FREQ_LPMM)
-    if not np.isfinite(sagittal_common).all() or not np.isfinite(tangential_common).all():
+    if not np.isfinite(common).all():
         raise ValueError("MTF interpolation produced non-finite values")
-    sagittal_score = float(
-        np.trapz(
-            AHUMADA_WEIGHT_NORMALIZED * sagittal_common, COMMON_FREQ_LPMM
-        )
-    )
-    tangential_score = float(
-        np.trapz(
-            AHUMADA_WEIGHT_NORMALIZED * tangential_common, COMMON_FREQ_LPMM
-        )
-    )
     scores = np.asarray(
-        [
-            sagittal_score,
-            tangential_score,
-            0.5 * (sagittal_score + tangential_score),
-        ],
+        np.trapz(
+            common * AHUMADA_WEIGHT_NORMALIZED[None, :],
+            COMMON_FREQ_LPMM,
+            axis=1,
+        ),
         dtype=np.float64,
     )
     if not np.isfinite(scores).all():
         raise ValueError("weighted-MTF score is non-finite")
-    return scores, sagittal_common, tangential_common
+    minimum = float(scores.min())
+    robust = minimum - temperature * math.log(
+        float(np.mean(np.exp(-(scores - minimum) / temperature)))
+    )
+    if not math.isfinite(robust):
+        raise ValueError("directional weighted-MTF soft minimum is non-finite")
+    return scores, robust, np.asarray(common, dtype=np.float64)
 
 
-def weighted_mtf_mean_torch_batch(
-    psf: torch.Tensor, *, pixel_pitch_mm: torch.Tensor,
-) -> torch.Tensor:
-    """Return differentiable evaluator-equivalent mean scores for ``[B,H,W]`` PSFs.
+def _directional_native_torch(mtf: torch.Tensor) -> torch.Tensor:
+    """Return native 0/45/90/135-degree MTF lines for ``[B,H,W]``."""
+    batch_size, size = int(mtf.shape[0]), int(mtf.shape[-1])
+    center = size // 2
+    horizontal = mtf[:, center, center : center + center + 1]
+    vertical = mtf[:, center : center + center + 1, center]
+    radius = torch.arange(size - center, device=mtf.device, dtype=mtf.dtype)
+    diagonal_lines: list[torch.Tensor] = []
+    for angle_deg in (45.0, 135.0):
+        angle = math.radians(angle_deg)
+        rows = center + radius * math.sin(angle)
+        columns = center + radius * math.cos(angle)
+        grid_x = 2.0 * columns / float(size - 1) - 1.0
+        grid_y = 2.0 * rows / float(size - 1) - 1.0
+        grid = torch.stack((grid_x, grid_y), dim=-1).reshape(1, -1, 1, 2)
+        grid = grid.expand(batch_size, -1, -1, -1)
+        sampled = F.grid_sample(
+            mtf[:, None, :, :],
+            grid,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=True,
+        )
+        diagonal_lines.append(sampled[:, 0, :, 0])
+    return torch.stack(
+        (horizontal, diagonal_lines[0], vertical, diagonal_lines[1]), dim=1
+    ).clamp(0.0, 1.0)
 
-    ``pixel_pitch_mm`` is fixed FFT sampling metadata and must not require a
-    gradient.  Only its cached interpolation projection is built outside the
-    graph; all PSF-dependent operations remain Torch tensors.
-    """
+
+def weighted_mtf_directional_torch_batch(
+    psf: torch.Tensor,
+    *,
+    pixel_pitch_mm: torch.Tensor,
+    softmin_temperature: float = DEFAULT_DIRECTIONAL_SOFTMIN_TEMPERATURE,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return differentiable four-direction scores and robust scores per PSF."""
+    temperature = _validate_softmin_temperature(softmin_temperature)
     if psf.ndim != 3 or int(psf.shape[-2]) != int(psf.shape[-1]):
         raise ValueError("weighted-MTF PSF batch must have square shape [B,H,W]")
     batch_size, size = int(psf.shape[0]), int(psf.shape[-1])
@@ -180,10 +259,8 @@ def weighted_mtf_mean_torch_batch(
     dc = magnitude[:, center, center]
     if not bool(torch.isfinite(dc).all()) or bool((dc <= 0.0).any()):
         raise ValueError("weighted-MTF OTF DC must be finite and positive")
-    mtf = magnitude / dc[:, None, None]
-    sagittal = mtf[:, center, center : center + center + 1].clamp(0.0, 1.0)
-    tangential = mtf[:, center : center + center + 1, center].clamp(0.0, 1.0)
-    means: list[torch.Tensor] = []
+    native = _directional_native_torch(magnitude / dc[:, None, None])
+    per_case: list[torch.Tensor] = []
     for index in range(batch_size):
         pitch = float(pixel_pitch_mm[index].detach().cpu())
         projection = torch.as_tensor(
@@ -192,10 +269,29 @@ def weighted_mtf_mean_torch_batch(
             dtype=psf.dtype,
         )
         count = int(projection.numel())
-        sag_score = (sagittal[index, :count] * projection).sum()
-        tan_score = (tangential[index, :count] * projection).sum()
-        means.append(0.5 * (sag_score + tan_score))
-    scores = torch.stack(means)
-    if not bool(torch.isfinite(scores).all()):
-        raise ValueError("weighted-MTF score is non-finite")
-    return scores
+        per_case.append((native[index, :, :count] * projection[None, :]).sum(dim=1))
+    scores = torch.stack(per_case)
+    robust = -temperature * (
+        torch.logsumexp(-scores / temperature, dim=1)
+        - math.log(float(len(DIRECTION_ANGLES_DEG)))
+    )
+    if not bool(torch.isfinite(scores).all()) or not bool(torch.isfinite(robust).all()):
+        raise ValueError("directional weighted-MTF score is non-finite")
+    return scores, robust
+
+
+def weighted_mtf_mean_torch_batch(
+    psf: torch.Tensor, *, pixel_pitch_mm: torch.Tensor,
+) -> torch.Tensor:
+    """Return differentiable evaluator-equivalent mean scores for ``[B,H,W]`` PSFs.
+
+    ``pixel_pitch_mm`` is fixed FFT sampling metadata and must not require a
+    gradient.  Only its cached interpolation projection is built outside the
+    graph; all PSF-dependent operations remain Torch tensors.
+    """
+    directional, _ = weighted_mtf_directional_torch_batch(
+        psf,
+        pixel_pitch_mm=pixel_pitch_mm,
+        softmin_temperature=DEFAULT_DIRECTIONAL_SOFTMIN_TEMPERATURE,
+    )
+    return 0.5 * (directional[:, 0] + directional[:, 2])

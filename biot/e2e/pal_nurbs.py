@@ -57,10 +57,14 @@ from .system import (
     trace_system_to_image_with_phase,
     _snell,
 )
-from .weighted_mtf import weighted_mtf_mean_torch_batch
+from .weighted_mtf import (
+    DEFAULT_DIRECTIONAL_SOFTMIN_TEMPERATURE,
+    weighted_mtf_mean_torch_batch,
+    weighted_mtf_directional_torch_batch,
+)
 
 
-METHOD_NAME = "pal_109case_7functional_ahumada_weighted_mtf_peripheral_astig_v1"
+METHOD_NAME = "pal_121case_7functional_4dir_softmin_mtf_physical_bending_v1"
 
 DEFAULT_GROUP_WEIGHTS = {
     "far": 0.24,
@@ -131,8 +135,10 @@ class MinimalConfig:
         default_factory=lambda: dict(DEFAULT_GROUP_WEIGHTS)
     )
     weighted_mtf_loss_tolerance: float = 0.10
+    directional_softmin_temperature: float = DEFAULT_DIRECTIONAL_SOFTMIN_TEMPERATURE
     astigmatism_tolerance_D: float = 0.80
     smooth_lambda: float = 0.05
+    smooth_curvature_scale_per_mm: float = 1.0e-4
     candidate_trace_import: str | None = None
     forward_qualification_import: str | None = None
     final_phase_qualification_import: str | None = None
@@ -156,7 +162,12 @@ class MinimalConfig:
             raise ValueError("group_weights must be finite and positive")
         if not math.isclose(sum(weights.values()), 1.0, rel_tol=0.0, abs_tol=1.0e-12):
             raise ValueError("group_weights must sum to 1")
-        for name in ("weighted_mtf_loss_tolerance", "astigmatism_tolerance_D"):
+        for name in (
+            "weighted_mtf_loss_tolerance",
+            "directional_softmin_temperature",
+            "astigmatism_tolerance_D",
+            "smooth_curvature_scale_per_mm",
+        ):
             value = float(getattr(self, name))
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{name} must be finite and positive")
@@ -217,20 +228,23 @@ class MinimalConfig:
             raise ValueError("relative_improvement_threshold must be finite and positive")
 
 
-RUN_IDENTITY_SCHEMA_VERSION = 11
-PARENT_RUN_IDENTITY_SCHEMA_VERSIONS = (11,)
-CASE_LAYOUT_STATE_SCHEMA_VERSION = 12
-BASELINE_STATE_SCHEMA_VERSION = 8
-BASELINE_PROGRESS_SCHEMA_VERSION = 8
-STAGE_RESUME_SCHEMA_VERSION = 4
+RUN_IDENTITY_SCHEMA_VERSION = 12
+PARENT_RUN_IDENTITY_SCHEMA_VERSIONS = (12,)
+CASE_LAYOUT_STATE_SCHEMA_VERSION = 13
+BASELINE_STATE_SCHEMA_VERSION = 9
+BASELINE_PROGRESS_SCHEMA_VERSION = 9
+STAGE_RESUME_SCHEMA_VERSION = 5
 RUN_STATE_SCHEMA_VERSION = 1
 STAGE_LADDER = (7, 11, 19)
 FORWARD_POOL_MULTIPLIER = 4
 FORWARD_POOL_GROUP_COUNTS = {
-    **{
-        group: TRAINING_GROUP_COUNTS[group] * FORWARD_POOL_MULTIPLIER
-        for group in FUNCTIONAL_GROUPS
-    },
+    "far": 112,
+    "corridor_upper": 20,
+    "corridor_middle": 20,
+    "corridor_lower": 20,
+    "near": 80,
+    "near_robustness": 32,
+    "near_edge_astig": 32,
     # Keep the already audited 52-case pool per side.  This is the smallest
     # pool that contains the complete 16/16/20 band strata while supporting
     # the final 5/5/6 selection without increasing qualification compute.
@@ -830,19 +844,59 @@ def psf_second_moment_mm2_batch(
     return (normalized * ((xx_mm - cx).square() + (yy_mm - cy).square())).sum(dim=(-2, -1))
 
 
-def laplacian_regularizer(
+def physical_bending_regularizer(
     module: FixedWeightNURBSPerturbation,
+    monitored_mask: torch.Tensor,
+    *,
+    curvature_scale_per_mm: float,
 ) -> torch.Tensor:
-    """Return the normalized-control second-difference penalty."""
-    q = module.inner_q
-    if q.ndim != 2 or min(int(q.shape[0]), int(q.shape[1])) < 3:
-        raise ValueError("NURBS inner control grid is too small for a Laplacian penalty")
-    lap_y = q[2:, :] - 2.0 * q[1:-1, :] + q[:-2, :]
-    lap_x = q[:, 2:] - 2.0 * q[:, 1:-1] + q[:, :-2]
-    value = lap_y.square().mean() + lap_x.square().mean()
+    """Return dimensionless physical Hessian bending energy on the PAL mask."""
+    scale = float(curvature_scale_per_mm)
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError("physical curvature scale must be finite and positive")
+    mask = monitored_mask.to(device=module.inner_q.device, dtype=torch.bool)
+    if mask.ndim != 2 or tuple(mask.shape) != (81, 81) or not bool(mask.any()):
+        raise ValueError("physical bending requires a non-empty 81x81 monitored mask")
+    coordinate = torch.linspace(
+        -40.0,
+        40.0,
+        81,
+        device=module.inner_q.device,
+        dtype=module.inner_q.dtype,
+    )
+    yy, xx = torch.meshgrid(coordinate, coordinate, indexing="ij")
+    _, _, _, sxx, sxy, syy = module.all_derivatives_raw(xx, yy)
+    density = (sxx.square() + 2.0 * sxy.square() + syy.square()) / (scale * scale)
+    value = density[mask].mean()
     if not bool(torch.isfinite(value)):
-        raise ValueError("NURBS Laplacian regularizer is non-finite")
+        raise ValueError("physical NURBS bending regularizer is non-finite")
     return value
+
+
+def _effective_smooth_lambda(control_count: int, configured: float) -> float:
+    return 0.0 if int(control_count) == 7 else float(configured)
+
+
+def _regularized_objective(
+    data_value: float,
+    health: Mapping[str, Any],
+    *,
+    bending_value: float,
+    effective_lambda: float,
+) -> tuple[float, dict[str, Any]]:
+    weighted = float(effective_lambda) * float(bending_value)
+    total = float(data_value) + weighted
+    if not all(math.isfinite(value) for value in (data_value, bending_value, weighted, total)):
+        raise ValueError("regularized PAL objective is non-finite")
+    enriched = {
+        **dict(health),
+        "J_data": float(data_value),
+        "R_bend": float(bending_value),
+        "smooth_lambda_effective": float(effective_lambda),
+        "smooth_weighted_loss": weighted,
+        "J_total": total,
+    }
+    return total, enriched
 
 
 def _edge_fraction_batch(psf: torch.Tensor, edge_px: int = 5) -> torch.Tensor:
@@ -1368,7 +1422,7 @@ def build_joint_training_cases(
     group_counts: Mapping[str, int] = TRAINING_GROUP_COUNTS,
     peripheral_band_counts: Mapping[str, int] = PERIPHERAL_BAND_COUNTS,
 ) -> list[dict[str, Any]]:
-    """Build the fixed 109-case contract from traced dense-field candidates."""
+    """Build the fixed 121-case contract from traced dense-field candidates."""
     maps = dict(zones_payload.get("maps", {}))
     if "power_D" not in maps:
         raise ValueError("zones.json must store the Original PAL power_D map")
@@ -1657,6 +1711,12 @@ def _prepare_case_layout(
     save_qualification_progress("complete")
 
     qualified_pool = [dict(case) for case in qualification_pool if bool(case.get("eligible"))]
+    qualified_pool = _trace_preoptimization_case_geometry(
+        model,
+        qualified_pool,
+        zones_json=config.zones_json,
+        reference_distance_mm=config.far_object_distance_mm,
+    )
     forward_attempts: list[dict[str, Any]] = []
     phase_progress_path = output / "final_phase_qualification_progress.json"
     _import_complete_pool_progress(
@@ -1843,7 +1903,7 @@ def _prepare_case_layout(
                 "exact BIOT_vis field-dependent WFNO for traced functional cases + "
                 "surface-only peripheral qualification + final group-preserving "
                 "coverage-constrained selection + "
-                "complete pre-FFT phase trace for 79 functional cases"
+                "complete pre-FFT phase trace for 91 functional cases"
             ),
             "pool_group_counts": FORWARD_POOL_GROUP_COUNTS,
             "pool_peripheral_band_counts": FORWARD_POOL_PERIPHERAL_BAND_COUNTS,
@@ -1873,7 +1933,7 @@ def _prepare_case_layout(
             "method": (
                 "dense field -> Original PAL rear trace -> classified partition -> "
                 "fixed region-wise lens-plane FPS pool -> exact aiming/WFNO qualification for functional cases -> "
-                "final group-preserving coverage-constrained selection -> 79-case complete "
+                "final group-preserving coverage-constrained selection -> 91-case complete "
                 "pre-FFT phase qualification; peripheral is surface-only"
             ),
             "field_grid_deg": {
@@ -1906,7 +1966,7 @@ def _prepare_case_layout(
             "forward_qualification": (
                 f"fixed {sum(FORWARD_POOL_GROUP_COUNTS.values())}-case spatial pool; exact BIOT_vis "
                 "field-dependent WFNO for functional cases; complete pre-FFT phase trace on final "
-                "79 functional cases; 30 peripheral cases use no ray trace"
+                "91 functional cases; 30 peripheral cases use no ray trace"
             ),
             "forward_pool_group_counts": FORWARD_POOL_GROUP_COUNTS,
             "forward_pool_peripheral_band_counts": FORWARD_POOL_PERIPHERAL_BAND_COUNTS,
@@ -1929,6 +1989,7 @@ def _validate_case_layout_state(
     training_ids = [str(case["case_id"]) for case in training_cases]
     if len(training_ids) != len(set(training_ids)):
         raise ValueError("training case IDs are not unique")
+    _validate_spatial_weights(training_cases)
 
 
 def _prepare_or_load_case_layout(
@@ -2023,13 +2084,13 @@ def _summarize_training_baseline(
         sum(weights.values()), 1.0, rel_tol=0.0, abs_tol=1.0e-12
     ):
         raise ValueError("baseline group weights must define the nine groups and sum to 1")
+    _validate_spatial_weights(rows)
     group_losses = {
         name: sum(
-            float(row["score"])
+            float(row["score"]) * float(row["spatial_weight"])
             for row in rows
             if str(row["training_group"]) == name
         )
-        / sum(str(row["training_group"]) == name for row in rows)
         for name in FUNCTIONAL_GROUPS + PERIPHERAL_GROUPS
     }
     maximum_edge = max(float(row["edge_fraction"]) for row in rows)
@@ -2050,18 +2111,33 @@ def _summarize_training_baseline(
         weights[name] * group_losses[name]
         for name in FUNCTIONAL_GROUPS + PERIPHERAL_GROUPS
     )
+    group_summary["J_data"] = objective_value
     group_summary["J_total"] = objective_value
     health: dict[str, Any] = {
         "minimum_valid_fraction_ratio": 1.0,
         "maximum_edge_fraction": maximum_edge,
         "objective_name": (
-            "J=sum(group_weight*mean(fixed-tolerance normalized metric)); "
-            "seven traced functional groups use Ahumada weighted-MTF loss; "
+            "J_data=sum(group_weight*physical-area-weighted fixed-tolerance metric); "
+            "seven traced functional groups use four-direction robust Ahumada weighted-MTF loss; "
             "peripheral groups remain surface-only A_D"
         ),
         **group_summary,
     }
     return float(objective_value), health
+
+
+def _validate_spatial_weights(rows: Sequence[Mapping[str, Any]]) -> None:
+    groups = FUNCTIONAL_GROUPS + PERIPHERAL_GROUPS
+    for group in groups:
+        values = [
+            float(row.get("spatial_weight", math.nan))
+            for row in rows
+            if str(row.get("training_group")) == group
+        ]
+        if not values or any(not math.isfinite(value) or value <= 0.0 for value in values):
+            raise ValueError(f"{group} spatial weights must be finite and positive")
+        if not math.isclose(sum(values), 1.0, rel_tol=0.0, abs_tol=1.0e-12):
+            raise ValueError(f"{group} spatial weights must sum to 1")
 
 
 def _validate_baseline_progress_prefix(
@@ -2124,12 +2200,14 @@ def _batch_rows(
     z4_defocus_mm2: torch.Tensor,
     weighted_mtf_loss: torch.Tensor,
     weighted_mtf_score: torch.Tensor,
+    weighted_mtf_directional_scores: torch.Tensor,
     astig_A_D: torch.Tensor,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for index, case in enumerate(cases):
         vf = float(result.valid_fraction[index].detach().cpu())
         ratio = 1.0 if baseline_valid is None else vf / float(baseline_valid[str(case["case_id"])])
+        directional = weighted_mtf_directional_scores[index]
         rows.append({
             **dict(case),
             "m2_mm2": float(moments[index].detach().cpu()),
@@ -2137,6 +2215,17 @@ def _batch_rows(
             "z4_defocus_mm2": float(z4_defocus_mm2[index].detach().cpu()),
             "weighted_mtf_loss": float(weighted_mtf_loss[index].detach().cpu()),
             "weighted_mtf_score": float(weighted_mtf_score[index].detach().cpu()),
+            "weighted_mtf_direction_0": float(directional[0].detach().cpu()),
+            "weighted_mtf_direction_45": float(directional[1].detach().cpu()),
+            "weighted_mtf_direction_90": float(directional[2].detach().cpu()),
+            "weighted_mtf_direction_135": float(directional[3].detach().cpu()),
+            "weighted_mtf_legacy_mean": float(
+                (0.5 * (directional[0] + directional[2])).detach().cpu()
+            ),
+            "weighted_mtf_worst_direction": float(directional.min().detach().cpu()),
+            "weighted_mtf_direction_spread": float(
+                (directional.max() - directional.min()).detach().cpu()
+            ),
             "loss_metric": float(loss_metrics[index].detach().cpu()),
             "loss_metric_name": loss_metric_names[index],
             "score": float(scores[index].detach().cpu()),
@@ -2152,8 +2241,11 @@ def _loss_metrics_for_batch(
     cases: Sequence[Mapping[str, Any]],
     result: BatchFieldResult,
     moments: torch.Tensor,
+    *,
+    directional_softmin_temperature: float = DEFAULT_DIRECTIONAL_SOFTMIN_TEMPERATURE,
 ) -> tuple[
-    torch.Tensor, list[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    torch.Tensor, list[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+    torch.Tensor,
 ]:
     z4_values = (
         torch.zeros_like(moments)
@@ -2162,9 +2254,10 @@ def _loss_metrics_for_batch(
     )
     if z4_values.shape != moments.shape:
         raise ValueError("Z4 batch shape does not match traced cases")
-    weighted_scores = weighted_mtf_mean_torch_batch(
+    directional_scores, weighted_scores = weighted_mtf_directional_torch_batch(
         result.kernels,
         pixel_pitch_mm=result.pixel_pitch_mm,
+        softmin_temperature=directional_softmin_temperature,
     )
     weighted_losses = 1.0 - weighted_scores
     metrics = [value for value in weighted_losses]
@@ -2177,6 +2270,7 @@ def _loss_metrics_for_batch(
         z4_values,
         weighted_losses,
         weighted_scores,
+        directional_scores,
     )
 
 
@@ -2187,9 +2281,10 @@ def _normalized_scores_for_batch(
     moments: torch.Tensor,
     *,
     weighted_mtf_loss_tolerance: float,
+    directional_softmin_temperature: float = DEFAULT_DIRECTIONAL_SOFTMIN_TEMPERATURE,
 ) -> tuple[
     torch.Tensor, torch.Tensor, list[str], torch.Tensor, torch.Tensor,
-    torch.Tensor, torch.Tensor,
+    torch.Tensor, torch.Tensor, torch.Tensor,
 ]:
     (
         loss_metrics,
@@ -2198,7 +2293,14 @@ def _normalized_scores_for_batch(
         z4_values,
         weighted_losses,
         weighted_scores,
-    ) = _loss_metrics_for_batch(model, cases, result, moments)
+        directional_scores,
+    ) = _loss_metrics_for_batch(
+        model,
+        cases,
+        result,
+        moments,
+        directional_softmin_temperature=directional_softmin_temperature,
+    )
     normalized: list[torch.Tensor] = []
     for index, _case in enumerate(cases):
         normalized.append(
@@ -2215,6 +2317,7 @@ def _normalized_scores_for_batch(
         z4_values,
         weighted_losses,
         weighted_scores,
+        directional_scores,
     )
 
 
@@ -2226,6 +2329,7 @@ def _evaluate_original_training_baseline_with_resume(
     identity_sha256: str,
     group_weights: Mapping[str, float] = DEFAULT_GROUP_WEIGHTS,
     weighted_mtf_loss_tolerance: float = 0.10,
+    directional_softmin_temperature: float = DEFAULT_DIRECTIONAL_SOFTMIN_TEMPERATURE,
     astigmatism_tolerance_D: float = 0.80,
 ) -> tuple[float, list[dict[str, Any]], dict[str, Any]]:
     path = Path(progress_path)
@@ -2325,18 +2429,21 @@ def _evaluate_original_training_baseline_with_resume(
                 z4_values,
                 weighted_losses,
                 weighted_scores,
+                directional_scores,
             ) = _normalized_scores_for_batch(
                 model,
                 batch,
                 result,
                 moments,
                 weighted_mtf_loss_tolerance=weighted_mtf_loss_tolerance,
+                directional_softmin_temperature=directional_softmin_temperature,
             )
         batch_rows = _batch_rows(
             batch, result, moments, loss_metrics, loss_metric_names, None, scores,
             z4_defocus_mm2=z4_values,
             weighted_mtf_loss=weighted_losses,
             weighted_mtf_score=weighted_scores,
+            weighted_mtf_directional_scores=directional_scores,
             astig_A_D=astig_values,
         )
         for row in batch_rows:
@@ -2365,6 +2472,13 @@ def _evaluate_original_training_baseline_with_resume(
                 "z4_defocus_mm2": 0.0,
                 "weighted_mtf_loss": 0.0,
                 "weighted_mtf_score": 0.0,
+                "weighted_mtf_direction_0": 0.0,
+                "weighted_mtf_direction_45": 0.0,
+                "weighted_mtf_direction_90": 0.0,
+                "weighted_mtf_direction_135": 0.0,
+                "weighted_mtf_legacy_mean": 0.0,
+                "weighted_mtf_worst_direction": 0.0,
+                "weighted_mtf_direction_spread": 0.0,
                 "loss_metric": float(value.detach().cpu()),
                 "loss_metric_name": "astig_A_D",
                 "score": float(value.detach().cpu()) / float(astigmatism_tolerance_D),
@@ -2386,6 +2500,7 @@ def _evaluate(
     *, with_grad: bool, baseline_valid: Mapping[str, float] | None = None,
     group_weights: Mapping[str, float] = DEFAULT_GROUP_WEIGHTS,
     weighted_mtf_loss_tolerance: float = 0.10,
+    directional_softmin_temperature: float = DEFAULT_DIRECTIONAL_SOFTMIN_TEMPERATURE,
     astigmatism_tolerance_D: float = 0.80,
     progress_stage: str | None = None,
     progress_step: str | None = None,
@@ -2415,6 +2530,7 @@ def _evaluate(
         sum(weights.values()), 1.0, rel_tol=0.0, abs_tol=1.0e-12
     ):
         raise ValueError("group_weights must define the nine groups and sum to 1")
+    _validate_spatial_weights(cases)
     minimum_ratio, maximum_edge = math.inf, 0.0
     batch_size = int(getattr(getattr(model, "config", None), "case_batch_size", 1))
     traced_cases = [
@@ -2443,17 +2559,19 @@ def _evaluate(
                 z4_values,
                 weighted_losses,
                 weighted_scores,
+                directional_scores,
             ) = _normalized_scores_for_batch(
                 model,
                 batch,
                 result,
                 moments,
                 weighted_mtf_loss_tolerance=weighted_mtf_loss_tolerance,
+                directional_softmin_temperature=directional_softmin_temperature,
             )
             coefficients = torch.as_tensor(
                 [
                     weights[str(case["training_group"])]
-                    / group_counts[str(case["training_group"])]
+                    * float(case["spatial_weight"])
                     for case in batch
                 ], device=scores.device, dtype=scores.dtype,
             )
@@ -2483,6 +2601,7 @@ def _evaluate(
                 z4_defocus_mm2=z4_values,
                 weighted_mtf_loss=weighted_losses,
                 weighted_mtf_score=weighted_scores,
+                weighted_mtf_directional_scores=directional_scores,
                 astig_A_D=astig_values,
             )
         )
@@ -2515,7 +2634,7 @@ def _evaluate(
             group = str(case["training_group"])
             raw = astig_by_zone[GROUP_TO_ZONE[group]]
             score = raw / float(astigmatism_tolerance_D)
-            weighted = score * (weights[group] / group_counts[group])
+            weighted = score * (weights[group] * float(case["spatial_weight"]))
             peripheral_loss = weighted if peripheral_loss is None else peripheral_loss + weighted
             value = float(score.detach().cpu())
             group_values.setdefault(group, []).append(value)
@@ -2526,6 +2645,13 @@ def _evaluate(
                 "z4_defocus_mm2": 0.0,
                 "weighted_mtf_loss": 0.0,
                 "weighted_mtf_score": 0.0,
+                "weighted_mtf_direction_0": 0.0,
+                "weighted_mtf_direction_45": 0.0,
+                "weighted_mtf_direction_90": 0.0,
+                "weighted_mtf_direction_135": 0.0,
+                "weighted_mtf_legacy_mean": 0.0,
+                "weighted_mtf_worst_direction": 0.0,
+                "weighted_mtf_direction_spread": 0.0,
                 "loss_metric": float(raw.detach().cpu()),
                 "loss_metric_name": "astig_A_D",
                 "score": value,
@@ -2540,7 +2666,11 @@ def _evaluate(
                 )
             peripheral_loss.backward()
     group_losses = {
-        name: sum(group_values[name]) / len(group_values[name])
+        name: sum(
+            float(row["score"]) * float(row["spatial_weight"])
+            for row in rows
+            if str(row["training_group"]) == name
+        )
         for name in FUNCTIONAL_GROUPS + PERIPHERAL_GROUPS
     }
     for row in rows:
@@ -2565,11 +2695,12 @@ def _evaluate(
     group_summary.update({
         "J_functional": float(functional),
         "J_peripheral": float(peripheral),
+        "J_data": float(objective_value),
         "J_total": float(objective_value),
     })
     objective_name = (
-        "J=sum(group_weight*mean(fixed-tolerance normalized metric)); "
-        "seven traced functional groups use Ahumada weighted-MTF loss; "
+        "J_data=sum(group_weight*physical-area-weighted fixed-tolerance metric); "
+        "seven traced functional groups use four-direction robust Ahumada weighted-MTF loss; "
         "peripheral groups remain surface-only A_D"
     )
     return float(objective_value), rows, {
@@ -2587,7 +2718,7 @@ def _save_checkpoint(path: Path, module: FixedWeightNURBSPerturbation, **metadat
     )
 
 
-GRADIENT_DIAGNOSTIC_SCHEMA_VERSION = 1
+GRADIENT_DIAGNOSTIC_SCHEMA_VERSION = 2
 
 
 def _backward_gradient_for_diagnostic(
@@ -2615,6 +2746,7 @@ def _group_gradient_for_diagnostic(
     group: str,
     *,
     weighted_mtf_loss_tolerance: float,
+    directional_softmin_temperature: float,
     astigmatism_tolerance_D: float,
 ) -> tuple[float, torch.Tensor]:
     members = [case for case in cases if str(case["training_group"]) == group]
@@ -2651,8 +2783,14 @@ def _group_gradient_for_diagnostic(
             result,
             moments,
             weighted_mtf_loss_tolerance=weighted_mtf_loss_tolerance,
+            directional_softmin_temperature=directional_softmin_temperature,
         )
-        contribution = scores.sum() / len(members)
+        spatial = torch.as_tensor(
+            [float(case["spatial_weight"]) for case in batch],
+            device=scores.device,
+            dtype=scores.dtype,
+        )
+        contribution = (scores * spatial).sum()
         gradient = _backward_gradient_for_diagnostic(
             contribution,
             module,
@@ -2688,6 +2826,7 @@ def _build_gradient_diagnostic(
     checkpoint_sha256: str,
     group_weights: Mapping[str, float],
     weighted_mtf_loss_tolerance: float,
+    directional_softmin_temperature: float,
     astigmatism_tolerance_D: float,
 ) -> dict[str, Any]:
     groups = FUNCTIONAL_GROUPS + PERIPHERAL_GROUPS
@@ -2708,6 +2847,7 @@ def _build_gradient_diagnostic(
                 cases,
                 group,
                 weighted_mtf_loss_tolerance=weighted_mtf_loss_tolerance,
+                directional_softmin_temperature=directional_softmin_temperature,
                 astigmatism_tolerance_D=astigmatism_tolerance_D,
             )
             if not math.isfinite(loss) or not bool(torch.isfinite(gradient).all()):
@@ -2767,6 +2907,9 @@ def _build_gradient_diagnostic(
         "group_weights": {name: float(group_weights[name]) for name in groups},
         "tolerances": {
             "weighted_mtf_loss": float(weighted_mtf_loss_tolerance),
+            "directional_softmin_temperature": float(
+                directional_softmin_temperature
+            ),
             "astigmatism_D": float(astigmatism_tolerance_D),
         },
         "total_gradient_l2": total_norm,
@@ -2787,6 +2930,7 @@ def _ensure_gradient_diagnostic(
     identity_sha256: str,
     group_weights: Mapping[str, float],
     weighted_mtf_loss_tolerance: float,
+    directional_softmin_temperature: float,
     astigmatism_tolerance_D: float,
 ) -> Path:
     if not checkpoint_path.is_file():
@@ -2831,6 +2975,7 @@ def _ensure_gradient_diagnostic(
             checkpoint_sha256=checkpoint_sha256,
             group_weights=group_weights,
             weighted_mtf_loss_tolerance=weighted_mtf_loss_tolerance,
+            directional_softmin_temperature=directional_softmin_temperature,
             astigmatism_tolerance_D=astigmatism_tolerance_D,
         )
         _write_json_atomic(path, payload)
@@ -2916,6 +3061,13 @@ def _write_inherited_gradient_diagnostic_manifest(
 def _joint_metric_fields(value: float, health: Mapping[str, float]) -> dict[str, float]:
     return {
         "J": float(value),
+        "J_total": float(health.get("J_total", value)),
+        "J_data": float(health.get("J_data", value)),
+        "R_bend": float(health.get("R_bend", 0.0)),
+        "smooth_lambda_effective": float(
+            health.get("smooth_lambda_effective", 0.0)
+        ),
+        "smooth_weighted_loss": float(health.get("smooth_weighted_loss", 0.0)),
         "J_far": float(health["J_far"]),
         "J_mid": float(health["J_mid"]),
         "J_near": float(health["J_near"]),
@@ -2939,14 +3091,16 @@ def _accumulate_startup_case_gradients(
         # uses the same weighted-MTF target and never substitutes another metric.
         for case in cases:
             result = model.field(case)
-            case_loss = 1.0 - weighted_mtf_mean_torch_batch(
+            _, robust_score = weighted_mtf_directional_torch_batch(
                 result.kernel.unsqueeze(0),
                 pixel_pitch_mm=torch.as_tensor(
                     [result.pixel_pitch_mm],
                     device=result.kernel.device,
                     dtype=result.kernel.dtype,
                 ),
-            ).sum()
+                softmin_temperature=config.directional_softmin_temperature,
+            )
+            case_loss = (1.0 - robust_score).sum()
             case_loss.backward()
             result_device = result.kernel.device
             del case_loss, result
@@ -2956,10 +3110,12 @@ def _accumulate_startup_case_gradients(
             raise RuntimeError("startup gradient check failed: fewer than two finite non-zero zp gradients")
         return grad.detach().clone()
     result = _field_batch(model, cases)
-    (1.0 - weighted_mtf_mean_torch_batch(
+    _, robust_scores = weighted_mtf_directional_torch_batch(
         result.kernels,
         pixel_pitch_mm=result.pixel_pitch_mm,
-    )).sum().backward()
+        softmin_temperature=config.directional_softmin_temperature,
+    )
+    (1.0 - robust_scores).sum().backward()
     result_device = result.kernels.device
     del result
     _release_inactive_case_cuda_cache(result_device)
@@ -3825,6 +3981,7 @@ def _run_bound(
     objective_options = {
         "group_weights": config.group_weights,
         "weighted_mtf_loss_tolerance": config.weighted_mtf_loss_tolerance,
+        "directional_softmin_temperature": config.directional_softmin_temperature,
         "astigmatism_tolerance_D": config.astigmatism_tolerance_D,
     }
 
@@ -4028,6 +4185,9 @@ def _run_bound(
 
         stage_dir = output / f"stage_{control_count}x{control_count}"
         stage_dir.mkdir(parents=True, exist_ok=True)
+        effective_smooth_lambda = _effective_smooth_lambda(
+            control_count, config.smooth_lambda
+        )
         _write_json_atomic(
             stage_dir / "config.json",
             {
@@ -4038,6 +4198,7 @@ def _run_bound(
                 "is_terminal_stage": is_terminal_stage,
                 "minimum_steps": minimum_steps,
                 "maximum_steps": maximum_steps,
+                "smooth_lambda_effective": effective_smooth_lambda,
             },
         )
         optimizer = torch.optim.Adam([module.inner_q], lr=config.learning_rate)
@@ -4099,11 +4260,11 @@ def _run_bound(
             if control_count == 7 and parent_context is None:
                 # The 7x7 module is verified above to be the exact zero-residual
                 # Original PAL state.  Its fixed-tolerance group objectives were
-                # already measured above, so no duplicate 109-case pass is needed.
-                current = float(baseline_value)
+                # already measured above, so no duplicate 121-case pass is needed.
+                current_data = float(baseline_value)
                 health = dict(baseline_health)
             else:
-                current, _, health = _evaluate(
+                current_data, _, health = _evaluate(
                     model,
                     training_cases,
                     baseline,
@@ -4115,6 +4276,20 @@ def _run_bound(
                     progress_learning_rate=config.learning_rate,
                     progress_update="INITIAL",
                 )
+            with torch.no_grad():
+                bending_value = float(
+                    physical_bending_regularizer(
+                        module,
+                        zones["monitored"],
+                        curvature_scale_per_mm=config.smooth_curvature_scale_per_mm,
+                    ).detach().cpu()
+                )
+            current, health = _regularized_objective(
+                current_data,
+                health,
+                bending_value=bending_value,
+                effective_lambda=effective_smooth_lambda,
+            )
             stage_initial = current
             stage_initial_groups = _joint_metric_fields(current, health)
             best, best_state, best_health = (
@@ -4218,7 +4393,7 @@ def _run_bound(
                 )
                 module.zero_grad(set_to_none=True)
                 optimizer.param_groups[0]["lr"] = lr
-                current, _, health = _evaluate(
+                current_data, _, health = _evaluate(
                     model,
                     training_cases,
                     baseline,
@@ -4229,11 +4404,20 @@ def _run_bound(
                     progress_step=f"{step}/{maximum_steps}",
                     progress_learning_rate=lr,
                 )
-                smooth_loss_value = 0.0
-                if control_count == 19 and config.smooth_lambda > 0.0:
-                    smooth_loss = laplacian_regularizer(module)
-                    (float(config.smooth_lambda) * smooth_loss).backward()
-                    smooth_loss_value = float(smooth_loss.detach().cpu())
+                smooth_loss = physical_bending_regularizer(
+                    module,
+                    zones["monitored"],
+                    curvature_scale_per_mm=config.smooth_curvature_scale_per_mm,
+                )
+                if effective_smooth_lambda > 0.0:
+                    (effective_smooth_lambda * smooth_loss).backward()
+                smooth_loss_value = float(smooth_loss.detach().cpu())
+                current, health = _regularized_objective(
+                    current_data,
+                    health,
+                    bending_value=smooth_loss_value,
+                    effective_lambda=effective_smooth_lambda,
+                )
                 if module.inner_q.grad is None or not bool(torch.isfinite(module.inner_q.grad).all()):
                     raise RuntimeError("non-finite Adam gradient")
                 parameter_state = module.inner_q.detach().clone()
@@ -4299,7 +4483,7 @@ def _run_bound(
                     ):
                         reason = "prescription"
                         continue
-                    candidate, candidate_rows, candidate_health = _evaluate(
+                    candidate_data, candidate_rows, candidate_health = _evaluate(
                         model,
                         training_cases,
                         baseline,
@@ -4312,17 +4496,18 @@ def _run_bound(
                         progress_update="TRIAL",
                         print_progress=False,
                     )
-                    candidate_smooth_loss = (
-                        float(laplacian_regularizer(module).detach().cpu())
-                        if control_count == 19 and config.smooth_lambda > 0.0
-                        else 0.0
+                    candidate_smooth_loss = float(
+                        physical_bending_regularizer(
+                            module,
+                            zones["monitored"],
+                            curvature_scale_per_mm=config.smooth_curvature_scale_per_mm,
+                        ).detach().cpu()
                     )
-                    current_total_loss = (
-                        current + float(config.smooth_lambda) * smooth_loss_value
-                    )
-                    candidate_total_loss = (
-                        candidate
-                        + float(config.smooth_lambda) * candidate_smooth_loss
+                    candidate, candidate_health = _regularized_objective(
+                        candidate_data,
+                        candidate_health,
+                        bending_value=candidate_smooth_loss,
+                        effective_lambda=effective_smooth_lambda,
                     )
                     if (
                         candidate_health["minimum_valid_fraction_ratio"]
@@ -4331,8 +4516,8 @@ def _run_bound(
                         reason = "health"
                         continue
                     if (
-                        not math.isfinite(candidate_total_loss)
-                        or candidate_total_loss > current_total_loss
+                        not math.isfinite(candidate)
+                        or candidate > current
                     ):
                         reason = "objective"
                         continue
@@ -4342,6 +4527,7 @@ def _run_bound(
                         min(config.learning_rate, trial_lr * 1.1),
                     )
                     health = candidate_health
+                    smooth_loss_value = candidate_smooth_loss
                     break
                 if not accepted:
                     with torch.no_grad():
@@ -4398,8 +4584,11 @@ def _run_bound(
                         "learning_rate": lr,
                         "minimum_valid_fraction_ratio": health["minimum_valid_fraction_ratio"],
                         "maximum_edge_fraction": health["maximum_edge_fraction"],
-                        "smooth_laplacian": smooth_loss_value,
-                        "smooth_weighted_loss": float(config.smooth_lambda) * smooth_loss_value,
+                        "J_data": float(health["J_data"]),
+                        "J_total": float(health["J_total"]),
+                        "smooth_bending": smooth_loss_value,
+                        "smooth_lambda_effective": effective_smooth_lambda,
+                        "smooth_weighted_loss": effective_smooth_lambda * smooth_loss_value,
                         "minimum_steps": minimum_steps,
                         "maximum_steps": maximum_steps,
                         "actual_steps": step,
@@ -4617,13 +4806,29 @@ def _run_bound(
         )
 
     write_state("final_training_evaluation")
-    final_value, _, final_health = _evaluate(
+    final_data_value, _, final_health = _evaluate(
         model,
         training_cases,
         baseline,
         with_grad=False,
         baseline_valid=baseline_valid,
         **objective_options,
+    )
+    final_bending_value = float(
+        physical_bending_regularizer(
+            module,
+            zones["monitored"],
+            curvature_scale_per_mm=config.smooth_curvature_scale_per_mm,
+        ).detach().cpu()
+    )
+    final_effective_lambda = _effective_smooth_lambda(
+        int(module.control_shape[0]), config.smooth_lambda
+    )
+    final_value, final_health = _regularized_objective(
+        final_data_value,
+        final_health,
+        bending_value=final_bending_value,
+        effective_lambda=final_effective_lambda,
     )
     coord = torch.linspace(
         -power_config.semi_diameter_mm,
@@ -4672,8 +4877,10 @@ def _run_bound(
         "objective_name": final_health["objective_name"],
         "group_weights": dict(config.group_weights),
         "weighted_mtf_loss_tolerance": config.weighted_mtf_loss_tolerance,
+        "directional_softmin_temperature": config.directional_softmin_temperature,
         "astigmatism_tolerance_D": config.astigmatism_tolerance_D,
         "smooth_lambda": config.smooth_lambda,
+        "smooth_curvature_scale_per_mm": config.smooth_curvature_scale_per_mm,
         "training_case_count": len(training_cases),
         "training_groups": {
             name: sum(row["training_group"] == name for row in training_cases)

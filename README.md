@@ -60,8 +60,12 @@ python -m biot.gui
   不改变物理面形的精确 knot refinement。patience 从 terminal 第一步累计，最低
   配额前不允许 early stop；连续 7 个 attempt 未使 best 相对改善严格超过
   `1e-3` 时停止。
-- 109 个 case 分为 9 组：Far 28、Corridor upper/middle/lower 各 5、
-  Near 20、Near-robustness 8、Near-edge-astig 8、Peripheral-left/right 各 15。
+- 121 个 case 分为 9 组：Far 28、Corridor upper/middle/lower 各 5、
+  Near 28、Near-robustness 12、Near-edge-astig 8、Peripheral-left/right 各 15。
+  Near 与 Near-robustness 按 `field_y >= -40°` 的 core 和 `< -40°` 的 deep
+  分层；Near forward/final 为 core `24/8`、deep `56/20`，Near-robustness
+  forward/final 为 core `8/4`、deep `24/8`。Near-edge 保持
+  `|lens_x| > 10 mm` 的 8 个独立边缘 case。
 - 420-case WFNO 合格池的最终固定数量选择保持各自 `training_group`，并在不改变
   覆盖门槛和各组数量的前提下做 coverage-constrained 选择；确定性选择无法通过时失败关闭。
   phase 进度使用 `training_group/candidate_id/distance/field` 稳定源键，不依赖每轮
@@ -72,19 +76,25 @@ python -m biot.gui
   离线 PSF 不参与反传。七个真实追迹功能组都直接使用归一化物理 FFT PSF 的
   Ahumada weighted-MTF loss；Zernike 仅保留为诊断量，不参与该分支目标。
 - 两个分支统一使用 `legacy_pupil_phase=False`、`phase_reference="biot_reference_sphere"` 和 `remove_tilt=False`；训练 loss、健康检查和梯度均直接基于原始 `512×512` 物理 FFT PSF 及其物理像素间距。`130×130` crop/render 仅用于评价数据库与拼接显示。
-- 默认 pupil 采样为 `np=256`、FFT 为 `512`；79 个功能 case 按
+- 默认 pupil 采样为 `np=256`、FFT 为 `512`；91 个功能 case 按
   `case_batch_size=8` 做 GPU tensor 追迹和 FFT，30 个周边 case 保持原来的
   `surface_only` A_D 目标且不做光线追迹；不因 OOM 自动缩小 batch。
 - 训练输出统一包含 `stage`、`step`、`batch`、`loss`、`update` 和 `lr`；每个 run 的 `training.log` 持久化同样的进度摘要，中断时追加异常信息，各阶段仍保留结构化 `history.csv`。
 - 追迹失败保持失败关闭，由当前 run 的资格筛选进度记录错误；底层追迹不在项目根目录自动导出 `wrong_result` Excel。
-- `J=sum(group_weight*group_mean)`，9 组权重显式且和为 1。七个真实追迹功能组
+- `J=sum(group_weight*spatial_weight*case_metric)`，9 组权重显式且和为 1。
+  功能组在合格候选凸包内按固定物理网格的 Voronoi/最近邻覆盖面积加权；
+  peripheral 保持组内等权。七个真实追迹功能组
   使用与正式评价一致的 Ahumada weighted-MTF loss，并统一除以固定的 `0.10`
   无量纲容差；左右 peripheral 继续使用对应区平均 A_D 与固定 `0.80 D` 容差，
   保持 `surface_only` 且不做光线追迹。Original PAL baseline 不参与 loss 分母，
   只用于健康比例、改善率和审计。
 - 每个新 run 在 Original PAL 7×7 和 `stage_7x7/final.pt` 保存九组梯度范数、
   两两余弦及与总梯度余弦；产物位于 `gradient_diagnostics/` 并绑定 run/checkpoint 哈希。
-- 19×19 阶段额外使用 `smooth_lambda=0.05` 的控制点归一化二阶差分正则。
+- 功能质量同时计算 `0°/45°/90°/135°` 四方向 Ahumada weighted-MTF，并用
+  归一化 soft-min 聚合；legacy mean 仅保留用于兼容和报告。
+- 面形平滑使用 monitored mask 内 81×81 物理网格的 Hessian bending energy。
+  7×7 阶段只记录且权重为零；11×11/19×19 阶段按配置的 `smooth_lambda`
+  生效。该项直接参与可微目标，不是控制点后处理或显示滤波。
 - 约束包括 trace/PSF health、`P_far`、`ADD`、下缘监管带相对 Original PAL 的
   最大光焦度/像散变化和单步 sag trust region。
 - 不自动运行历史 192-case posthoc 或 SSIM 链；PSF 数据库、weighted MTF、PSF stitch 和 chart stitch 仅在正式评价入口中运行。
@@ -162,13 +172,15 @@ python run_pal_nurbs.py `
   --max-extra-terminal-stage-steps 30 `
   --weighted-mtf-loss-tolerance 0.10 `
   --astigmatism-tolerance-D 0.80 `
-  --smooth-lambda 0.05
+  --smooth-lambda 0.05 `
+  --smooth-curvature-scale-per-mm 1e-4 `
+  --directional-softmin-temperature 0.02
 ```
 
 该示例最低训练 50 个 attempt，最多训练 80 个 attempt。terminal stage 每个 attempt
 完成后先原子保存 resume/history，再按 early stopping、学习率下限和额外预算
 顺序判断；最低预算前若学习率跌破下限，则 run 失败且不写成功 `summary.json`。
-后续零预算阶段只做精确 refinement；最终 19×19 表示完成 109-case 无梯度复核后
+后续零预算阶段只做精确 refinement；最终 19×19 表示完成 121-case 无梯度复核后
 才标记 complete。`summary.json` 显式记录 terminal control count、terminal extra
 attempt 数及其停止原因。
 

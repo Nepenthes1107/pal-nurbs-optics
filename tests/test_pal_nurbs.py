@@ -45,7 +45,12 @@ from biot.e2e.regional_nurbs import FixedWeightNURBSPerturbation
 
 def _nine_group_cases() -> list[dict[str, object]]:
     return [
-        {"case_id": f"case_{index:02d}", "training_group": group, "scale": float(index)}
+        {
+            "case_id": f"case_{index:02d}",
+            "training_group": group,
+            "scale": float(index),
+            "spatial_weight": 1.0,
+        }
         for index, group in enumerate(
             pal_nurbs.FUNCTIONAL_GROUPS + pal_nurbs.PERIPHERAL_GROUPS,
             start=1,
@@ -229,6 +234,7 @@ def _make_completed_parent_fixture(
             "objective_config": {
                 "group_weights": config.group_weights,
                 "weighted_mtf_loss_tolerance": config.weighted_mtf_loss_tolerance,
+                "directional_softmin_temperature": config.directional_softmin_temperature,
                 "astigmatism_tolerance_D": config.astigmatism_tolerance_D,
             },
             "baseline_power": {"P_far_D": 0.0, "ADD_D": 0.0},
@@ -558,7 +564,7 @@ def test_parent_fork_run_uses_parent_best_and_preserves_parent(
         lambda config, device: (
             torch.zeros((5, 5), dtype=torch.float64),
             PALPowerConfig(40.0, 1.5, 100.0, 5.0),
-            {},
+                {"monitored": torch.ones((81, 81), dtype=torch.bool)},
         ),
     )
 
@@ -1065,10 +1071,12 @@ def test_startup_cases_backward_immediately_and_match_summed_loss_gradient() -> 
     summed_module = FixedWeightNURBSPerturbation(7, device="cpu", dtype=torch.float64)
     summed_model = Model(summed_module, record_events=False)
     summed_loss = sum(
-        1.0 - pal_nurbs.weighted_mtf_mean_torch_batch(
+        1.0
+        - pal_nurbs.weighted_mtf_directional_torch_batch(
             summed_model.field(case).kernel.unsqueeze(0),
             pixel_pitch_mm=torch.tensor([0.001], dtype=torch.float64),
-        ).sum()
+            softmin_temperature=config.directional_softmin_temperature,
+        )[1].sum()
         for case in cases
     )
     summed_loss.backward()
@@ -1202,9 +1210,10 @@ def test_group_gradient_diagnostic_reports_norms_cosines_and_preserves_state() -
         label="test",
         identity_sha256="identity",
         checkpoint_sha256="checkpoint",
-        group_weights=pal_nurbs.DEFAULT_GROUP_WEIGHTS,
-        weighted_mtf_loss_tolerance=0.10,
-        astigmatism_tolerance_D=0.80,
+            group_weights=pal_nurbs.DEFAULT_GROUP_WEIGHTS,
+            weighted_mtf_loss_tolerance=0.10,
+            directional_softmin_temperature=0.02,
+            astigmatism_tolerance_D=0.80,
     )
     assert payload["group_order"] == list(
         pal_nurbs.FUNCTIONAL_GROUPS + pal_nurbs.PERIPHERAL_GROUPS
@@ -1932,7 +1941,7 @@ def test_interrupted_training_resume_matches_uninterrupted_adam_state(
         lambda config, device: (
             torch.zeros((5, 5), dtype=torch.float64),
             PALPowerConfig(40.0, 1.5, 100.0, 5.0),
-            {},
+                {"monitored": torch.ones((81, 81), dtype=torch.bool)},
         ),
     )
 

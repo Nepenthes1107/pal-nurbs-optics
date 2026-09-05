@@ -44,7 +44,7 @@ def main() -> int:
         "--baseline-state-import",
         default=None,
         help=(
-            "导入已完成的 Original PAL 109-case baseline 状态；源文件哈希进入新 run identity，"
+            "导入已完成的 Original PAL 121-case baseline 状态；源文件哈希进入新 run identity，"
             "导入后仍严格校验 case IDs、7x7 零 residual 与 baseline schema"
         ),
     )
@@ -90,7 +90,19 @@ def main() -> int:
         "--smooth-lambda",
         type=float,
         default=MinimalConfig.smooth_lambda,
-        help="仅在 19x19 阶段启用的 NURBS 归一化二阶差分权重",
+        help="11x11/19x19 阶段物理 Hessian 弯曲能权重；7x7 仅记录诊断",
+    )
+    parser.add_argument(
+        "--smooth-curvature-scale-per-mm",
+        type=float,
+        default=MinimalConfig.smooth_curvature_scale_per_mm,
+        help="物理 Hessian 弯曲能的固定曲率归一化尺度（mm^-1）",
+    )
+    parser.add_argument(
+        "--directional-softmin-temperature",
+        type=float,
+        default=MinimalConfig.directional_softmin_temperature,
+        help="四方向 Ahumada weighted-MTF 归一化 soft-min 温度（无量纲）",
     )
     parser.add_argument(
         "--weighted-mtf-loss-tolerance",
@@ -125,6 +137,8 @@ def main() -> int:
         relative_improvement_threshold=args.relative_improvement_threshold,
         max_extra_terminal_stage_steps=args.max_extra_terminal_stage_steps,
         smooth_lambda=args.smooth_lambda,
+        smooth_curvature_scale_per_mm=args.smooth_curvature_scale_per_mm,
+        directional_softmin_temperature=args.directional_softmin_temperature,
         weighted_mtf_loss_tolerance=args.weighted_mtf_loss_tolerance,
         astigmatism_tolerance_D=args.astigmatism_tolerance_D,
         candidate_trace_import=args.candidate_trace_import,

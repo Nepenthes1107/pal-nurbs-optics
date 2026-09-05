@@ -20,13 +20,22 @@ TRAINING_GROUP_COUNTS = {
     "corridor_upper": 5,
     "corridor_middle": 5,
     "corridor_lower": 5,
-    "near": 20,
-    "near_robustness": 8,
+    "near": 28,
+    "near_robustness": 12,
     "near_edge_astig": 8,
     "peripheral_left": 15,
     "peripheral_right": 15,
 }
 TOTAL_TRAINING_CASES = sum(TRAINING_GROUP_COUNTS.values())
+NEAR_CORE_FIELD_Y_DEG = -40.0
+TRAINING_NEAR_STRATUM_COUNTS = {
+    "near": {"core": 8, "deep": 20},
+    "near_robustness": {"core": 4, "deep": 8},
+}
+FORWARD_NEAR_STRATUM_COUNTS = {
+    "near": {"core": 24, "deep": 56},
+    "near_robustness": {"core": 8, "deep": 24},
+}
 PERIPHERAL_BAND_COUNTS = {"upper": 4, "middle": 5, "lower": 6}
 PERIPHERAL_REAR_MIRROR_TOLERANCE_MM = 1.0e-4
 REFERENCE_RETRACE_TOLERANCE_MM = 1.0e-8
@@ -414,9 +423,56 @@ def _fps_indices(
     return selected
 
 
+def _physical_xy(row: Mapping[str, Any]) -> tuple[float, float]:
+    """Use assigned-distance rear coordinates when qualification has produced them."""
+    x_name = "case_lens_x_mm" if row.get("case_lens_x_mm") is not None else "reference_lens_x_mm"
+    y_name = (
+        "case_lens_physical_y_mm"
+        if row.get("case_lens_physical_y_mm") is not None
+        else "reference_lens_physical_y_mm"
+    )
+    point = float(row[x_name]), float(row[y_name])
+    if not all(math.isfinite(value) for value in point):
+        raise ValueError("case spatial coordinates must be finite")
+    return point
+
+
 def _fps_rows(rows: Sequence[Mapping[str, Any]], count: int, seed_target: Sequence[float] | None = None) -> list[dict[str, Any]]:
-    points = np.asarray([[row["reference_lens_x_mm"], row["reference_lens_physical_y_mm"]] for row in rows], dtype=np.float64)
+    points = np.asarray([_physical_xy(row) for row in rows], dtype=np.float64)
     return [dict(rows[index]) for index in _fps_indices(points, count, seed_target)]
+
+
+def _near_stratum_counts(group: str, count: int) -> Mapping[str, int]:
+    contracts = (
+        TRAINING_NEAR_STRATUM_COUNTS,
+        FORWARD_NEAR_STRATUM_COUNTS,
+    )
+    for contract in contracts:
+        if group in contract and sum(contract[group].values()) == int(count):
+            return contract[group]
+    raise ValueError(
+        f"unsupported {group} count {count}; no sealed core/deep sampling contract"
+    )
+
+
+def _select_near_stratified(
+    rows: Sequence[Mapping[str, Any]], *, group: str, count: int,
+) -> list[dict[str, Any]]:
+    strata = _near_stratum_counts(group, count)
+    core = [row for row in rows if float(row["field_y_deg"]) >= NEAR_CORE_FIELD_Y_DEG]
+    deep = [row for row in rows if float(row["field_y_deg"]) < NEAR_CORE_FIELD_Y_DEG]
+    selected: list[dict[str, Any]] = []
+    for name, members in (("core", core), ("deep", deep)):
+        required = int(strata[name])
+        if len(members) < required:
+            raise ValueError(
+                f"insufficient {group} {name} candidates: {len(members)} < {required}"
+            )
+        selected.extend(
+            {**row, "near_spatial_stratum": name}
+            for row in _fps_rows(members, required)
+        )
+    return selected
 
 
 def _nearest_neighbour_p95_mm(rows: Sequence[Mapping[str, Any]]) -> float:
@@ -490,6 +546,36 @@ def _select_corridor_stratum(
     pfar: float,
     zones_payload: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
+    members = _corridor_stratum_rows(
+        rows,
+        add_min_D=add_min_D,
+        add_max_D=add_max_D,
+        include_upper=include_upper,
+        power_map=power_map,
+        pfar=pfar,
+        zones_payload=zones_payload,
+    )
+    if len(members) < int(count):
+        raise ValueError(
+            f"insufficient eligible corridor candidates in ADD [{add_min_D:g},{add_max_D:g}] D: "
+            f"{len(members)} < {count}"
+        )
+    seed_y = float(np.median([
+        float(row["reference_lens_physical_y_mm"]) for row in members
+    ]))
+    return _fps_rows(members, int(count), (0.0, seed_y))
+
+
+def _corridor_stratum_rows(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    add_min_D: float,
+    add_max_D: float,
+    include_upper: bool,
+    power_map: np.ndarray,
+    pfar: float,
+    zones_payload: Mapping[str, Any],
+) -> list[dict[str, Any]]:
     members: list[dict[str, Any]] = []
     for source in rows:
         local_add, distance = _corridor_add_and_distance(
@@ -502,15 +588,7 @@ def _select_corridor_stratum(
                 "corridor_local_add_D": local_add,
                 "distance_mm": distance,
             })
-    if len(members) < int(count):
-        raise ValueError(
-            f"insufficient eligible corridor candidates in ADD [{add_min_D:g},{add_max_D:g}] D: "
-            f"{len(members)} < {count}"
-        )
-    seed_y = float(np.median([
-        float(row["reference_lens_physical_y_mm"]) for row in members
-    ]))
-    return _fps_rows(members, int(count), (0.0, seed_y))
+    return members
 
 
 def _peripheral_pairs(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -589,6 +667,108 @@ def _select_peripheral(
     return selected
 
 
+def _convex_hull_points(points: np.ndarray) -> np.ndarray:
+    unique = sorted({(float(point[0]), float(point[1])) for point in points})
+    if len(unique) < 3:
+        raise ValueError("spatial-weight domain needs at least three unique points")
+
+    def cross(
+        origin: tuple[float, float],
+        first: tuple[float, float],
+        second: tuple[float, float],
+    ) -> float:
+        return (
+            (first[0] - origin[0]) * (second[1] - origin[1])
+            - (first[1] - origin[1]) * (second[0] - origin[0])
+        )
+
+    lower: list[tuple[float, float]] = []
+    for point in unique:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], point) <= 0.0:
+            lower.pop()
+        lower.append(point)
+    upper: list[tuple[float, float]] = []
+    for point in reversed(unique):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], point) <= 0.0:
+            upper.pop()
+        upper.append(point)
+    hull = np.asarray(lower[:-1] + upper[:-1], dtype=np.float64)
+    if hull.shape[0] < 3:
+        raise ValueError("spatial-weight candidate hull is degenerate")
+    return hull
+
+
+def _inside_convex_hull(points: np.ndarray, hull: np.ndarray) -> np.ndarray:
+    edges = np.roll(hull, -1, axis=0) - hull
+    offsets = points[:, None, :] - hull[None, :, :]
+    cross = (
+        edges[None, :, 0] * offsets[:, :, 1]
+        - edges[None, :, 1] * offsets[:, :, 0]
+    )
+    return np.all(cross >= -1.0e-9, axis=1)
+
+
+def _assign_group_spatial_weights(
+    selected: Sequence[Mapping[str, Any]],
+    source_rows: Sequence[Mapping[str, Any]],
+    *,
+    zones_payload: Mapping[str, Any],
+    mask_name: str,
+    minimum_abs_x_mm: float | None = None,
+) -> list[dict[str, Any]]:
+    """Integrate one group's Voronoi cells on the fixed physical mask grid."""
+    if not selected or not source_rows:
+        raise ValueError("spatial weighting requires selected and source cases")
+    x, y, masks = _zone_arrays(zones_payload)
+    if mask_name not in masks:
+        raise ValueError(f"zones do not define spatial-weight mask {mask_name}")
+    source_points = np.asarray([_physical_xy(row) for row in source_rows], dtype=np.float64)
+    selected_points = np.asarray([_physical_xy(row) for row in selected], dtype=np.float64)
+    hull = _convex_hull_points(source_points)
+    iy, ix = np.nonzero(masks[mask_name])
+    grid_points = np.column_stack((x[ix], y[iy])).astype(np.float64, copy=False)
+    inside = _inside_convex_hull(grid_points, hull)
+    if minimum_abs_x_mm is not None:
+        inside &= np.abs(grid_points[:, 0]) > float(minimum_abs_x_mm)
+    integration_points = grid_points[inside]
+    if integration_points.shape[0] < len(selected):
+        raise ValueError(
+            f"{mask_name} qualified hull contains too few physical integration cells: "
+            f"{integration_points.shape[0]} < {len(selected)}"
+        )
+    squared = np.square(
+        integration_points[:, None, :] - selected_points[None, :, :]
+    ).sum(axis=2)
+    owners = np.argmin(squared, axis=1)
+    counts = np.bincount(owners, minlength=len(selected))
+    if np.any(counts <= 0):
+        missing = np.flatnonzero(counts <= 0).tolist()
+        raise ValueError(
+            f"{mask_name} selected cases own no 1 mm physical cells: {missing}"
+        )
+    pitch_x = float(np.median(np.abs(np.diff(x))))
+    pitch_y = float(np.median(np.abs(np.diff(y))))
+    cell_area = pitch_x * pitch_y
+    total = int(counts.sum())
+    coordinate_source = (
+        "case_lens_assigned_distance"
+        if all(row.get("case_lens_x_mm") is not None for row in source_rows)
+        else "reference_lens"
+    )
+    return [
+        {
+            **dict(row),
+            "spatial_weight": float(counts[index] / total),
+            "spatial_voronoi_cell_count": int(counts[index]),
+            "spatial_voronoi_area_mm2": float(counts[index] * cell_area),
+            "spatial_weight_domain_cell_count": total,
+            "spatial_weight_method": "qualified_hull_physical_grid_voronoi",
+            "spatial_weight_coordinate_source": coordinate_source,
+        }
+        for index, row in enumerate(selected)
+    ]
+
+
 def select_training_cases(
     traced_candidates: Sequence[Mapping[str, Any]], *,
     far_object_distance_mm: float, intermediate_object_distance_mm: float,
@@ -644,6 +824,25 @@ def select_training_cases(
     near_rows = source_rows("near", "near")
     near_robustness_rows = source_rows("near_robustness", "near")
     near_edge_astig_rows = source_rows("near_edge_astig", "near")
+    corridor_upper_domain = _corridor_stratum_rows(
+        corridor_upper_rows,
+        add_min_D=0.2, add_max_D=0.5, include_upper=False,
+        power_map=power_map, pfar=pfar, zones_payload=zones_payload,
+    )
+    corridor_middle_domain = _corridor_stratum_rows(
+        corridor_middle_rows,
+        add_min_D=0.5, add_max_D=1.3, include_upper=False,
+        power_map=power_map, pfar=pfar, zones_payload=zones_payload,
+    )
+    corridor_lower_domain = _corridor_stratum_rows(
+        corridor_lower_rows,
+        add_min_D=1.3, add_max_D=2.0, include_upper=True,
+        power_map=power_map, pfar=pfar, zones_payload=zones_payload,
+    )
+    near_edge_domain = [
+        row for row in near_edge_astig_rows
+        if abs(float(row["reference_lens_x_mm"])) > 10.0
+    ]
     groups: dict[str, list[dict[str, Any]]] = {
         "far": _fps_rows(far_rows, resolved_counts["far"]),
         "corridor_upper": _select_corridor_stratum(
@@ -661,15 +860,16 @@ def select_training_cases(
             add_min_D=1.3, add_max_D=2.0, include_upper=True,
             power_map=power_map, pfar=pfar, zones_payload=zones_payload,
         ),
-        "near": _fps_rows(near_rows, resolved_counts["near"]),
-        "near_robustness": _fps_rows(
-            near_robustness_rows, resolved_counts["near_robustness"]
+        "near": _select_near_stratified(
+            near_rows, group="near", count=resolved_counts["near"],
+        ),
+        "near_robustness": _select_near_stratified(
+            near_robustness_rows,
+            group="near_robustness",
+            count=resolved_counts["near_robustness"],
         ),
         "near_edge_astig": _fps_rows(
-            [
-                row for row in near_edge_astig_rows
-                if abs(float(row["reference_lens_x_mm"])) > 10.0
-            ],
+            near_edge_domain,
             resolved_counts["near_edge_astig"],
             (12.0, -28.0),
         ),
@@ -700,6 +900,33 @@ def select_training_cases(
             mask_name="far",
             zones_payload=zones_payload,
         )
+    source_domains = {
+        "far": far_rows,
+        "corridor_upper": corridor_upper_domain,
+        "corridor_middle": corridor_middle_domain,
+        "corridor_lower": corridor_lower_domain,
+        "near": near_rows,
+        "near_robustness": near_robustness_rows,
+        "near_edge_astig": near_edge_domain,
+    }
+    for group in FUNCTIONAL_GROUPS:
+        groups[group] = _assign_group_spatial_weights(
+            groups[group],
+            source_domains[group],
+            zones_payload=zones_payload,
+            mask_name=GROUP_TO_ZONE[group],
+            minimum_abs_x_mm=(10.0 if group == "near_edge_astig" else None),
+        )
+    for group in PERIPHERAL_GROUPS:
+        groups[group] = [
+            {
+                **row,
+                "spatial_weight": 1.0 / len(groups[group]),
+                "spatial_weight_method": "surface_only_equal",
+                "spatial_weight_coordinate_source": "reference_lens",
+            }
+            for row in groups[group]
+        ]
     group_distance = {
         "far": far_object_distance_mm,
         "near": near_object_distance_mm,
@@ -1418,6 +1645,29 @@ def _validate_selected_case_geometry(
             float(case["reference_lens_x_mm"])
         ) <= 10.0:
             raise ValueError(f"{case['case_id']} violates near-edge |x| > 10 mm")
+    for group, expected in TRAINING_NEAR_STRATUM_COUNTS.items():
+        actual = {
+            name: sum(
+                case.get("training_group") == group
+                and case.get("near_spatial_stratum") == name
+                for case in cases
+            )
+            for name in ("core", "deep")
+        }
+        if actual != expected:
+            raise ValueError(
+                f"{group} core/deep counts are {actual}, expected {expected}"
+            )
+    for group in TRAINING_GROUP_COUNTS:
+        spatial = [
+            float(case.get("spatial_weight", math.nan))
+            for case in cases
+            if case.get("training_group") == group
+        ]
+        if any(not math.isfinite(value) or value <= 0.0 for value in spatial):
+            raise ValueError(f"{group} spatial weights must be finite and positive")
+        if not math.isclose(sum(spatial), 1.0, rel_tol=0.0, abs_tol=1.0e-12):
+            raise ValueError(f"{group} spatial weights must sum to 1")
     for group in PERIPHERAL_GROUPS:
         for band, expected_count in PERIPHERAL_BAND_COUNTS.items():
             actual_count = sum(
@@ -1670,7 +1920,7 @@ def write_preoptimization_artifacts(
         )
 
     manifest = {
-        "schema_version": 9,
+        "schema_version": 10,
         "purpose": f"pal_nurbs_dense_field_fps_{TOTAL_TRAINING_CASES}_case_contract",
         "source": {
             "excel": {"path": str(excel_path), "sha256": _sha256_file(excel_path)},
@@ -1680,9 +1930,9 @@ def write_preoptimization_artifacts(
         "sampling_contract": dict(sampling_contract),
         "objective_contract": {
             "denominator": "fixed physical tolerance for each metric type",
-            "metrics": "seven traced functional groups=Ahumada weighted-MTF loss; peripheral=surface-only A_D",
-            "J": "sum(group_weight * mean(fixed-tolerance normalized score))",
-            "aggregation_order": "mean within each of nine groups before explicit group weighting",
+            "metrics": "seven traced functional groups=four-direction robust Ahumada weighted-MTF loss; peripheral=surface-only A_D",
+            "J": "sum(group_weight * physical-area-weighted fixed-tolerance score)",
+            "aggregation_order": "Voronoi area integration within each group before explicit group weighting",
         },
         "coverage_audit": {
             "path": str(coverage_json.resolve()),

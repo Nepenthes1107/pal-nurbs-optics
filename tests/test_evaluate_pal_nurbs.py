@@ -93,11 +93,18 @@ def test_weighted_mtf_stage_adds_interpolated_pngs_to_manifest(
 
     monkeypatch.setattr(
         evaluator,
-        "_weighted_mtf",
-        lambda psf, pitch: (
-            np.asarray([0.0, 0.0, 0.2 + 0.005 * float(psf[0, 0])]),
-            np.ones(2),
-            np.ones(2),
+        "_directional_weighted_mtf",
+        lambda psf, pitch, *, softmin_temperature: (
+            np.asarray(
+                [
+                    0.2 + 0.005 * float(psf[0, 0]),
+                    0.19 + 0.005 * float(psf[0, 0]),
+                    0.18 + 0.005 * float(psf[0, 0]),
+                    0.17 + 0.005 * float(psf[0, 0]),
+                ]
+            ),
+            0.17 + 0.005 * float(psf[0, 0]),
+            np.ones((4, 2)),
         ),
     )
 
@@ -108,7 +115,7 @@ def test_weighted_mtf_stage_adds_interpolated_pngs_to_manifest(
     monkeypatch.setattr(evaluator, "_plot_interpolated_weighted_mtf_map", write_plot)
     evaluator._run_weighted_mtf(
         tmp_path,
-        config=SimpleNamespace(),
+        config=SimpleNamespace(directional_softmin_temperature=0.02),
         identity_sha256="identity",
         database_sha256="database",
     )
@@ -131,7 +138,7 @@ def test_weighted_mtf_stage_adds_interpolated_pngs_to_manifest(
         "extrapolation": False,
         "native_nodes_preserved_abs_tolerance": 1.0e-12,
     }
-    assert len(manifest["files"]) == 27
+    assert len(manifest["files"]) == 108
 
 
 def test_evaluation_grid_has_three_distances_and_81_fields() -> None:

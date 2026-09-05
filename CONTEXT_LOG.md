@@ -1,6 +1,6 @@
 # 当前工程状态
 
-更新时间：2026-09-03。
+更新时间：2026-09-05。
 
 ## 当前主线
 
@@ -14,10 +14,16 @@
 - 新实验输出：`results/optimization/run_001`、`run_002`，依次递增。
 - 历史证据：`results/archive/`，不进入 Git，也不参与新实验身份。
 - 当前入口：`run_pal_nurbs.py`；PAL 实现位于 `biot/e2e/pal_nurbs.py` 和 `biot/e2e/pal_case_layout.py`。
-- 当前 weighted-MTF 目标分支使用 9 组 109 case：Far 28、Corridor 三组各 5、Near 20、
-  Near-robustness 8、Near-edge-astig 8、Peripheral 左右各 15；79 个功能 case 使用
+- 当前方法身份为 `pal_121case_7functional_4dir_softmin_mtf_physical_bending_v1`。
+  目标分支使用 9 组 121 case：Far 28、Corridor 三组各 5、Near 28、
+  Near-robustness 12、Near-edge-astig 8、Peripheral 左右各 15；91 个功能 case 使用
   GPU tensor 真实追迹和物理 FFT PSF，30 个 peripheral case 保持 `surface_only` A_D
   且不做光线追迹。默认 `case_batch_size=8`、`requested_np=256`、FFT `512`，不做 OOM 自动降级。
+- Near 与 Near-robustness 使用 core/deep 分层；Near forward/final 为
+  core `24/8`、deep `56/20`，Near-robustness forward/final 为 core `8/4`、
+  deep `24/8`。Near-edge 保持 `|lens_x|>10 mm` 的 8-case 独立边缘采样。
+  功能组使用合格候选凸包内固定物理网格的 Voronoi/最近邻面积权重，peripheral
+  保持 surface-only 等权。
 - `main` 的分阶段训练输出统一显示 `stage/step/batch/loss/update/lr`，并写入 run 根目录 `training.log`；各阶段 `history.csv` 和 resume checkpoint 继续作为结构化恢复依据。
 - `--steps S7 S11 S19` 定义三个阶段的最低训练预算，最后一个非零阶段为 terminal
   stage；此前阶段严格完成固定 attempt 数，terminal 才使用 patience、严格相对
@@ -27,7 +33,7 @@
 - terminal 每次 attempt 后先原子保存 resume/history，再依次判断 early stopping、
   学习率下限和额外预算。最低预算前学习率跌破下限会将 run 标为 failed 且不写
   成功 summary；完成后后续零预算阶段只做精确 refinement，再以最终 19×19 表示
-  做完整 109-case 无梯度复核。summary 显式记录 terminal control count、extra
+  做完整 121-case 无梯度复核。summary 显式记录 terminal control count、extra
   attempt 数和 terminal 停止原因。
 - 已完成父 run 可通过 `--parent-run` 和 `--start-stage 7|11|19` 分叉为新
   child identity；合法起点必须不早于父 terminal。child `--steps` 只统计新增
@@ -47,6 +53,11 @@
   Near-robustness 仍使用 D1000。七个真实追迹功能组的目标统一为 Ahumada
   weighted-MTF loss；左右 peripheral 像散区保持原来的 `surface_only` A_D 目标，
   不做光线追迹。
+- 七个功能组使用 `0°/45°/90°/135°` 四方向 Ahumada weighted-MTF 和归一化
+  soft-min；legacy mean 仅用于兼容和报告。面形平滑使用 monitored mask 内
+  81×81 物理网格 Hessian bending energy，7×7 只记录，11×11/19×19 按
+  `smooth_lambda` 生效；新增 CLI `--smooth-curvature-scale-per-mm` 和
+  `--directional-softmin-temperature`。
   已完成旧 run 保持历史训练身份，不原位改写。
 - `main` 与多物距分支均显式固定 `legacy_pupil_phase=False`、`phase_reference="biot_reference_sphere"`、`remove_tilt=False`；相位/PSF 表示变化已提升 run、case-layout 和 baseline schema，旧 checkpoint 不可按新合同恢复。
 - `evaluate_pal_nurbs.py` 在 `<run>/evaluation` 生成独立评价身份；三物距×双状态
@@ -85,6 +96,10 @@
 - 外置 Git 恢复备份仍保留在 `D:\VSCODE\端到端光学设计_git_backup_20260826.tar.zst`。
 
 ## 有效合同与限制
+
+- 本次 121-case/四方向/物理平滑改造的定向验证为 weighted-MTF `2 passed`、
+  PAL/case-layout `81 passed`、evaluator `19 passed`；完整测试为 `227 passed`。
+  未执行正式训练或正式评价，因此不形成新的光学收益结论。
 
 - 训练 case 数量固定为 28/5/5/5/20/8/8/15/15，权重为
   0.24/0.07/0.10/0.11/0.18/0.02/0.04/0.12/0.12。七个功能组全部使用与评价

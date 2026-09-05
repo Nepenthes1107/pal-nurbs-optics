@@ -74,11 +74,23 @@ def _candidate(candidate_id: str, zone: str, fx: float, fy: float, x: float, y: 
 
 def _traced_candidates() -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
-    for zone, y0 in (("far", 20.0), ("near", -22.0)):
-        for iy, y in enumerate((y0 - 6, y0 - 2, y0 + 2, y0 + 6)):
+    for iy, y in enumerate((14.0, 18.0, 22.0, 26.0)):
+        for ix, x in enumerate((-12.0, -8.0, -4.0, 0.0, 4.0, 8.0, 12.0)):
+            rows.append(_candidate(f"far_{iy}_{ix}", "far", x, y, x, y))
+    near_rows = (
+        ((-30.0, -14.0), (-35.0, -18.0), (-39.0, -21.0)),
+        ((-43.0, -23.0), (-47.0, -25.0), (-51.0, -27.0),
+         (-55.0, -29.0), (-57.0, -30.0)),
+    )
+    for stratum, definitions in zip(("core", "deep"), near_rows):
+        for iy, (field_y, lens_y) in enumerate(definitions):
             for ix, x in enumerate((-12.0, -8.0, -4.0, 0.0, 4.0, 8.0, 12.0)):
-                rows.append(_candidate(f"{zone}_{iy}_{ix}", zone, x, y, x, y))
-    for iy, y in enumerate((-10.0, -6.0, -2.0)):
+                rows.append(
+                    _candidate(
+                        f"near_{stratum}_{iy}_{ix}", "near", x, field_y, x, lens_y
+                    )
+                )
+    for iy, y in enumerate((-12.0, -11.0, -10.0, -9.0, -7.0, -5.0, -3.0, -2.0, 0.0)):
         for x in (-8.0, -4.0, 0.0, 4.0, 8.0):
             rows.append(_candidate(f"mid_{iy}_{x}", "corridor", x, y, x, y))
     for band, y_values in (
@@ -211,11 +223,33 @@ def test_candidate_trace_progress_path_is_identity_without_content_hash(tmp_path
         )
 
 
-def test_selects_fixed_109_cases_with_stratified_corridor_and_mirrored_peripheral() -> None:
+def test_selects_fixed_121_cases_with_stratified_corridor_near_and_mirrored_peripheral() -> None:
     cases = _selected_cases()
     counts = {group: sum(case["training_group"] == group for case in cases) for group in TRAINING_GROUP_COUNTS}
     assert counts == TRAINING_GROUP_COUNTS
-    assert len(cases) == 109
+    assert len(cases) == 121
+    assert {
+        group: {
+            stratum: sum(
+                case["training_group"] == group
+                and case.get("near_spatial_stratum") == stratum
+                for case in cases
+            )
+            for stratum in ("core", "deep")
+        }
+        for group in ("near", "near_robustness")
+    } == {
+        "near": {"core": 8, "deep": 20},
+        "near_robustness": {"core": 4, "deep": 8},
+    }
+    for group in TRAINING_GROUP_COUNTS:
+        weights = [
+            case["spatial_weight"]
+            for case in cases
+            if case["training_group"] == group
+        ]
+        assert all(value > 0.0 for value in weights)
+        assert sum(weights) == pytest.approx(1.0, abs=1.0e-12)
     expected_add_ranges = {
         "corridor_upper": (0.2, 0.5),
         "corridor_middle": (0.5, 1.3),
@@ -278,7 +312,8 @@ def test_final_fps_retains_each_qualified_pool_training_group() -> None:
             "candidate_id": "robustness_only_extreme",
             "case_id": "near_robustness_pool_extreme_D2000",
             "field_x_deg": 99.0,
-            "reference_lens_x_mm": 100.0,
+            "reference_lens_x_mm": 13.5,
+            "case_lens_x_mm": 13.5,
             "distance_mm": 2000.0,
         }
     )
@@ -356,7 +391,7 @@ def test_preoptimization_artifacts_record_candidates_and_nine_groups(tmp_path) -
     ):
         assert (output / name).is_file()
     manifest = json.loads((output / "case_manifest.json").read_text(encoding="utf-8"))
-    assert manifest["schema_version"] == 9
+    assert manifest["schema_version"] == 10
     assert "posthoc_cases_json" not in manifest["source"]
     assert manifest["group_counts"] == TRAINING_GROUP_COUNTS
     assert "group_weight" in manifest["objective_contract"]["J"]
@@ -424,7 +459,7 @@ def test_preoptimization_artifacts_accept_group_qualified_pool_candidate_reuse(
     manifest = json.loads(
         (output / "case_manifest.json").read_text(encoding="utf-8")
     )
-    assert manifest["schema_version"] == 9
+    assert manifest["schema_version"] == 10
     membership = manifest["candidate_membership_audit"]
     assert membership["candidate_domain"] == "group_qualified_pool"
     assert membership["candidate_record_count"] == len(qualified_pool)
