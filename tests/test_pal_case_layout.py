@@ -18,6 +18,7 @@ from biot.e2e.pal_case_layout_plotter import (
 from biot.e2e.pal_case_layout import (
     PERIPHERAL_BAND_COUNTS,
     TRAINING_GROUP_COUNTS,
+    _assign_group_spatial_weights,
     _unique_physical_candidate_rows,
     _validate_selected_candidate_membership,
     classify_partition_point,
@@ -290,6 +291,50 @@ def test_qualification_pool_selection_defers_final_spatial_weights() -> None:
     )
     assert len(cases) == 121
     assert all("spatial_weight" not in case for case in cases)
+
+
+def test_spatial_weights_resolve_valid_submillimetre_voronoi_cells() -> None:
+    coordinates = [0.0, 1.0]
+    zones = {
+        "x_mm": coordinates,
+        "physical_y_mm": coordinates,
+        "masks": {"near": [[1, 1], [1, 1]]},
+    }
+    selected = [
+        {
+            "candidate_id": candidate_id,
+            "reference_lens_x_mm": x,
+            "reference_lens_physical_y_mm": y,
+        }
+        for candidate_id, x, y in (
+            ("corner_00", 0.0, 0.0),
+            ("edge_inner", 0.1, 0.0),
+            ("corner_10", 1.0, 0.0),
+            ("corner_11", 1.0, 1.0),
+            ("corner_01", 0.0, 1.0),
+        )
+    ]
+    source_rows = [
+        {
+            "candidate_id": f"source_{index}",
+            "reference_lens_x_mm": x,
+            "reference_lens_physical_y_mm": y,
+        }
+        for index, (x, y) in enumerate(
+            ((-1.0, -1.0), (2.0, -1.0), (2.0, 2.0), (-1.0, 2.0))
+        )
+    ]
+    weighted = _assign_group_spatial_weights(
+        selected,
+        source_rows,
+        zones_payload=zones,
+        mask_name="near",
+    )
+    assert all(float(case["spatial_weight"]) > 0.0 for case in weighted)
+    assert sum(float(case["spatial_weight"]) for case in weighted) == pytest.approx(1.0)
+    assert {case["spatial_weight_method"] for case in weighted} == {
+        "qualified_hull_physical_subcell_voronoi_v2"
+    }
 
 
 def test_select_training_cases_serializes_infinite_distance_without_overflow() -> None:

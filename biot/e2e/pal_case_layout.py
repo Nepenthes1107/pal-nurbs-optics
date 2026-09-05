@@ -39,6 +39,7 @@ FORWARD_NEAR_STRATUM_COUNTS = {
 PERIPHERAL_BAND_COUNTS = {"upper": 4, "middle": 5, "lower": 6}
 PERIPHERAL_REAR_MIRROR_TOLERANCE_MM = 1.0e-4
 REFERENCE_RETRACE_TOLERANCE_MM = 1.0e-8
+SPATIAL_QUADRATURE_SUBDIVISIONS = 8
 FUNCTIONAL_GROUPS = (
     "far",
     "corridor_upper",
@@ -716,7 +717,7 @@ def _assign_group_spatial_weights(
     mask_name: str,
     minimum_abs_x_mm: float | None = None,
 ) -> list[dict[str, Any]]:
-    """Integrate one group's Voronoi cells on the fixed physical mask grid."""
+    """Integrate Voronoi area on a fixed subcell quadrature of the zone mask."""
     if not selected or not source_rows:
         raise ValueError("spatial weighting requires selected and source cases")
     x, y, masks = _zone_arrays(zones_payload)
@@ -725,15 +726,35 @@ def _assign_group_spatial_weights(
     source_points = np.asarray([_physical_xy(row) for row in source_rows], dtype=np.float64)
     selected_points = np.asarray([_physical_xy(row) for row in selected], dtype=np.float64)
     hull = _convex_hull_points(source_points)
+    pitch_x = float(np.median(np.abs(np.diff(x))))
+    pitch_y = float(np.median(np.abs(np.diff(y))))
+    if (
+        not math.isfinite(pitch_x)
+        or not math.isfinite(pitch_y)
+        or pitch_x <= 0.0
+        or pitch_y <= 0.0
+        or not np.allclose(np.abs(np.diff(x)), pitch_x, rtol=0.0, atol=1.0e-9)
+        or not np.allclose(np.abs(np.diff(y)), pitch_y, rtol=0.0, atol=1.0e-9)
+    ):
+        raise ValueError("spatial weighting requires finite uniform physical zone grids")
+    subdivisions = SPATIAL_QUADRATURE_SUBDIVISIONS
+    fractions = (np.arange(subdivisions, dtype=np.float64) + 0.5) / subdivisions - 0.5
+    offsets_x, offsets_y = np.meshgrid(
+        fractions * pitch_x,
+        fractions * pitch_y,
+        indexing="xy",
+    )
+    offsets = np.column_stack((offsets_x.ravel(), offsets_y.ravel()))
     iy, ix = np.nonzero(masks[mask_name])
-    grid_points = np.column_stack((x[ix], y[iy])).astype(np.float64, copy=False)
-    inside = _inside_convex_hull(grid_points, hull)
+    mask_centers = np.column_stack((x[ix], y[iy])).astype(np.float64, copy=False)
+    quadrature_points = (mask_centers[:, None, :] + offsets[None, :, :]).reshape(-1, 2)
+    inside = _inside_convex_hull(quadrature_points, hull)
     if minimum_abs_x_mm is not None:
-        inside &= np.abs(grid_points[:, 0]) > float(minimum_abs_x_mm)
-    integration_points = grid_points[inside]
+        inside &= np.abs(quadrature_points[:, 0]) > float(minimum_abs_x_mm)
+    integration_points = quadrature_points[inside]
     if integration_points.shape[0] < len(selected):
         raise ValueError(
-            f"{mask_name} qualified hull contains too few physical integration cells: "
+            f"{mask_name} qualified hull contains too few physical quadrature samples: "
             f"{integration_points.shape[0]} < {len(selected)}"
         )
     squared = np.square(
@@ -744,11 +765,9 @@ def _assign_group_spatial_weights(
     if np.any(counts <= 0):
         missing = np.flatnonzero(counts <= 0).tolist()
         raise ValueError(
-            f"{mask_name} selected cases own no 1 mm physical cells: {missing}"
+            f"{mask_name} selected cases own no physical quadrature area: {missing}"
         )
-    pitch_x = float(np.median(np.abs(np.diff(x))))
-    pitch_y = float(np.median(np.abs(np.diff(y))))
-    cell_area = pitch_x * pitch_y
+    sample_area = pitch_x * pitch_y / float(subdivisions * subdivisions)
     total = int(counts.sum())
     coordinate_source = (
         "case_lens_assigned_distance"
@@ -759,10 +778,13 @@ def _assign_group_spatial_weights(
         {
             **dict(row),
             "spatial_weight": float(counts[index] / total),
-            "spatial_voronoi_cell_count": int(counts[index]),
-            "spatial_voronoi_area_mm2": float(counts[index] * cell_area),
-            "spatial_weight_domain_cell_count": total,
-            "spatial_weight_method": "qualified_hull_physical_grid_voronoi",
+            "spatial_voronoi_quadrature_count": int(counts[index]),
+            "spatial_voronoi_area_mm2": float(counts[index] * sample_area),
+            "spatial_weight_domain_quadrature_count": total,
+            "spatial_weight_method": "qualified_hull_physical_subcell_voronoi_v2",
+            "spatial_quadrature_subdivisions_per_axis": subdivisions,
+            "spatial_quadrature_pitch_x_mm": pitch_x / subdivisions,
+            "spatial_quadrature_pitch_y_mm": pitch_y / subdivisions,
             "spatial_weight_coordinate_source": coordinate_source,
         }
         for index, row in enumerate(selected)

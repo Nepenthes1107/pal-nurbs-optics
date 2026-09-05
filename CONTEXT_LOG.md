@@ -104,6 +104,10 @@
   最终目标的物理空间权重，避免 20-case 超采样池受 1 mm corridor 积分格数量限制；
   最终 121-case 重选仍严格计算并校验空间权重。修复后 case-layout 测试为 `21 passed`，
   并通过 `py_compile` 与 `git diff --check`。
+- 随后云端最终 Near 选择发现 1 mm 离散 Voronoi 节点下某个合法 case 没有归属节点。
+  空间权重现改为每个 zones 物理格细分为固定 `8×8` 子像元后做 Voronoi 面积求积，
+  仍要求每个最终 case 拥有正物理面积；修复后 case-layout 为 `22 passed`、PAL 为
+  `61 passed`，并通过 `py_compile` 与 `git diff --check`。未运行正式训练或正式评价。
 
 - 训练 case 数量固定为 28/5/5/5/20/8/8/15/15，权重为
   0.24/0.07/0.10/0.11/0.18/0.02/0.04/0.12/0.12。七个功能组全部使用与评价
