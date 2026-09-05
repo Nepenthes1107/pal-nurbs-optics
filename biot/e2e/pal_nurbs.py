@@ -1421,6 +1421,7 @@ def build_joint_training_cases(
     zones_payload: Mapping[str, Any],
     group_counts: Mapping[str, int] = TRAINING_GROUP_COUNTS,
     peripheral_band_counts: Mapping[str, int] = PERIPHERAL_BAND_COUNTS,
+    assign_spatial_weights: bool = True,
 ) -> list[dict[str, Any]]:
     """Build the fixed 121-case contract from traced dense-field candidates."""
     maps = dict(zones_payload.get("maps", {}))
@@ -1445,6 +1446,7 @@ def build_joint_training_cases(
         zones_payload=zones_payload,
         group_counts=group_counts,
         peripheral_band_counts=peripheral_band_counts,
+        assign_spatial_weights=assign_spatial_weights,
     )
 
 
@@ -1595,6 +1597,10 @@ def _prepare_case_layout(
         zones_payload=zones_payload,
         group_counts=FORWARD_POOL_GROUP_COUNTS,
         peripheral_band_counts=FORWARD_POOL_PERIPHERAL_BAND_COUNTS,
+        # The oversampling pool is only a list of cases to qualify. Physical
+        # area weights belong to the final 121-case objective and are assigned
+        # after failed WFNO/phase cases have been removed from this pool.
+        assign_spatial_weights=False,
     )
     pool_identity = _canonical_json_sha256([
         {

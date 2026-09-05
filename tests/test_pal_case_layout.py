@@ -274,6 +274,24 @@ def test_selects_fixed_121_cases_with_stratified_corridor_near_and_mirrored_peri
     } == PERIPHERAL_BAND_COUNTS
 
 
+def test_qualification_pool_selection_defers_final_spatial_weights() -> None:
+    zones = _zones_payload()
+    cases = select_training_cases(
+        _traced_candidates(),
+        far_object_distance_mm=100000.0,
+        intermediate_object_distance_mm=2000.0,
+        near_object_distance_mm=500.0,
+        corridor_y_min_mm=-9.0,
+        corridor_y_max_mm=-3.0,
+        power_map=np.asarray(zones["maps"]["power_D"], dtype=np.float64),
+        pfar=1.0,
+        zones_payload=zones,
+        assign_spatial_weights=False,
+    )
+    assert len(cases) == 121
+    assert all("spatial_weight" not in case for case in cases)
+
+
 def test_select_training_cases_serializes_infinite_distance_without_overflow() -> None:
     cases = _selected_cases(far_distance=float("inf"))
     far_cases = [case for case in cases if case["training_group"] == "far"]

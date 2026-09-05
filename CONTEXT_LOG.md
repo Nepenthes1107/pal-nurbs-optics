@@ -100,6 +100,10 @@
 - 本次 121-case/四方向/物理平滑改造的定向验证为 weighted-MTF `2 passed`、
   PAL/case-layout `81 passed`、evaluator `19 passed`；完整测试为 `227 passed`。
   未执行正式训练或正式评价，因此不形成新的光学收益结论。
+- 云端首次运行暴露的窄 corridor 问题已修复：420-case WFNO 资格池不再提前计算
+  最终目标的物理空间权重，避免 20-case 超采样池受 1 mm corridor 积分格数量限制；
+  最终 121-case 重选仍严格计算并校验空间权重。修复后 case-layout 测试为 `21 passed`，
+  并通过 `py_compile` 与 `git diff --check`。
 
 - 训练 case 数量固定为 28/5/5/5/20/8/8/15/15，权重为
   0.24/0.07/0.10/0.11/0.18/0.02/0.04/0.12/0.12。七个功能组全部使用与评价

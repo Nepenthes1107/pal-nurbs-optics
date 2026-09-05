@@ -778,6 +778,7 @@ def select_training_cases(
     zones_payload: Mapping[str, Any],
     group_counts: Mapping[str, int] = TRAINING_GROUP_COUNTS,
     peripheral_band_counts: Mapping[str, int] = PERIPHERAL_BAND_COUNTS,
+    assign_spatial_weights: bool = True,
 ) -> list[dict[str, Any]]:
     """Select physical cases by lens-plane FPS after real tracing."""
     resolved_counts = {name: int(group_counts[name]) for name in TRAINING_GROUP_COUNTS}
@@ -909,24 +910,25 @@ def select_training_cases(
         "near_robustness": near_robustness_rows,
         "near_edge_astig": near_edge_domain,
     }
-    for group in FUNCTIONAL_GROUPS:
-        groups[group] = _assign_group_spatial_weights(
-            groups[group],
-            source_domains[group],
-            zones_payload=zones_payload,
-            mask_name=GROUP_TO_ZONE[group],
-            minimum_abs_x_mm=(10.0 if group == "near_edge_astig" else None),
-        )
-    for group in PERIPHERAL_GROUPS:
-        groups[group] = [
-            {
-                **row,
-                "spatial_weight": 1.0 / len(groups[group]),
-                "spatial_weight_method": "surface_only_equal",
-                "spatial_weight_coordinate_source": "reference_lens",
-            }
-            for row in groups[group]
-        ]
+    if assign_spatial_weights:
+        for group in FUNCTIONAL_GROUPS:
+            groups[group] = _assign_group_spatial_weights(
+                groups[group],
+                source_domains[group],
+                zones_payload=zones_payload,
+                mask_name=GROUP_TO_ZONE[group],
+                minimum_abs_x_mm=(10.0 if group == "near_edge_astig" else None),
+            )
+        for group in PERIPHERAL_GROUPS:
+            groups[group] = [
+                {
+                    **row,
+                    "spatial_weight": 1.0 / len(groups[group]),
+                    "spatial_weight_method": "surface_only_equal",
+                    "spatial_weight_coordinate_source": "reference_lens",
+                }
+                for row in groups[group]
+            ]
     group_distance = {
         "far": far_object_distance_mm,
         "near": near_object_distance_mm,
